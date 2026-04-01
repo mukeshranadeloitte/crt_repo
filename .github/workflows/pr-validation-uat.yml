@@ -102,12 +102,27 @@ jobs:
           fi
           git config --global --add safe.directory $GITHUB_WORKSPACE
 
-      - name: Build delta package list with SGD
-        id: sgd-delta
+      - name: Building Package SGD
         run: |
-          source_commit="${{ vars.CRT_UAT_COMMIT_ID }}"
-          echo "Using source commit: $source_commit"
-          sf sgd:source:delta --from "$source_commit" --to "HEAD" --output-dir "." --source-dir force-app/
+          sf sgd:source:delta --to "HEAD" --from "${{ vars.CRT_UAT_COMMIT_ID }}" --output-dir "." --source-dir force-app/
+
+      - name: Package
+        run: |
+          echo " ------ Package ------"
+          if [ -f package/package.xml ]; then
+            cat package/package.xml
+          else
+            echo "No package/package.xml generated"
+          fi
+          echo " ---------------------"
+          echo "                       "
+          echo " ------ Destructive Package------"
+          if [ -f destructiveChanges/destructiveChanges.xml ]; then
+            cat destructiveChanges/destructiveChanges.xml
+          else
+            echo "No destructiveChanges/destructiveChanges.xml generated"
+          fi
+          echo "---------------------------------"
 
       - name: Compute delta and decide test behavior
         id: delta-tests
