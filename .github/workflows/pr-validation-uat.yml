@@ -399,77 +399,89 @@ jobs:
             exit 1
           fi
 
-      - name: Run check-only deploy to UAT org
+      - name: Run check-only deploy to UAT org (print errors)
         shell: bash
         run: |
-  
+
           set -euo pipefail
 
           apex_required="${{ steps.delta-tests.outputs.apex_required }}"
-          test_level="${{ steps.set-test-classes.outputs.test_level }}"
           pr_test_classes="${{ steps.set-test-classes.outputs.test_classes }}"
           inferred_test_classes="${{ steps.delta-tests.outputs.inferred_test_classes }}"
           manifest_path="${{ steps.delta-tests.outputs.deploy_manifest }}"
           destructive_path="${{ steps.delta-tests.outputs.destructive_manifest }}"
 
-          # Build command as an array (safer than eval)
           deploy_cmd=(sfdx force:source:deploy -u uat --checkonly --verbose --json)
 
           if [ -n "${manifest_path:-}" ]; then
-            echo "Using generated manifest for changed metadata: $manifest_path"
+            echo "Using generated manifest: $manifest_path"
             cat "$manifest_path"
             deploy_cmd+=(--manifest "$manifest_path")
           else
-            echo "No changed metadata found in delta manifest; defaulting to full force-app deployment"
+            echo "No delta manifest; deploying full source"
             deploy_cmd+=(-p force-app/main/default)
           fi
 
           if [ -n "${destructive_path:-}" ]; then
-            echo "Including destructive changes manifest: $destructive_path"
+            echo "Including destructive manifest: $destructive_path"
             deploy_cmd+=(-x "$destructive_path")
           fi
 
-          # Combine PR-requested and inferred test classes (comma-separated)
           all_test_classes=""
-          if [ -n "${pr_test_classes:-}" ]; then
-            all_test_classes="$pr_test_classes"
-          fi
+          if [ -n "${pr_test_classes:-}" ]; then all_test_classes="$pr_test_classes"; fi
           if [ -n "${inferred_test_classes:-}" ]; then
-            if [ -z "$all_test_classes" ]; then
-              all_test_classes="$inferred_test_classes"
-            else
-              all_test_classes="$all_test_classes,$inferred_test_classes"
+            if [ -z "$all_test_classes" ]; then all_test_classes="$inferred_test_classes"
+            else all_test_classes="$all_test_classes,$inferred_test_classes"
             fi
           fi
 
-          # Dedupe -> newline-separated list (no commas)
           tests_deduped="$(echo "$all_test_classes" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++')"
 
           if [ -n "${tests_deduped:-}" ]; then
             echo "Running tests:"
             echo "$tests_deduped"
-
             deploy_cmd+=(--testlevel RunSpecifiedTests)
-
-            # Repeated --runtests flags (no commas)
             while IFS= read -r t; do
               [ -z "$t" ] && continue
               deploy_cmd+=(--runtests "$t")
             done <<< "$tests_deduped"
-
           elif [ "$apex_required" = "true" ]; then
-            echo "Apex classes changed but no test classes found. Please add tests in PR description or include test classes in PR commit."
+            echo "ERROR: Apex changed but no tests specified/found."
             exit 1
           else
-            echo "No Apex class changes required; using NoTestRun"
+            echo "No Apex changes; using NoTestRun"
             deploy_cmd+=(--testlevel NoTestRun)
           fi
 
           echo "Final deploy command:"
-          printf ' %q' "${deploy_cmd[@]}"
-          echo
+          printf ' %q' "${deploy_cmd[@]}"; echo
 
-          "${deploy_cmd[@]}" > deploy-output.json
+          # Run deploy: keep stdout JSON clean; capture stderr separately
+          set +e
+          "${deploy_cmd[@]}" > deploy-output.json 2> deploy-stderr.log
+          rc=$?
+          set -e
+
+          if [ $rc -ne 0 ]; then
+            echo "Deploy failed (exit code $rc). Showing errors..."
+
+            echo "---- sfdx stderr ----"
+            cat deploy-stderr.log || true
+
+            echo "---- top-level message/status ----"
+            jq -r '{status: .status, message: .message} | @json' deploy-output.json 2>/dev/null || cat deploy-output.json
+
+            echo "---- componentFailures ----"
+            jq -r '.result.details.componentFailures // empty' deploy-output.json 2>/dev/null || true
+
+            echo "---- test failures ----"
+            jq -r '.result.details.runTestResult.failures // empty' deploy-output.json 2>/dev/null || true
+
+            echo "---- coverage warnings ----"
+            jq -r '.result.details.runTestResult.codeCoverageWarnings // empty' deploy-output.json 2>/dev/null || true
+
+            exit 1
+          fi
 
       - name: Check coverage from deploy results
         run: |
