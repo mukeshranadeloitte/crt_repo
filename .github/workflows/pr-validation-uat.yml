@@ -28,7 +28,14 @@ jobs:
           node-version: 20
 
       - name: Install npm deps
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "package-lock.json found; running npm ci"
+            npm ci
+          else
+            echo "package-lock.json not found; running npm install"
+            npm install
+          fi
 
       - name: Install Salesforce CLI
         # Use the maintained setup action and fallback to npm install for resilience
