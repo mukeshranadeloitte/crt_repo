@@ -1,0 +1,298 @@
+name: PR -> UAT Org validation + code analysis
+
+on:
+  pull_request:
+    branches:
+      - uat
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - ready_for_review
+
+jobs:
+  sfdx-validation:
+    name: Deploy check + static analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Install Salesforce CLI
+        uses: salesforce/sfdx-action@v2
+
+      - name: Authenticate to UAT org
+        env:
+          SFDX_AUTH_URL: ${{ secrets.CRT_UAT_AUTHURL }}
+        run: |
+          echo "$SFDX_AUTH_URL" > sfdxAuthUrl.txt
+          sfdx auth:sfdxurl:store -f sfdxAuthUrl.txt -a uat
+          sfdx force:org:display -u uat
+
+      - name: Determine target test classes from PR description
+        id: set-test-classes
+        run: |
+          body="${{ github.event.pull_request.body }}"
+          echo "PR body: $body"
+
+          extracted=$(echo "$body" | grep -iEo 'test(classes)?:[[:space:]]*[^\n]+' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//I')
+          extracted=$(echo "$extracted" | awk '{gsub(/ /,""); print}')
+
+          if [ -z "$extracted" ]; then
+            echo "No test classes specified in PR body."
+            echo "test_level=none" >> $GITHUB_OUTPUT
+          else
+            echo "Detected test classes: $extracted"
+            echo "test_level=RunSpecifiedTests" >> $GITHUB_OUTPUT
+            echo "test_classes=$extracted" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compute delta and decide test behavior
+        id: delta-tests
+        run: |
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          echo "Base SHA: $base_sha"; echo "Head SHA: $head_sha"
+
+          changed_files=$(git diff --name-only $base_sha $head_sha || true)
+          echo "Changed files:\n$changed_files"
+
+          changed_status=$(git diff --name-status $base_sha $head_sha || true)
+          echo "Changed status lines:\n$changed_status"
+
+          package_changed=$(echo "$changed_files" | grep -E '^manifest/package.xml$' || true)
+
+          has_apex_in_package="false"
+          if [ -f manifest/package.xml ] && grep -q '<name>ApexClass</name>' manifest/package.xml; then
+            has_apex_in_package="true"
+          fi
+
+          # Setup structures
+          temp_manifest="./.github/temp/package.xml"
+          temp_destructive="./.github/temp/destructiveChangesPre.xml"
+          temp_input="./.github/temp/changed_metadata.txt"
+          mkdir -p ./.github/temp
+          rm -f "$temp_manifest" "$temp_destructive" "$temp_input"
+
+          declare -A typeMembers
+
+          add_member() {
+            type="$1"; member="$2"
+            if [ -z "${typeMembers[$type]}" ]; then
+              typeMembers[$type]="$member"
+            else
+              existing="${typeMembers[$type]}"
+              if ! echo "$existing" | grep -qx "$member"; then
+                typeMembers[$type]="$existing\n$member"
+              fi
+            fi
+          }
+
+          normalized=
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            # Skip non package contents
+            if [[ ! "$file" =~ ^force-app/main/default/ ]]; then
+              continue
+            fi
+            rel=${file#force-app/main/default/}
+            case "$rel" in
+              classes/*)
+                meta="ApexClass"; m=$(basename "$rel" .cls);;
+              triggers/*)
+                meta="ApexTrigger"; m=$(basename "$rel" .trigger);;
+              pages/*)
+                meta="ApexPage"; m=$(basename "$rel" .page);;
+              components/*)
+                meta="ApexComponent"; m=$(basename "$rel" .component);;
+              aura/*/*)
+                meta="AuraDefinitionBundle"; m=$(echo "$rel" | cut -d'/' -f2);;
+              lwc/*/*)
+                meta="LightningComponentBundle"; m=$(echo "$rel" | cut -d'/' -f2);;
+              objects/*/object/*|objects/*/*.object)
+                meta="CustomObject"; m=$(echo "$rel" | cut -d'/' -f2);;
+              objects/*)
+                # object components - include owning object
+                meta="CustomObject"; m=$(echo "$rel" | cut -d'/' -f2);;
+              permissionsets/*)
+                meta="PermissionSet"; m=$(basename "$rel" .permissionset);;
+              profiles/*)
+                meta="Profile"; m=$(basename "$rel" .profile);;
+              staticresources/*)
+                meta="StaticResource"; m=$(basename "$rel" .resource);;
+              labels/*)
+                meta="CustomLabels"; m="CustomLabels";;
+              flows/*)
+                meta="Flow"; m=$(basename "$rel" .flow);;
+              datacategorygroups/*)
+                meta="DataCategoryGroup"; m=$(basename "$rel" .datacategorygroup);;
+              * )
+                # Fallback: map folder name to metadata type
+                folder=$(echo "$rel" | cut -d'/' -f1)
+                meta=${folder^}
+                m=$(basename "${rel%.*}")
+                ;;
+            esac
+            # strip ext in case meta files exist
+            m=${m% -meta}
+            m=${m%.*}
+            if [ -n "$meta" ] && [ -n "$m" ]; then
+              add_member "$meta" "$m"
+            fi
+          done <<< "$changed_files"
+
+          # deleted apex etc for destructive package
+          apex_deleted_files=$(echo "$changed_status" | awk '/^D[[:space:]]+force-app\/main\/default\/.*\.(cls|cls-meta.xml)$/ {print $2}' || true)
+          if [ -n "$apex_deleted_files" ]; then
+            for f in $apex_deleted_files; do
+              deleted_rel=${f#force-app/main/default/}
+              if [[ "$deleted_rel" =~ ^classes/ ]]; then
+                dname=$(basename "$deleted_rel" .cls)
+                add_member "ApexClass" "$dname"
+              fi
+            done
+          fi
+
+          # write package manifest for all collected metadata types
+          if [ ${#typeMembers[@]} -gt 0 ]; then
+            echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" > "$temp_manifest"
+            echo "<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">" >> "$temp_manifest"
+            for key in "${!typeMembers[@]}"; do
+              printf "  <types>\n" >> "$temp_manifest"
+              echo -e "${typeMembers[$key]}" | sort -u | while IFS= read -r member; do
+                [ -z "$member" ] && continue
+                echo "    <members>$member</members>" >> "$temp_manifest"
+              done
+              echo "    <name>$key</name>" >> "$temp_manifest"
+              echo "  </types>" >> "$temp_manifest"
+            done
+            echo "  <version>56.0</version>" >> "$temp_manifest"
+            echo "</Package>" >> "$temp_manifest"
+            echo "deploy_manifest=$temp_manifest" >> $GITHUB_OUTPUT
+            echo "Delta package.xml contents:"; cat "$temp_manifest"
+          fi
+
+          # destructive package for deleted metadata
+          if [ -n "$apex_deleted_files" ]; then
+            # we only built ApexClass deletes above; in future can add other types
+            echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" > "$temp_destructive"
+            echo "<Package xmlns=\"http://soap.sforce.com/2006/04/metadata\">" >> "$temp_destructive"
+            echo "  <types>" >> "$temp_destructive"
+            echo "    <name>ApexClass</name>" >> "$temp_destructive"
+            echo "  </types>" >> "$temp_destructive"
+            echo "  <version>56.0</version>" >> "$temp_destructive"
+            echo "</Package>" >> "$temp_destructive"
+            echo "destructive_manifest=$temp_destructive" >> $GITHUB_OUTPUT
+            echo "Destructive package.xml content:"; cat "$temp_destructive"
+          fi
+
+          if [ ${#typeMembers[@]} -gt 0 ] || [ "$has_apex_in_package" = "true" ]; then
+            echo "apex_required=true" >> $GITHUB_OUTPUT
+          else
+            echo "apex_required=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [ "${{ steps.set-test-classes.outputs.test_level }}" = "RunSpecifiedTests" ]; then
+            echo "tests_required=true" >> $GITHUB_OUTPUT
+          else
+            echo "tests_required=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate test requirements
+        run: |
+          apex_required="${{ steps.delta-tests.outputs.apex_required }}"
+          tests_required="${{ steps.delta-tests.outputs.tests_required }}"
+          test_level="${{ steps.set-test-classes.outputs.test_level }}"
+
+          if [ "$apex_required" = "true" ] && [ "$test_level" != "RunSpecifiedTests" ]; then
+            echo "Apex classes changed but no test classes specified in PR comments. Please update the PR with tests."
+            exit 1
+          fi
+
+      - name: Run check-only deploy to UAT org
+        run: |
+          apex_required="${{ steps.delta-tests.outputs.apex_required }}"
+          test_level="${{ steps.set-test-classes.outputs.test_level }}"
+          test_classes="${{ steps.set-test-classes.outputs.test_classes }}"
+          manifest_path="${{ steps.delta-tests.outputs.deploy_manifest }}"
+          destructive_path="${{ steps.delta-tests.outputs.destructive_manifest }}"
+
+          deploy_cmd="sfdx force:source:deploy -u uat --checkonly --verbose --json"
+
+          if [ -n "$manifest_path" ]; then
+            echo "Using generated manifest for changed Apex metadata: $manifest_path"
+            cat "$manifest_path"
+            deploy_cmd="$deploy_cmd --manifest $manifest_path"
+          else
+            echo "No changed Apex classes found in delta manifest; defaulting to full force-app deployment";
+            deploy_cmd="$deploy_cmd -p force-app/main/default"
+          fi
+
+          if [ -n "$destructive_path" ]; then
+            echo "Including destructive changes manifest: $destructive_path"
+            deploy_cmd="$deploy_cmd -x $destructive_path"
+          fi
+
+          if [ "$apex_required" != "true" ]; then
+            echo "No Apex class changes required; using NoTestRun"
+            deploy_cmd="$deploy_cmd --testlevel NoTestRun"
+          elif [ "$test_level" = "RunSpecifiedTests" ] && [ -n "$test_classes" ]; then
+            echo "Apex changes with requested tests: $test_classes"
+            deploy_cmd="$deploy_cmd --testlevel RunSpecifiedTests --runtests $test_classes"
+          else
+            echo "Apex classes changed but no test classes specified in PR comments. Please update the PR with tests."
+            exit 1
+          fi
+
+          echo "Final deploy command: $deploy_cmd"
+          eval "$deploy_cmd" > deploy-output.json
+
+      - name: Check coverage from deploy results
+        run: |
+          apex_required="${{ steps.delta-tests.outputs.apex_required }}"
+
+          if [ "$apex_required" != "true" ]; then
+            echo "No Apex tests run; coverage check skipped."
+            exit 0
+          fi
+
+          coverage=$(jq -r '.result.details.runTestResult.codeCoverage | if type=="object" then .coveragePercent // .overallCoverage else empty end' deploy-output.json 2>/dev/null || true)
+
+          if [ -z "$coverage" ] || [ "$coverage" = "null" ]; then
+            echo "Could not determine coverage from deploy output; failing for safety."
+            exit 1
+          fi
+
+          echo "Test coverage: $coverage%"
+          required=85
+          exceed=$(echo "$coverage >= $required" | bc -l)
+          if [ "$exceed" -ne 1 ]; then
+            echo "Test coverage $coverage% is below required $required%";
+            exit 1
+          fi
+
+      - name: Install Salesforce Scanner CLI
+        run: npm install -g @salesforce/sfdx-scanner
+
+      - name: Run Salesforce code analyzer (PMD)
+        run: |
+          sfdx scanner:run --target force-app/main/default --engine pmd --format json --out scanner-report.json
+          cat scanner-report.json
+
+      - name: Upload scanner report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-report
+          path: scanner-report.json
