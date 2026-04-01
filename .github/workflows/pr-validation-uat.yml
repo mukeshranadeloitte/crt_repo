@@ -63,8 +63,8 @@ jobs:
           body="${{ github.event.pull_request.body }}"
           echo "PR body: $body"
 
-          extracted=$(echo "$body" | grep -iEo 'test(classes)?:[[:space:]]*[^\n]+' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//I')
-          extracted=$(echo "$extracted" | awk '{gsub(/ /,""); print}')
+          # Extract test classes from lines like "tests: Class1, Class2" or "testclasses: Class1"
+          extracted=$(echo "$body" | grep -iE '^test(classes)?:[[:space:]]*' | head -n1 | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | xargs)
 
           if [ -z "$extracted" ]; then
             echo "No test classes specified in PR body."
@@ -116,70 +116,142 @@ jobs:
             fi
           }
 
+          get_api_name() {
+            file_path="$1"
+            rel="$2"
+
+            # If the file contains <fullName>, prefer that as API name
+            if [ -f "$file_path" ] && grep -q '<fullName>' "$file_path" 2>/dev/null; then
+              fullName=$(grep -oPm1 '(?<=<fullName>)[^<]+' "$file_path" 2>/dev/null || true)
+              [ -n "$fullName" ] && echo "$fullName" && return
+            fi
+
+            case "$rel" in
+              classes/*.cls|classes/*.cls-meta.xml)
+                echo "$(basename "$rel" .cls)" ;;
+              triggers/*.trigger|triggers/*.trigger-meta.xml)
+                echo "$(basename "$rel" .trigger)" ;;
+              pages/*.page|pages/*.page-meta.xml)
+                echo "$(basename "$rel" .page)" ;;
+              components/*.component|components/*.component-meta.xml)
+                echo "$(basename "$rel" .component)" ;;
+              aura/*/*)
+                echo "$(echo "$rel" | cut -d'/' -f2)" ;;
+              lwc/*/*)
+                echo "$(echo "$rel" | cut -d'/' -f2)" ;;
+              objects/*.object|objects/*.object-meta.xml)
+                echo "$(basename "$rel" .object)" ;;
+              objects/*/object/*|objects/*/*.object)
+                echo "$(echo "$rel" | cut -d'/' -f2)" ;;
+              permissionsets/*.permissionset|permissionsets/*.permissionset-meta.xml)
+                echo "$(basename "$rel" .permissionset)" ;;
+              profiles/*.profile|profiles/*.profile-meta.xml)
+                echo "$(basename "$rel" .profile)" ;;
+              staticresources/*.resource|staticresources/*.resource-meta.xml)
+                echo "$(basename "$rel" .resource)" ;;
+              labels/*.labels|labels/*.labels-meta.xml)
+                echo "CustomLabels" ;;
+              flows/*.flow|flows/*.flow-meta.xml)
+                echo "$(basename "$rel" .flow)" ;;
+              datacategorygroups/*.datacategorygroup|datacategorygroups/*.datacategorygroup-meta.xml)
+                echo "$(basename "$rel" .datacategorygroup)" ;;
+              * )
+                echo "$(basename "${rel%.*}")" ;;
+            esac
+          }
+
           normalized=
           while IFS= read -r file; do
             [ -z "$file" ] && continue
-            # Skip non package contents
             if [[ ! "$file" =~ ^force-app/main/default/ ]]; then
               continue
             fi
             rel=${file#force-app/main/default/}
+            meta=""
+            fullname=""
             case "$rel" in
               classes/*)
-                meta="ApexClass"; m=$(basename "$rel" .cls);;
+                meta="ApexClass" ;;
               triggers/*)
-                meta="ApexTrigger"; m=$(basename "$rel" .trigger);;
+                meta="ApexTrigger" ;;
               pages/*)
-                meta="ApexPage"; m=$(basename "$rel" .page);;
+                meta="ApexPage" ;;
               components/*)
-                meta="ApexComponent"; m=$(basename "$rel" .component);;
+                meta="ApexComponent" ;;
               aura/*/*)
-                meta="AuraDefinitionBundle"; m=$(echo "$rel" | cut -d'/' -f2);;
+                meta="AuraDefinitionBundle" ;;
               lwc/*/*)
-                meta="LightningComponentBundle"; m=$(echo "$rel" | cut -d'/' -f2);;
-              objects/*/object/*|objects/*/*.object)
-                meta="CustomObject"; m=$(echo "$rel" | cut -d'/' -f2);;
-              objects/*)
-                # object components - include owning object
-                meta="CustomObject"; m=$(echo "$rel" | cut -d'/' -f2);;
+                meta="LightningComponentBundle" ;;
+              objects/*.object|objects/*.object-meta.xml|objects/*/object/*|objects/*/*.object)
+                meta="CustomObject" ;;
               permissionsets/*)
-                meta="PermissionSet"; m=$(basename "$rel" .permissionset);;
+                meta="PermissionSet" ;;
               profiles/*)
-                meta="Profile"; m=$(basename "$rel" .profile);;
+                meta="Profile" ;;
               staticresources/*)
-                meta="StaticResource"; m=$(basename "$rel" .resource);;
+                meta="StaticResource" ;;
               labels/*)
-                meta="CustomLabels"; m="CustomLabels";;
+                meta="CustomLabels" ;;
               flows/*)
-                meta="Flow"; m=$(basename "$rel" .flow);;
+                meta="Flow" ;;
               datacategorygroups/*)
-                meta="DataCategoryGroup"; m=$(basename "$rel" .datacategorygroup);;
+                meta="DataCategoryGroup" ;;
               * )
-                # Fallback: map folder name to metadata type
                 folder=$(echo "$rel" | cut -d'/' -f1)
                 meta=${folder^}
-                m=$(basename "${rel%.*}")
                 ;;
             esac
-            # strip ext in case meta files exist
-            m=${m% -meta}
-            m=${m%.*}
-            if [ -n "$meta" ] && [ -n "$m" ]; then
-              add_member "$meta" "$m"
+
+            # Prefer the metadata fullName if present for API compatibility
+            file_path="./$file"
+            if [[ "$rel" == *-meta.xml ]]; then
+              base_file="$file"
+            else
+              base_file="$file"
+            fi
+            fullname=$(get_api_name "$file_path" "$rel")
+
+            if [ -n "$meta" ] && [ -n "$fullname" ]; then
+              add_member "$meta" "$fullname"
             fi
           done <<< "$changed_files"
 
           # deleted apex etc for destructive package
           apex_deleted_files=$(echo "$changed_status" | awk '/^D[[:space:]]+force-app\/main\/default\/.*\.(cls|cls-meta.xml)$/ {print $2}' || true)
+          apex_changed_classes=""
+          while IFS= read -r file; do
+            if [[ "$file" =~ ^force-app/main/default/classes/.*\.cls$ ]]; then
+              className=$(basename "$file" .cls)
+              if [ -z "$apex_changed_classes" ]; then
+                apex_changed_classes="$className"
+              else
+                case ",${apex_changed_classes}," in
+                  *,${className},*) ;;
+                  *) apex_changed_classes+=",$className" ;;
+                esac
+              fi
+            fi
+          done <<< "$changed_files"
+
           if [ -n "$apex_deleted_files" ]; then
             for f in $apex_deleted_files; do
               deleted_rel=${f#force-app/main/default/}
               if [[ "$deleted_rel" =~ ^classes/ ]]; then
                 dname=$(basename "$deleted_rel" .cls)
                 add_member "ApexClass" "$dname"
+                if [ -z "$apex_changed_classes" ]; then
+                  apex_changed_classes="$dname"
+                else
+                  case ",${apex_changed_classes}," in
+                    *,${dname},*) ;;
+                    *) apex_changed_classes+=",$dname" ;;
+                  esac
+                fi
               fi
             done
           fi
+
+          echo "apex_changed_classes=$apex_changed_classes" >> $GITHUB_OUTPUT
 
           # write package manifest for all collected metadata types
           if [ ${#typeMembers[@]} -gt 0 ]; then
@@ -231,9 +303,19 @@ jobs:
           apex_required="${{ steps.delta-tests.outputs.apex_required }}"
           tests_required="${{ steps.delta-tests.outputs.tests_required }}"
           test_level="${{ steps.set-test-classes.outputs.test_level }}"
+          apex_changed_classes="${{ steps.delta-tests.outputs.apex_changed_classes }}"
 
           if [ "$apex_required" = "true" ] && [ "$test_level" != "RunSpecifiedTests" ]; then
-            echo "Apex classes changed but no test classes specified in PR comments. Please update the PR with tests."
+            echo "ERROR: Apex classes changed but no test classes were specified in PR comments."
+            echo "Changed Apex classes in this PR: $apex_changed_classes"
+            echo "To fix: edit the PR description and add a line like:"
+            echo "  tests: MyFirstTestClass, MySecondTestClass"
+            echo "If you already have test classes names, just comma-separated list them there."
+            echo "Next steps:"
+            echo "1) Update PR description as above."
+            echo "2) Push an updated commit or reopen the PR."
+            echo "3) Wait for the workflow to rerun and confirm coverage >= 85%."
+            echo "4) If coverage is still below threshold, add or extend test methods for the changed Apex classes."
             exit 1
           fi
 
