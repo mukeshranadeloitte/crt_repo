@@ -94,7 +94,12 @@ jobs:
 
       - name: Install SGD plugin
         run: |
-          echo y | sf plugins install sfdx-git-delta
+          # Use npm install as fallback for the sf plugin install failure
+          echo "Trying sf plugin install on sfdx-git-delta..."
+          if ! (echo y | sf plugins install sfdx-git-delta); then
+            echo "sf plugin install failed, trying npm global install"
+            npm install -g sfdx-git-delta@latest
+          fi
           git config --global --add safe.directory $GITHUB_WORKSPACE
 
       - name: Build delta package list with SGD
