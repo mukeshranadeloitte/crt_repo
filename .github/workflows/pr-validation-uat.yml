@@ -28,10 +28,26 @@ jobs:
           node-version: 20
 
       - name: Install npm deps
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "package-lock.json found; running npm ci"
+            npm ci
+          else
+            echo "package-lock.json not found; running npm install"
+            npm install
+          fi
 
       - name: Install Salesforce CLI
-        uses: salesforce/sfdx-action@v2
+        # Use the maintained setup action and fallback to npm install for resilience
+        uses: sfdx-actions/setup-sfdx@v1
+
+      - name: Verify Salesforce CLI installed
+        run: |
+          if ! command -v sfdx >/dev/null; then
+            echo "sfdx not found, installing via npm"
+            npm install -g sfdx-cli
+          fi
+          sfdx --version
 
       - name: Authenticate to UAT org
         env:
@@ -217,7 +233,11 @@ jobs:
           test_level="${{ steps.set-test-classes.outputs.test_level }}"
 
           if [ "$apex_required" = "true" ] && [ "$test_level" != "RunSpecifiedTests" ]; then
-            echo "Apex classes changed but no test classes specified in PR comments. Please update the PR with tests."
+            echo "ERROR: Apex classes changed but no test classes were specified in PR comments."
+            echo "Please add a line in your PR description like:"
+            echo "  tests: MyFirstTestClass, MySecondTestClass"
+            echo "Then push the update to your branch. The workflow will re-run and execute those tests against UAT."
+            echo "If you are unsure which tests to run, include all relevant class names that cover the modified Apex."
             exit 1
           fi
 
