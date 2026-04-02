@@ -1,14 +1,13 @@
 <template>
   <lightning-card title={title}>
     <div class="slds-p-around_medium">
-      <!-- HTML issues (common scanners may flag): missing alt, duplicate id, javascript: URL -->
+      <!-- still analyzable issues: missing alt, javascript: URL, etc. -->
       <img src={imageUrl}>
-      <div id="dup">First</div>
-      <div id="dup">Second</div>
+      <div id="dup1">First</div>
+      <div id="dup2">Second</div>
       <a href="javascript:alert('xss')">Bad link</a>
 
       <lightning-button label="Run" onclick={handleClick}></lightning-button>
-      <p>Open devtools / run scanner for violations.</p>
     </div>
   </lightning-card>
 </template>
