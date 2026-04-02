@@ -112,17 +112,18 @@ jobs:
         env:
           CRT_API_TOKEN: ${{ secrets.CRT_API_TOKEN }}
           CRT_SERVER_URL: ${{ secrets.CRT_SERVER_URL }}
+          CRT_TEST_JOB_ID: ${{ secrets.CRT_TEST_JOB_ID }}
         run: |
           curl -X POST "${CRT_SERVER_URL}/api/v1/test/execute" \
             -H "Authorization: Bearer ${CRT_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d '{
-              "suiteId": "your-suite-id",
-              "parameters": {
-                "environment": "staging",
-                "browser": "chrome"
+            -d "{
+              \"jobId\": \"${CRT_TEST_JOB_ID}\",
+              \"parameters\": {
+                \"environment\": \"staging\",
+                \"browser\": \"chrome\"
               }
-            }'
+            }"
 
       - name: Wait for Test Completion (optional)
         run: |
