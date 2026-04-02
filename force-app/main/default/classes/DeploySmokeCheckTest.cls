@@ -1,4 +1,4 @@
-@IsTest(testFor='ApexClass: DeploySmokeCheck')
+@IsTest
 private class DeploySmokeCheckTest {
 
     @IsTest
