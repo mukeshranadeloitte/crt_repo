@@ -9,5 +9,5 @@ Library                         FakerLibrary
 
 *** Test Cases ***
 UserCreation
-    OpenBrowser        Chrome
-    GoTo               https://orgfarm-fae880852c-dev-ed.develop.lightning.force.com
+    Open Browser    about:blank    chrome
+    GoTo            https://orgfarm-fae880852c-dev-ed.develop.lightning.force.com
