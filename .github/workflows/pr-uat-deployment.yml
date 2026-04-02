@@ -1,22 +1,15 @@
 # Description: PR-triggered deployment pipeline for UAT branch
-# Deploys delta changes on PR open/update, then triggers CRT smoke tests
-name: PR_UAT_Deployment_And_SmokeTest
+# Deploys delta changes on PR open/update, then triggers CRT test job after successful deploy
+name: PR_UAT_Deployment_And_CRT_TestJob
 
 on:
   pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-    branches:
-      - uat
+    types: [opened, synchronize, reopened]
+    branches: [uat]
     paths:
       - "force-app/**"
 
 jobs:
-  # ──────────────────────────────────────────────
-  # JOB 1: Deploy delta changes to the UAT org
-  # ──────────────────────────────────────────────
   deploy:
     name: Deploy Delta to UAT Org
     runs-on: ubuntu-latest
@@ -26,7 +19,7 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history required for delta calculation
+          fetch-depth: 0
 
       - name: Git Log
         run: git log --oneline -20
@@ -43,13 +36,12 @@ jobs:
       - name: Install sfdx-git-delta plugin
         run: |
           echo y | sf plugins install sfdx-git-delta
-          git config --global --add safe.directory /home/runner/work/crt_repo/crt_repo
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Build delta package (PR head vs UAT base)
-        # Computes the diff between the PR head commit and the target UAT branch tip
         run: |
           sf sgd:source:delta \
-            --to   "HEAD" \
+            --to "HEAD" \
             --from "${{ github.event.pull_request.base.sha }}" \
             --output-dir "." \
             --source-dir force-app/
@@ -68,7 +60,6 @@ jobs:
           sf org login sfdx-url --sfdx-url-file SF_envnameLogin_URL.txt
 
       - name: Deploy with destructive changes
-        # Runs when destructive changes are present (members exist in the XML)
         run: |
           if [ -f destructiveChanges/destructiveChanges.xml ] && \
              { grep -q '<types>' destructiveChanges/destructiveChanges.xml || \
@@ -83,7 +74,6 @@ jobs:
           fi
 
       - name: Deploy (no destructive changes)
-        # Runs when there are no destructive changes
         run: |
           if ! { [ -f destructiveChanges/destructiveChanges.xml ] && \
                  { grep -q '<types>' destructiveChanges/destructiveChanges.xml || \
@@ -95,40 +85,50 @@ jobs:
             echo "Destructive deploy was handled in the previous step — skipping plain deploy."
           fi
 
-  # ──────────────────────────────────────────────
-  # JOB 2: Trigger CRT smoke tests (runs only after deploy succeeds)
-  # ──────────────────────────────────────────────
-  smoke-test:
-    name: Trigger CRT Smoke Test
+  crt-testjob:
+    name: Trigger CRT Test Job (post-deploy)
     runs-on: ubuntu-latest
-    needs: deploy   # only runs if deploy job succeeds
+    needs: deploy
+    if: ${{ needs.deploy.result == 'success' }}
     timeout-minutes: 30
 
     steps:
-      - name: Trigger smoke test run via Copado Robotic Testing API
-        # Calls the CRT API to start the smoke-test suite defined by CRT_SMOKE_TEST_SUITE_ID.
-        # Required secrets:
-        #   CRT_API_TOKEN        – CRT personal / service-account API token
-        #   CRT_SMOKE_TEST_SUITE_ID – ID of the test suite to run (Settings > Test Suites in CRT)
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Trigger CRT Test Job run
+        env:
+          CRT_API_BASE: ${{ vars.CRT_API_BASE }}          # e.g., EU CRT API base (per your tenant)
+          CRT_API_TOKEN: ${{ secrets.CRT_API_TOKEN }}     # CRT API token / personal access key
+          CRT_TEST_JOB_ID: ${{ secrets.CRT_TEST_JOB_ID }} # CRT Test Job ID
         run: |
           RESPONSE=$(curl --silent --show-error --fail \
             --request POST \
-            --url "https://api.copado.com/robotic-testing/v1/test-suites/${{ secrets.CRT_SMOKE_TEST_SUITE_ID }}/runs" \
-            --header "Authorization: Bearer ${{ secrets.CRT_API_TOKEN }}" \
+            --url "${CRT_API_BASE}/robotic-testing/v1/test-jobs/${CRT_TEST_JOB_ID}/runs" \
+            --header "Authorization: Bearer ${CRT_API_TOKEN}" \
             --header "Content-Type: application/json" \
-            --data '{
-              "environment": "UAT",
-              "branch":      "${{ github.head_ref }}",
-              "pr_number":   "${{ github.event.pull_request.number }}"
-            }')
-          echo "CRT API response: $RESPONSE"
-          RUN_ID=$(echo "$RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-          echo "CRT Run ID: $RUN_ID"
-          echo "CRT_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+            --data "{
+              \"environment\": \"UAT\",
+              \"branch\": \"${{ github.head_ref }}\",
+              \"pr_number\": \"${{ github.event.pull_request.number }}\"
+            }")
 
-      - name: Poll CRT for smoke test result
-        # Polls every 30 s (up to 25 min) until the run reaches a terminal state.
-        # Terminal states: PASSED, FAILED, ERROR, CANCELLED
+          echo "CRT API response: ${RESPONSE}"
+          RUN_ID=$(echo "${RESPONSE}" | jq -r '.id // empty')
+
+          if [ -z "${RUN_ID}" ] || [ "${RUN_ID}" = "null" ]; then
+            echo "Could not parse run id from CRT response."
+            exit 1
+          fi
+
+          echo "CRT_RUN_ID=${RUN_ID}" >> "${GITHUB_ENV}"
+
+      - name: Poll CRT run status
+        env:
+          CRT_API_BASE: ${{ vars.CRT_API_BASE }}
+          CRT_API_TOKEN: ${{ secrets.CRT_API_TOKEN }}
         run: |
           MAX_ATTEMPTS=50
           SLEEP_SECONDS=30
@@ -136,37 +136,33 @@ jobs:
 
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             ATTEMPT=$((ATTEMPT + 1))
-            echo "Polling attempt $ATTEMPT / $MAX_ATTEMPTS …"
+            echo "Polling attempt $ATTEMPT / $MAX_ATTEMPTS ..."
 
             STATUS_RESPONSE=$(curl --silent --show-error --fail \
               --request GET \
-              --url "https://api.copado.com/robotic-testing/v1/runs/$CRT_RUN_ID" \
-              --header "Authorization: Bearer ${{ secrets.CRT_API_TOKEN }}" \
+              --url "${CRT_API_BASE}/robotic-testing/v1/runs/${CRT_RUN_ID}" \
+              --header "Authorization: Bearer ${CRT_API_TOKEN}" \
               --header "Content-Type: application/json")
 
-            echo "Status response: $STATUS_RESPONSE"
-            RUN_STATUS=$(echo "$STATUS_RESPONSE" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
-            echo "Current status: $RUN_STATUS"
+            echo "Status response: ${STATUS_RESPONSE}"
+            RUN_STATUS=$(echo "${STATUS_RESPONSE}" | jq -r '.status // empty')
+            echo "Current status: ${RUN_STATUS}"
 
-            case "$RUN_STATUS" in
+            case "${RUN_STATUS}" in
               PASSED)
-                echo "✅ Smoke tests PASSED."
+                echo "CRT tests PASSED."
                 exit 0
                 ;;
-              FAILED|ERROR)
-                echo "❌ Smoke tests $RUN_STATUS."
-                exit 1
-                ;;
-              CANCELLED)
-                echo "⚠️ Smoke test run was CANCELLED."
+              FAILED|ERROR|CANCELLED)
+                echo "CRT tests ended with status: ${RUN_STATUS}"
                 exit 1
                 ;;
               *)
-                echo "Run is still in progress (status: $RUN_STATUS). Waiting ${SLEEP_SECONDS}s …"
+                echo "Run still in progress (status: ${RUN_STATUS}). Waiting ${SLEEP_SECONDS}s ..."
                 sleep $SLEEP_SECONDS
                 ;;
             esac
           done
 
-          echo "❌ Timed out waiting for CRT smoke tests to complete."
+          echo "Timed out waiting for CRT tests."
           exit 1
