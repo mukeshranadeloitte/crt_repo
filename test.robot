@@ -14,3 +14,6 @@ Suite Teardown                  End suite
 UserCreation
     Open Browser    about:blank    chrome
     GoTo            https://orgfarm-fae880852c-dev-ed.develop.lightning.force.com
+    TypeText                    Username                    mukeshrana1909.8b565d512db3@agentforce.com             delay=1
+    TypeSecret                  Password                    Salesforce@032026
+    ClickText                   Log In
