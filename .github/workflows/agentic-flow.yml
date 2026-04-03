@@ -1,0 +1,147 @@
+name: Agentic DevOps Pipeline
+
+on:
+  pull_request:
+    branches: ["uat"]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  issues: write
+
+jobs:
+  automated-governance:
+    name: Automated Hard Gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      - name: Install Salesforce Scanner plugin
+        run: sf plugins install @salesforce/sfdx-scanner
+
+      - name: Salesforce Code Analyzer
+        continue-on-error: true
+        run: |
+          sf scanner run \
+            --target "./force-app" \
+            --format "csv" \
+            --outfile "sfdx-report.csv" \
+            --severity-threshold 3
+
+      - name: Upload scanner report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfdx-report
+          path: sfdx-report.csv
+          if-no-files-found: warn
+
+      - name: Fortify Security Scan
+        uses: fortify/github-action@v1
+        with:
+          sast-scan: true
+
+      - name: Authenticate to UAT org
+        env:
+          SFDX_AUTH_URL: ${{ secrets.CRT_UAT_AUTHURL }}
+        run: |
+          echo "$SFDX_AUTH_URL" > sfdxAuthUrl.txt
+          sf org login sfdx-url --sfdx-url-file sfdxAuthUrl.txt --alias uat --set-default
+          rm -f sfdxAuthUrl.txt
+
+      - name: Run Apex tests with coverage (JSON output)
+        run: |
+          sf apex run test \
+            --target-org uat \
+            --code-coverage \
+            --result-format json \
+            --wait 30 > test-result.json
+
+      - name: Enforce minimum 75% test coverage
+        shell: bash
+        run: |
+          COVERAGE=$(jq -r '.result.summary.testRunCoverage // 0' test-result.json)
+          echo "Coverage: ${COVERAGE}%"
+          awk -v c="$COVERAGE" 'BEGIN { exit (c+0 < 75) ? 1 : 0 }' || {
+            echo "Coverage below 75%"
+            exit 1
+          }
+
+      - name: Check destructive changes presence
+        id: destructive-check
+        shell: bash
+        run: |
+          if [ -f "manifest/destructiveChanges.xml" ] || [ -f "manifest/destructveChanges.xml" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment reminder for destructive changes backup
+        if: steps.destructive-check.outputs.present == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: "Detected destructive changes file. Please confirm data backup is completed before deployment approval."
+            });
+
+  manual-validation:
+    name: Manual Agent Validation (ReleaseGate)
+    needs: automated-governance
+    runs-on: ubuntu-latest
+    environment:
+      name: ReleaseGate
+      url: ${{ github.server_url }}/${{ github.repository }}/blob/main/docs/manual_runbook.md
+
+    steps:
+      - name: Log approval
+        run: echo "Manual validation complete. Releasing robots."
+
+  robotic-testing:
+    name: Robotic Execution
+    needs: manual-validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Invoke Copado Robotic Testing
+        env:
+          COPADO_BASE_URL: ${{ secrets.COPADO_BASE_URL }}
+          COPADO_PROJECT_ID: ${{ secrets.COPADO_PROJECT_ID }}
+          COPADO_API_KEY: ${{ secrets.COPADO_API_KEY }}
+        run: |
+          if [ -z "$COPADO_BASE_URL" ] || [ -z "$COPADO_PROJECT_ID" ] || [ -z "$COPADO_API_KEY" ]; then
+            echo "Missing one or more Copado secrets: COPADO_BASE_URL, COPADO_PROJECT_ID, COPADO_API_KEY"
+            exit 1
+          fi
+
+          curl -sS -X POST "${COPADO_BASE_URL}/${COPADO_PROJECT_ID}/robots/trigger" \
+            -H "Authorization: Bearer ${COPADO_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"testSuite": "Regression_Suite_v2"}'
+
+      - name: Mark story deployed
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: "Deployed: Copado robots have been triggered."
+            });
