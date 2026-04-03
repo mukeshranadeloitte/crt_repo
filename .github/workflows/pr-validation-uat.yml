@@ -1,0 +1,865 @@
+name: PR Validation UAT + Security Gates + Auto Merge + Deploy
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REQUIRED SECRETS  (Settings → Secrets and variables → Actions → Secrets)
+#
+#   SFDX_AUTH_URL_UAT     – SFDX auth URL for the UAT org
+#                           Obtain with: sf org display --verbose --target-org <alias>
+#   CX_CLIENT_SECRET      – CheckMarx One client secret
+#   FOD_CLIENT_SECRET     – Fortify on Demand client secret
+#   FOD_DAST_SCAN_URL     – (optional) FoD DAST target URL; omit entirely to skip DAST
+#
+# REQUIRED VARIABLES  (Settings → Secrets and variables → Actions → Variables)
+#
+#   Salesforce:
+#     ORG_ALIAS             – e.g. "uat-org"
+#     DELTA_FROM_COMMIT_VAR – (optional) fixed baseline SHA; defaults to PR base SHA
+#     COVERAGE_THRESHOLD    – integer, e.g. "75"
+#     SOURCE_DIR            – e.g. "force-app"
+#
+#   CheckMarx:
+#     CX_BASE_URI           – e.g. "https://ast.checkmarx.net"
+#     CX_TENANT             – CheckMarx tenant name
+#     CX_CLIENT_ID          – CheckMarx OAuth client ID
+#     CX_PROJECT_NAME       – (optional) defaults to <org>/<repo>
+#
+#   Fortify:
+#     FOD_URL               – e.g. "https://ams.fortify.com"
+#     FOD_CLIENT_ID         – FoD client ID (not a secret)
+#     FOD_APP_NAME          – FoD application name
+#     FOD_RELEASE_NAME      – FoD release name
+#
+# BRANCH PROTECTION  (Settings → Branches → <rule for uat / UberDemo>)
+#   Add as required status checks to block merge until all pass:
+#     • "Salesforce Validation"
+#     • "SCA Gate"
+#     • "CheckMarx SAST"        (when CheckMarx is in use)
+#     • "Fortify SAST / DAST"   (when Fortify is in use)
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  pull_request:
+    branches:
+      - uat
+      - UberDemo
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+    paths:
+      - 'force-app/**'
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      scanner:
+        description: 'Security scanner(s) to run'
+        required: false
+        default: 'all'
+        type: choice
+        options: [all, checkmarx, fortify]
+
+# One active run per PR; new pushes cancel in-progress runs for the same PR.
+concurrency:
+  group: pr-validation-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+# ── Global configurable values (all overridable via repository variables) ─────
+env:
+  ORG_ALIAS:             ${{ vars.ORG_ALIAS             || 'uat-org' }}
+  DELTA_FROM_COMMIT_VAR: ${{ vars.DELTA_FROM_COMMIT_VAR || '' }}
+  COVERAGE_THRESHOLD:    ${{ vars.COVERAGE_THRESHOLD    || '75' }}
+  SOURCE_DIR:            ${{ vars.SOURCE_DIR            || 'force-app' }}
+  CX_BASE_URI:           ${{ vars.CX_BASE_URI           || '' }}
+  CX_TENANT:             ${{ vars.CX_TENANT             || '' }}
+  CX_CLIENT_ID:          ${{ vars.CX_CLIENT_ID          || '' }}
+  CX_PROJECT_NAME:       ${{ vars.CX_PROJECT_NAME       || github.repository }}
+  FOD_URL:               ${{ vars.FOD_URL               || 'https://ams.fortify.com' }}
+  FOD_CLIENT_ID:         ${{ vars.FOD_CLIENT_ID         || '' }}
+  FOD_APP_NAME:          ${{ vars.FOD_APP_NAME          || '' }}
+  FOD_RELEASE_NAME:      ${{ vars.FOD_RELEASE_NAME      || '' }}
+
+# ══════════════════════════════════════════════════════════════════════════════
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: setup
+  # Determines which security scanners should run based on available secrets
+  # and the `scanner` workflow input.  Outputs are consumed by checkmarx and
+  # fortify jobs so those jobs can skip cleanly when tools are not configured.
+  # ────────────────────────────────────────────────────────────────────────────
+  setup:
+    name: Setup / Scanner Flags
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run-checkmarx: ${{ steps.flags.outputs.run-checkmarx }}
+      run-fortify:   ${{ steps.flags.outputs.run-fortify }}
+      has-dast-url:  ${{ steps.flags.outputs.has-dast-url }}
+    steps:
+      - name: Compute scanner flags
+        id: flags
+        env:
+          CX_SECRET:    ${{ secrets.CX_CLIENT_SECRET }}
+          FOD_SECRET:   ${{ secrets.FOD_CLIENT_SECRET }}
+          FOD_DAST_URL: ${{ secrets.FOD_DAST_SCAN_URL }}
+          SCANNER:      ${{ inputs.scanner || 'all' }}
+        run: |
+          set -euo pipefail
+          RUN_CX=false
+          RUN_FORTIFY=false
+          HAS_DAST=false
+
+          if [[ -n "${CX_SECRET}" && ( "${SCANNER}" == "checkmarx" || "${SCANNER}" == "all" ) ]]; then
+            RUN_CX=true
+          fi
+          if [[ -n "${FOD_SECRET}" && ( "${SCANNER}" == "fortify" || "${SCANNER}" == "all" ) ]]; then
+            RUN_FORTIFY=true
+          fi
+          [[ -n "${FOD_DAST_URL}" ]] && HAS_DAST=true
+
+          echo "run-checkmarx=${RUN_CX}"   >> "$GITHUB_OUTPUT"
+          echo "run-fortify=${RUN_FORTIFY}" >> "$GITHUB_OUTPUT"
+          echo "has-dast-url=${HAS_DAST}"   >> "$GITHUB_OUTPUT"
+          echo "Flags: run-checkmarx=${RUN_CX}  run-fortify=${RUN_FORTIFY}  has-dast-url=${HAS_DAST}"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: sf-validate
+  # Full Salesforce check-only validation pipeline:
+  #   1. Build sfdx-git-delta package + destructive manifests
+  #   2. Resolve Apex test classes (explicit PR body → convention inference)
+  #   3. Check-only deploy (RunSpecifiedTests | NoTestRun)
+  #   4. Coverage threshold enforcement
+  #   5. Salesforce Code Analyzer → scanner-report.csv
+  # ────────────────────────────────────────────────────────────────────────────
+  sf-validate:
+    name: Salesforce Validation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      apex-changed:    ${{ steps.delta.outputs.apex-changed }}
+      test-classes:    ${{ steps.tests.outputs.test-classes }}
+      has-package:     ${{ steps.delta.outputs.has-package }}
+      has-destructive: ${{ steps.delta.outputs.has-destructive }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install npm dependencies
+        run: |
+          set -euo pipefail
+          [[ -f package-lock.json ]] && npm ci || npm install
+
+      - name: Install Salesforce CLI
+        run: |
+          set -euo pipefail
+          npm install --global @salesforce/cli@latest
+          sf --version
+
+      - name: Authenticate to Salesforce org
+        env:
+          # Secret name corresponds to SFDX_AUTH_SECRET_NAME config key.
+          # GitHub Actions does not support dynamic secret lookup by variable name;
+          # the secret must be stored under the hardcoded name SFDX_AUTH_URL_UAT.
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL_UAT }}
+        run: |
+          set -euo pipefail
+          echo "${SFDX_AUTH_URL}" | sf org login sfdx-url \
+            --sfdx-url-stdin --alias "${ORG_ALIAS}" --set-default
+
+      - name: Install sfdx-git-delta
+        run: |
+          set -euo pipefail
+          echo "y" | sf plugins install sfdx-git-delta
+
+      # ── Delta build ──────────────────────────────────────────────────────────
+      # sfdx-git-delta compares FROM..HEAD and writes:
+      #   package/package.xml                      — added/modified components
+      #   destructiveChanges/destructiveChanges.xml — deleted components
+      # Both manifests are logged and uploaded as artifacts when non-empty.
+      - name: Build delta package
+        id: delta
+        run: |
+          set -euo pipefail
+          # Prefer explicit baseline commit; fall back to PR base SHA.
+          FROM="${DELTA_FROM_COMMIT_VAR:-${{ github.event.pull_request.base.sha }}}"
+          mkdir -p package destructiveChanges
+
+          sf sgd source delta \
+            --to HEAD --from "${FROM}" \
+            --output . --source-dir "${SOURCE_DIR}" \
+            --generate-delta
+
+          HAS_PKG=false
+          HAS_DEST=false
+          APEX=false
+
+          if [[ -f package/package.xml ]]; then
+            HAS_PKG=true
+            echo "════ package/package.xml ════"
+            cat package/package.xml
+            grep -qE 'ApexClass|ApexTrigger' package/package.xml && APEX=true || true
+          fi
+
+          if [[ -f destructiveChanges/destructiveChanges.xml ]]; then
+            HAS_DEST=true
+            echo "════ destructiveChanges/destructiveChanges.xml ════"
+            cat destructiveChanges/destructiveChanges.xml
+          fi
+
+          echo "has-package=${HAS_PKG}"      >> "$GITHUB_OUTPUT"
+          echo "has-destructive=${HAS_DEST}" >> "$GITHUB_OUTPUT"
+          echo "apex-changed=${APEX}"        >> "$GITHUB_OUTPUT"
+
+      - name: Upload delta manifests
+        if: steps.delta.outputs.has-package == 'true' || steps.delta.outputs.has-destructive == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: delta-manifests-validation
+          path: |
+            package/package.xml
+            destructiveChanges/destructiveChanges.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ── Test class resolution ────────────────────────────────────────────────
+      # Priority 1 — explicit: parse "tests: Class1Test,Class2Test" from PR body.
+      # Priority 2 — infer: for every Apex member M produce M+Test, M+Tests, M+TestClass.
+      # Hard failure if Apex changed and neither source yields test classes.
+      - name: Resolve test classes
+        id: tests
+        env:
+          PR_BODY:      ${{ github.event.pull_request.body || '' }}
+          APEX_CHANGED: ${{ steps.delta.outputs.apex-changed }}
+        run: |
+          set -euo pipefail
+          TEST_CLASSES=""
+
+          # 1. Explicit list from PR body: "tests: ClassA,ClassB"
+          EXPLICIT=$(echo "${PR_BODY}" \
+            | grep -ioP '(?<=tests:\s{0,4})[\w,\s]+' \
+            | head -1 | tr -d ' ' || true)
+          if [[ -n "${EXPLICIT}" ]]; then
+            TEST_CLASSES="${EXPLICIT}"
+            echo "Tests from PR body: ${TEST_CLASSES}"
+          fi
+
+          # 2. Convention-based inference when no explicit list is present
+          if [[ -z "${TEST_CLASSES}" && "${APEX_CHANGED}" == "true" && -f package/package.xml ]]; then
+            INFERRED=""
+            while IFS= read -r cls; do
+              cls=$(echo "${cls}" | xargs)
+              [[ -z "${cls}" || "${cls}" == "*" ]] && continue
+              for suffix in Test Tests TestClass; do
+                INFERRED="${INFERRED:+${INFERRED},}${cls}${suffix}"
+              done
+            done < <(grep -oP '(?<=<members>)[^<]+(?=</members>)' package/package.xml \
+                     | grep -v '^\*' || true)
+            TEST_CLASSES="${INFERRED}"
+            [[ -n "${TEST_CLASSES}" ]] && echo "Tests inferred by convention: ${TEST_CLASSES}"
+          fi
+
+          # 3. Hard gate: Apex changed with no tests identified
+          if [[ "${APEX_CHANGED}" == "true" && -z "${TEST_CLASSES}" ]]; then
+            echo "::error::Apex classes/triggers changed but no test classes were specified or inferred."
+            echo "::error::Add 'tests: MyClassTest,MyOtherTest' to the PR description and repush."
+            exit 1
+          fi
+
+          echo "test-classes=${TEST_CLASSES}" >> "$GITHUB_OUTPUT"
+
+      # ── Check-only deploy ────────────────────────────────────────────────────
+      # Each test class is passed as a separate --tests flag; the SF CLI does NOT
+      # accept a comma-joined string for RunSpecifiedTests.
+      - name: Validate deploy (check-only)
+        env:
+          APEX_CHANGED: ${{ steps.delta.outputs.apex-changed }}
+          TEST_CLASSES:  ${{ steps.tests.outputs.test-classes }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+            --source-dir "${SOURCE_DIR}"
+            --target-org "${ORG_ALIAS}"
+            --check-only
+            --wait 30
+            --coverage-formatters json
+            --results-dir deploy-results
+          )
+
+          if [[ "${APEX_CHANGED}" == "true" ]]; then
+            ARGS+=(--test-level RunSpecifiedTests)
+            # Split on comma; pass each class individually — SF CLI requires one flag per class
+            IFS=',' read -ra CLASSES <<< "${TEST_CLASSES}"
+            for cls in "${CLASSES[@]}"; do
+              cls=$(echo "${cls}" | xargs)
+              [[ -n "${cls}" ]] && ARGS+=(--tests "${cls}")
+            done
+          else
+            ARGS+=(--test-level NoTestRun)
+          fi
+
+          sf project deploy start "${ARGS[@]}"
+
+          # Enforce average org coverage threshold
+          if [[ "${APEX_CHANGED}" == "true" && -f deploy-results/coverage/coverage.json ]]; then
+            COVERAGE=$(node -e "
+              const c = require('./deploy-results/coverage/coverage.json');
+              const v = Object.values(c);
+              if (!v.length) { process.stdout.write('0'); process.exit(0); }
+              process.stdout.write(String(
+                Math.floor(v.reduce((s, f) => s + (f.coveredPercent || 0), 0) / v.length)
+              ));
+            ")
+            echo "Org average coverage: ${COVERAGE}%"
+            if (( COVERAGE < COVERAGE_THRESHOLD )); then
+              echo "::error::Coverage ${COVERAGE}% is below the required threshold of ${COVERAGE_THRESHOLD}%."
+              exit 1
+            fi
+          fi
+
+      # ── Salesforce Code Analyzer ─────────────────────────────────────────────
+      # Runs PMD + ESLint + RetireJS, outputs scanner-report.csv, previews first
+      # 30 lines in logs, and uploads the full report as a workflow artifact.
+      # The `|| true` keeps the job green when violations are found (advisory mode);
+      # change to `|| false` to make violations a hard gate.
+      - name: Run Salesforce Code Analyzer
+        run: |
+          set -euo pipefail
+          sf plugins install @salesforce/sfdx-scanner --force || true
+          sf scanner run \
+            --target "${SOURCE_DIR}" \
+            --format csv \
+            --outfile scanner-report.csv \
+            --engine pmd,eslint,retire-js || true
+          echo "════ scanner-report.csv (first 30 lines) ════"
+          head -30 scanner-report.csv || true
+
+      - name: Upload scanner report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: salesforce-scanner-report
+          path: scanner-report.csv
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: sca
+  # Software Composition Analysis gate.  Must pass before CheckMarx and Fortify
+  # jobs are allowed to start, enforcing the pipeline ordering requirement.
+  # ────────────────────────────────────────────────────────────────────────────
+  sca:
+    name: SCA Gate
+    runs-on: ubuntu-latest
+    needs: sf-validate
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          [[ -f package-lock.json ]] && npm ci || npm install
+
+      - name: Dependency audit (SCA)
+        run: |
+          set -euo pipefail
+          npm audit --audit-level=high
+          echo "SCA dependency audit passed."
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: checkmarx
+  # SAST + IaC security (KICS) scan via CheckMarx One.
+  # Skipped automatically when CX_CLIENT_SECRET is absent or scanner is not
+  # "checkmarx" / "all".
+  # ────────────────────────────────────────────────────────────────────────────
+  checkmarx:
+    name: CheckMarx SAST
+    runs-on: ubuntu-latest
+    needs: [setup, sca]
+    if: |
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') &&
+      needs.setup.outputs.run-checkmarx == 'true'
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pinned to immutable tag 2.0.36.  Update when CheckMarx publishes a newer
+      # verified release tag.
+      - name: CheckMarx One scan
+        uses: checkmarx/ast-github-action@2.0.36
+        with:
+          base_uri:         ${{ env.CX_BASE_URI }}
+          cx_tenant:        ${{ env.CX_TENANT }}
+          cx_client_id:     ${{ env.CX_CLIENT_ID }}
+          cx_client_secret: ${{ secrets.CX_CLIENT_SECRET }}
+          project_name:     ${{ env.CX_PROJECT_NAME }}
+          additional_params: >-
+            --scan-types sast,kics
+            --report-format sarif
+            --output-path .
+            --output-name cx_result
+
+      - name: Upload CheckMarx SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cx-sarif
+          path: cx_result.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload CheckMarx SARIF to GitHub Code Scanning
+        if: always() && hashFiles('cx_result.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: cx_result.sarif
+          category:   checkmarx
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: fortify
+  # SAST via Fortify on Demand (FoD).  Optional DAST via fcli when the
+  # FOD_DAST_SCAN_URL secret is configured; direct DAST URL injection is not
+  # supported by the official fortify/github-action, so fcli is used instead.
+  # ────────────────────────────────────────────────────────────────────────────
+  fortify:
+    name: Fortify SAST / DAST
+    runs-on: ubuntu-latest
+    needs: [setup, sca]
+    if: |
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') &&
+      needs.setup.outputs.run-fortify == 'true'
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      # Propagate setup output so step-level `if:` conditions can reference it.
+      HAS_DAST_URL: ${{ needs.setup.outputs.has-dast-url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Fortify tools (fcli + ScanCentral client)
+        uses: fortify/github-action/setup@v2
+        with:
+          export-path: true
+          fcli:        latest
+          sc-client:   latest
+
+      # DO_EXPORT=true triggers `fcli fod issue export-sarif` after scan completion,
+      # producing a SARIF file in the workspace.
+      - name: Fortify FoD SAST scan
+        uses: fortify/github-action/fod-sast-scan@v2
+        env:
+          FOD_URL:             ${{ env.FOD_URL }}
+          FOD_CLIENT_ID:       ${{ env.FOD_CLIENT_ID }}
+          FOD_CLIENT_SECRET:   ${{ secrets.FOD_CLIENT_SECRET }}
+          FOD_APP_AND_RELEASE: ${{ env.FOD_APP_NAME }}:${{ env.FOD_RELEASE_NAME }}
+          DO_WAIT:             'true'
+          DO_EXPORT:           'true'
+
+      # The action may emit the SARIF under a version-dependent filename;
+      # locate it and normalise to a stable name for subsequent steps.
+      - name: Normalise SAST SARIF filename
+        run: |
+          set -euo pipefail
+          SARIF=$(find . -maxdepth 3 -name '*.sarif' ! -name 'fortify-dast.sarif' | head -1 || true)
+          if [[ -n "${SARIF}" ]]; then
+            mv "${SARIF}" fortify-sast.sarif
+            echo "SAST SARIF normalised to: fortify-sast.sarif"
+          else
+            echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[]}' \
+              > fortify-sast.sarif
+            echo "No SAST SARIF produced; created empty placeholder."
+          fi
+
+      - name: Upload Fortify SAST SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fortify-sast-sarif
+          path: fortify-sast.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Fortify SAST SARIF to GitHub Code Scanning
+        if: always() && hashFiles('fortify-sast.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: fortify-sast.sarif
+          category:   fortify-sast
+
+      # ── DAST — only when FOD_DAST_SCAN_URL secret is configured ─────────────
+      # Uses fcli directly because fortify/github-action/fod-dast-scan does not
+      # accept an arbitrary scan URL as input; fcli exposes the full FoD DAST API.
+      - name: Fortify FoD DAST scan (fcli)
+        if: env.HAS_DAST_URL == 'true'
+        env:
+          FOD_DAST_SCAN_URL: ${{ secrets.FOD_DAST_SCAN_URL }}
+          FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+
+          fcli fod session login \
+            --url "${FOD_URL}" \
+            --client-id "${FOD_CLIENT_ID}" \
+            --client-secret "${FOD_CLIENT_SECRET}" \
+            --session dast-session
+
+          SCAN_ID=$(fcli fod dast-scan start \
+            --release "${FOD_APP_NAME}:${FOD_RELEASE_NAME}" \
+            --url "${FOD_DAST_SCAN_URL}" \
+            --session dast-session \
+            --output "expr={scanId}")
+
+          echo "DAST scan ID: ${SCAN_ID}"
+          fcli fod dast-scan wait-for "${SCAN_ID}" --session dast-session
+
+          # Export full issue list as JSON for the artifact archive
+          fcli fod issue list \
+            --release "${FOD_APP_NAME}:${FOD_RELEASE_NAME}" \
+            --session dast-session \
+            --output json > fod-dast-results.json || true
+
+          # Best-effort SARIF export; gracefully fall back to an empty SARIF document
+          # when the installed fcli version does not yet implement the subcommand.
+          fcli fod dast-scan export-sarif "${SCAN_ID}" \
+            --output fortify-dast.sarif \
+            --session dast-session 2>/dev/null \
+            || echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[]}' \
+               > fortify-dast.sarif
+
+          fcli fod session logout --session dast-session || true
+
+      - name: Upload Fortify DAST artifacts
+        if: env.HAS_DAST_URL == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fortify-dast-results
+          path: |
+            fod-dast-results.json
+            fortify-dast.sarif
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Fortify DAST SARIF to GitHub Code Scanning
+        if: env.HAS_DAST_URL == 'true' && hashFiles('fortify-dast.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: fortify-dast.sarif
+          category:   fortify-dast
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: approve-and-merge
+  # Runs only when a PR review is submitted with state "approved".
+  #
+  # Guard 1 — Stale-approval:
+  #   Compares review.commit_id with the current PR head SHA.  If they differ
+  #   the approval is stale (a new push happened after the review) and the job
+  #   fails, preventing deployment of unreviewed code.
+  #
+  # Guard 2 — Required-checks verification:
+  #   Queries GET /repos/{repo}/commits/{sha}/check-runs (all pages) and accepts
+  #   a check as passing when ANY entry has status=completed AND conclusion=success.
+  #   Using ANY (not the most-recent entry) is critical: when pull_request_review
+  #   triggers this workflow, jobs guarded by `if: github.event_name == 'pull_request'`
+  #   are skipped, producing NEW conclusion=skipped check-run records on the same SHA
+  #   that would otherwise shadow the earlier successful run if only the latest entry
+  #   were inspected.
+  # ────────────────────────────────────────────────────────────────────────────
+  approve-and-merge:
+    name: Approve & Auto-Merge
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved'
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      merge-commit-sha: ${{ steps.merge.outputs.merge-commit-sha }}
+      pr-number:        ${{ steps.merge.outputs.pr-number }}
+    steps:
+      - name: Stale-approval guard
+        env:
+          REVIEW_SHA: ${{ github.event.review.commit_id }}
+          HEAD_SHA:   ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          echo "Approval on commit : ${REVIEW_SHA}"
+          echo "PR head SHA        : ${HEAD_SHA}"
+          if [[ "${REVIEW_SHA}" != "${HEAD_SHA}" ]]; then
+            echo "::error::Stale approval detected."
+            echo "::error::Review was approved for ${REVIEW_SHA} but the current head is ${HEAD_SHA}."
+            echo "::error::Push a new commit or re-request review to obtain a fresh approval."
+            exit 1
+          fi
+          echo "Approval is current. ✓"
+
+      - name: Verify required checks passed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO:     ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Must exactly match the `name:` fields of jobs configured as
+          # required status checks in branch protection rules.
+          REQUIRED_CHECKS=(
+            "Salesforce Validation"
+            "SCA Gate"
+          )
+
+          GATE_PASSED=true
+
+          for CHECK in "${REQUIRED_CHECKS[@]}"; do
+            echo "── Verifying: ${CHECK}"
+            FOUND=false
+            PAGE=1
+
+            while true; do
+              RUNS=$(gh api \
+                "repos/${REPO}/commits/${HEAD_SHA}/check-runs?per_page=100&page=${PAGE}" \
+                --jq '.check_runs')
+
+              TOTAL=$(echo "${RUNS}" | jq 'length')
+              (( TOTAL == 0 )) && break
+
+              # Accept the check if ANY entry (not just the most recent) has
+              # status=completed and conclusion=success.  This is essential because
+              # when pull_request_review fires, skipped jobs emit new conclusion=skipped
+              # entries on the same SHA that would otherwise shadow earlier successes.
+              HITS=$(echo "${RUNS}" | jq --arg n "${CHECK}" \
+                '[.[] | select(.name == $n and .status == "completed" and .conclusion == "success")] | length')
+
+              if (( HITS > 0 )); then
+                FOUND=true
+                echo "   ✓ Completed+success entry found for '${CHECK}'"
+                break
+              fi
+
+              PAGE=$(( PAGE + 1 ))
+            done
+
+            if [[ "${FOUND}" == "false" ]]; then
+              echo "   ✗ No completed+success entry for '${CHECK}'"
+              GATE_PASSED=false
+            fi
+          done
+
+          if [[ "${GATE_PASSED}" == "false" ]]; then
+            echo "::error::One or more required checks have not passed. Merge blocked."
+            exit 1
+          fi
+          echo "All required checks passed. ✓"
+
+      - name: Auto-merge PR (merge commit)
+        id: merge
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
+          REPO:      ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Pass `sha` to prevent race: API rejects merge if head moved since guard ran.
+          RESPONSE=$(gh api --method PUT \
+            "repos/${REPO}/pulls/${PR_NUMBER}/merge" \
+            -f merge_method=merge \
+            -f sha="${HEAD_SHA}" \
+            -f commit_title="chore: auto-merge PR #${PR_NUMBER}")
+
+          MERGE_SHA=$(echo "${RESPONSE}" | jq -r '.sha')
+          echo "PR #${PR_NUMBER} merged. Merge commit SHA: ${MERGE_SHA}"
+
+          echo "merge-commit-sha=${MERGE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "pr-number=${PR_NUMBER}"         >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: deploy
+  # Real (non-check-only) deployment executed from the merge commit.
+  # Checks out the exact merge SHA, rebuilds the delta, re-evaluates test classes,
+  # and runs sf project deploy start without --check-only.
+  # Destructive changes (component deletions) are included via
+  # --post-destructive-changes when the manifest is present.
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to UAT Org
+    runs-on: ubuntu-latest
+    needs: approve-and-merge
+    permissions:
+      contents: read
+    steps:
+      # Checkout the merge commit — not the PR branch head.
+      - name: Checkout merged commit
+        uses: actions/checkout@v4
+        with:
+          ref:         ${{ needs.approve-and-merge.outputs.merge-commit-sha }}
+          fetch-depth: 0
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install npm dependencies
+        run: |
+          set -euo pipefail
+          [[ -f package-lock.json ]] && npm ci || npm install
+
+      - name: Install Salesforce CLI
+        run: |
+          set -euo pipefail
+          npm install --global @salesforce/cli@latest
+
+      - name: Authenticate to Salesforce org
+        env:
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL_UAT }}
+        run: |
+          set -euo pipefail
+          echo "${SFDX_AUTH_URL}" | sf org login sfdx-url \
+            --sfdx-url-stdin --alias "${ORG_ALIAS}" --set-default
+
+      - name: Install sfdx-git-delta
+        run: |
+          set -euo pipefail
+          echo "y" | sf plugins install sfdx-git-delta
+
+      # ── Rebuild delta from merge commit ──────────────────────────────────────
+      # FROM = first parent (^1) = the target-branch tip before the merge.
+      # This scopes the delta to exactly the changes introduced by the PR.
+      - name: Build delta from merge commit
+        id: delta
+        env:
+          MERGE_SHA: ${{ needs.approve-and-merge.outputs.merge-commit-sha }}
+        run: |
+          set -euo pipefail
+          FROM=$(git rev-parse "${MERGE_SHA}^1")
+          mkdir -p package destructiveChanges
+
+          sf sgd source delta \
+            --to "${MERGE_SHA}" --from "${FROM}" \
+            --output . --source-dir "${SOURCE_DIR}" \
+            --generate-delta
+
+          APEX=false
+          if [[ -f package/package.xml ]]; then
+            echo "════ package/package.xml ════"
+            cat package/package.xml
+            grep -qE 'ApexClass|ApexTrigger' package/package.xml && APEX=true || true
+          fi
+          if [[ -f destructiveChanges/destructiveChanges.xml ]]; then
+            echo "════ destructiveChanges/destructiveChanges.xml ════"
+            cat destructiveChanges/destructiveChanges.xml
+          fi
+
+          echo "apex-changed=${APEX}" >> "$GITHUB_OUTPUT"
+
+      # ── Re-evaluate test classes ──────────────────────────────────────────────
+      # PR body is not available at deploy time; use convention inference only.
+      - name: Resolve test classes
+        id: tests
+        env:
+          APEX_CHANGED: ${{ steps.delta.outputs.apex-changed }}
+        run: |
+          set -euo pipefail
+          TEST_CLASSES=""
+
+          if [[ "${APEX_CHANGED}" == "true" && -f package/package.xml ]]; then
+            INFERRED=""
+            while IFS= read -r cls; do
+              cls=$(echo "${cls}" | xargs)
+              [[ -z "${cls}" || "${cls}" == "*" ]] && continue
+              for suffix in Test Tests TestClass; do
+                INFERRED="${INFERRED:+${INFERRED},}${cls}${suffix}"
+              done
+            done < <(grep -oP '(?<=<members>)[^<]+(?=</members>)' package/package.xml \
+                     | grep -v '^\*' || true)
+            TEST_CLASSES="${INFERRED}"
+            [[ -n "${TEST_CLASSES}" ]] && echo "Test classes: ${TEST_CLASSES}"
+          fi
+
+          echo "test-classes=${TEST_CLASSES}" >> "$GITHUB_OUTPUT"
+
+      # ── Real deploy ───────────────────────────────────────────────────────────
+      - name: Deploy to org
+        id: deploy
+        env:
+          APEX_CHANGED: ${{ steps.delta.outputs.apex-changed }}
+          TEST_CLASSES:  ${{ steps.tests.outputs.test-classes }}
+        run: |
+          set -euo pipefail
+          BASE_ARGS=(
+            --target-org "${ORG_ALIAS}"
+            --wait 60
+            --coverage-formatters json
+            --results-dir deploy-results
+          )
+
+          if [[ "${APEX_CHANGED}" == "true" && -n "${TEST_CLASSES}" ]]; then
+            BASE_ARGS+=(--test-level RunSpecifiedTests)
+            IFS=',' read -ra CLASSES <<< "${TEST_CLASSES}"
+            for cls in "${CLASSES[@]}"; do
+              cls=$(echo "${cls}" | xargs)
+              [[ -n "${cls}" ]] && BASE_ARGS+=(--tests "${cls}")
+            done
+          else
+            BASE_ARGS+=(--test-level NoTestRun)
+          fi
+
+          if [[ -f destructiveChanges/destructiveChanges.xml && -f package/package.xml ]]; then
+            # Single transaction: deploy additions/modifications then apply deletions.
+            sf project deploy start "${BASE_ARGS[@]}" \
+              --manifest package/package.xml \
+              --post-destructive-changes destructiveChanges/destructiveChanges.xml
+          else
+            sf project deploy start "${BASE_ARGS[@]}" \
+              --source-dir "${SOURCE_DIR}"
+          fi
+
+      # ── Failure diagnostics ───────────────────────────────────────────────────
+      - name: Print diagnostics on failure
+        if: failure() && steps.deploy.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          echo "════ Component failures ════"
+          find deploy-results -name "*.json" -print0 \
+            | xargs -0 jq -r \
+              '.result.details.componentFailures[]?
+               | "  [\(.componentType)] \(.fullName): \(.problem)"' \
+              2>/dev/null || true
+
+          echo "════ Test failures ════"
+          find deploy-results -name "*.json" -print0 \
+            | xargs -0 jq -r \
+              '.result.details.runTestResult.failures[]?
+               | "  \(.name).\(.methodName): \(.message)"' \
+              2>/dev/null || true
+
+          echo "════ Per-class coverage ════"
+          find deploy-results -name "coverage.json" -print0 \
+            | xargs -0 jq -r \
+              'to_entries[]
+               | "  \(.key): \(.value.coveredPercent // 0)%"' \
+              2>/dev/null || true
