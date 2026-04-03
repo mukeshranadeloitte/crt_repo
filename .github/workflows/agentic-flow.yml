@@ -2,7 +2,7 @@ name: Agentic DevOps Pipeline
 
 on:
   pull_request:
-    branches: ["main"]
+    branches: ["uat"]
 
 permissions:
   contents: read
