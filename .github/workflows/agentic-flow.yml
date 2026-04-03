@@ -53,9 +53,18 @@ jobs:
         with:
           sast-scan: true
 
+      - name: Authenticate to UAT org
+        env:
+          SFDX_AUTH_URL: ${{ secrets.CRT_UAT_AUTHURL }}
+        run: |
+          echo "$SFDX_AUTH_URL" > sfdxAuthUrl.txt
+          sf org login sfdx-url --sfdx-url-file sfdxAuthUrl.txt --alias uat --set-default
+          rm -f sfdxAuthUrl.txt
+
       - name: Run Apex tests with coverage (JSON output)
         run: |
           sf apex run test \
+            --target-org uat \
             --code-coverage \
             --result-format json \
             --wait 30 > test-result.json
