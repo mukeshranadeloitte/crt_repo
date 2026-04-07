@@ -119,26 +119,37 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger CRT Test Job via API
+      - name: Trigger CRT Test Suite Run
         env:
           CRT_API_TOKEN: ${{ secrets.CRT_API_TOKEN }}
-          CRT_SUITE_ID:  ${{ vars.CRT_SUITE_ID }}
-          CRT_ROBOT_ID:  ${{ vars.CRT_ROBOT_ID || '64280' }}
+          CRT_JOB_ID:  ${{ vars.CRT_JOB_ID }}
         run: |
           set -euo pipefail
-          if [ -z "${CRT_API_TOKEN}" ]; then
-            echo "Missing required secret: CRT_API_TOKEN"
+          if [ -z "${CRT_API_TOKEN}" ] || [ -z "${CRT_JOB_ID}" ]; then
+            echo "Missing required secret/variable: CRT_API_TOKEN, CRT_JOB_ID"
             exit 1
           fi
 
-          curl -sS -f -X POST "https://eu-robotic.copado.com/api/v3/suites/${CRT_SUITE_ID}/runs" \
-            -H "Authorization: Bearer ${CRT_API_TOKEN}" \
+          # POST /api/v3/jobs/{jobId}/runs — triggers a run for a pre-configured CRT Job.
+          # The Job already has suite, robots, and environment stored in its definition.
+          # Find CRT_JOB_ID: CRT UI → Jobs → click job → copy ID from the URL.
+          RESPONSE=$(curl -sS -w "\n%{http_code}" \
+            -X POST "https://eu-robotic.copado.com/api/v3/jobs/${CRT_JOB_ID}/runs" \
+            -H "Authorization: apiKey ${CRT_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"suite_id\": \"${CRT_SUITE_ID}\",
-              \"robot_id\": \"${CRT_ROBOT_ID}\",
-              \"environment\": \"production\"
-            }"
+            -d '{}')
+
+          HTTP_CODE=$(echo "${RESPONSE}" | tail -1)
+          BODY=$(echo "${RESPONSE}" | head -n -1)
+          echo "HTTP ${HTTP_CODE}: ${BODY}"
+
+          if [[ "${HTTP_CODE}" -lt 200 || "${HTTP_CODE}" -ge 300 ]]; then
+            echo "::error::CRT API call failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+          RUN_ID=$(echo "${BODY}" | jq -r '.id // .runId // empty')
+          [ -n "${RUN_ID}" ] && echo "CRT run started — Run ID: ${RUN_ID}" || true
 
       - name: Mark story deployed
         uses: actions/github-script@v7
