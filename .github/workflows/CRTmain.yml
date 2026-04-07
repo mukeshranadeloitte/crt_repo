@@ -4,19 +4,40 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main 
+      - main
 
 jobs:
   trigger-test:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger CRT Job
+      - name: 🚀 Trigger CRT Job
+        env:
+          PROJECT_ID: ${{ secrets.CRT_PROJECT_ID }}
+          JOB_ID: ${{ secrets.CRT_TEST_JOB_ID }}
+          API_KEY: ${{ secrets.CRT_API_KEY }}
+
         run: |
-          curl -v -X POST "https://api.eu-robotic.copado.com/pace/v4/projects/${PROJECT_ID}/jobs/${JOB_ID}/builds" \
-            -H "Authorization: Bearer ${{ secrets.CRT_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"projectId\": \"${{ secrets.CRT_PROJECT_ID }}\",
-              \"testJobId\": \"${{ secrets.CRT_TEST_JOB_ID }}\"
-            }"
+          echo "PROJECT_ID=$PROJECT_ID"
+          echo "JOB_ID=$JOB_ID"
+
+          if [ -z "$PROJECT_ID" ] || [ -z "$JOB_ID" ]; then
+            echo "❌ Missing PROJECT_ID or JOB_ID"
+            exit 1
+          fi
+
+          RESPONSE=$(curl -s -X POST "https://api.eu-robotic.copado.com/pace/v4/projects/$PROJECT_ID/jobs/$JOB_ID/builds" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json")
+
+          echo "Response: $RESPONSE"
+
+          BUILD_ID=$(echo $RESPONSE | jq -r '.id')
+
+          if [ "$BUILD_ID" = "null" ] || [ -z "$BUILD_ID" ]; then
+            echo "❌ Failed to extract Build ID"
+            exit 1
+          fi
+
+          echo "✅ Build triggered successfully"
+          echo "Build ID: $BUILD_ID"
