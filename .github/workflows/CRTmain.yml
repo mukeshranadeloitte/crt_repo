@@ -1,37 +1,22 @@
-name: Run Copado CRT
+name: Trigger Copado Robotic Testing Job
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - main 
 
 jobs:
-  trigger-crt:
+  trigger-test:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 🚀 Trigger CRT Job
+      - name: Trigger CRT Job
         run: |
-          echo "🚀 Triggering Copado Robotic Testing Job..."
-
-          RESPONSE=$(curl -s -X POST "https://eu-robotic.copado.com/pace/v4/projects/73283/builds" \
+          curl -v -X POST "https://api.eu-robotic.copado.com/pace/v4/projects/${PROJECT_ID}/jobs/${JOB_ID}/builds" \
+            -H "Authorization: Bearer ${{ secrets.CRT_API_KEY }}" \
             -H "Content-Type: application/json" \
-            -H "X-XSRF-TOKEN: 0Rmofp5mEH9IMJQ60hoYTQ==" \
-            -H "Cookie: ${{ secrets.COPADO_COOKIE }}" \
-            --data '{
-              "jobId": 123456
-            }')
-
-          echo "Response: $RESPONSE"
-
-          BUILD_ID=$(echo $RESPONSE | jq -r '.id')
-
-          if [ "$BUILD_ID" = "null" ] || [ -z "$BUILD_ID" ]; then
-            echo "❌ Failed to extract Build ID"
-            exit 1
-          fi
-
-          echo "✅ Build triggered successfully"
-          echo "Build ID: $BUILD_ID"
-
+            -d "{
+              \"projectId\": \"${{ secrets.CRT_PROJECT_ID }}\",
+              \"testJobId\": \"${{ secrets.CRT_TEST_JOB_ID }}\"
+            }"
