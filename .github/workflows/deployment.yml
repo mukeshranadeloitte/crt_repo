@@ -1,0 +1,71 @@
+# Description: Script for Deployment
+name: UAT_Deployment
+
+on:
+  push:
+    branches:
+      - uat
+    paths:
+      - "force-app/**"
+
+jobs:
+  usingsfdx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 'Checkout source code'
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 200
+
+      - name: Git Log
+        run: |
+          git log --oneline
+
+      - name: 'Set up JDK 1.8'
+        uses: actions/setup-java@v2
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: 'Install Salesforce CLI'
+        run: |
+          npm install @salesforce/cli --global
+
+      - name: Install SGD
+        run: |
+          echo y | sf plugins install sfdx-git-delta
+          pwd
+          git config --global --add safe.directory /home/runner/work/crt_repo/crt_repo
+
+      - name: Building Package SGD
+        run: |
+          sf sgd:source:delta --to "HEAD" --from "${{ vars.CRT_UAT_COMMIT_ID }}" --output-dir "." --source-dir force-app/
+
+      - name: Package
+        run: |
+          echo " ------ Package ------"
+          cat package/package.xml
+          echo " ---------------------"
+          echo "                       "
+          echo " ------ Destructive Package------"
+          cat destructiveChanges/destructiveChanges.xml
+          echo "---------------------------------"
+
+      - name: sf authorization 
+        run: |
+          echo ${{ secrets.CRT_UAT_AUTHURL }} > SF_envnameLogin_URL.txt
+          sf org login sfdx-url --sfdx-url-file SF_envnameLogin_URL.txt
+
+      - name: 'Deploy for destructive changes'
+        run: |
+          if [ -f destructiveChanges/destructiveChanges.xml ] && { grep -q '<types>' destructiveChanges/destructiveChanges.xml || grep -q '<members>' destructiveChanges/destructiveChanges.xml; }; then
+            sf project deploy start -x package/package.xml --post-destructive-changes destructiveChanges/destructiveChanges.xml -o ${{ secrets.CRT_UAT_USERNAME }} --verbose
+          fi
+
+      - name: 'Deploy'
+        run: |
+          if [ -f destructiveChanges/destructiveChanges.xml ] && { ! grep -q '<types>' destructiveChanges/destructiveChanges.xml || ! grep -q '<members>' destructiveChanges/destructiveChanges.xml; }; then
+            sf project deploy start -x package/package.xml -o ${{ secrets.CRT_UAT_USERNAME }}
+          fi
