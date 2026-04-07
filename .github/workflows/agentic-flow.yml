@@ -142,11 +142,9 @@ jobs:
           fi
 
           # Step 1 — Exchange PAT for a short-lived JWT.
-          # The Pace v4 API does not accept the raw PAT directly; it must be
-          # exchanged for a session token first.
           echo "CRT_PAT length: ${#CRT_PAT} chars"
           AUTH_RESPONSE=$(curl -sS -w "\n%{http_code}" \
-            -X POST "https://api.eu-robotic.copado.com/pace/v4/auth/login" \
+            -X POST "https://api.eu-robotic.copado.com/pace/v4/login" \
             -H "Content-Type: application/json" \
             -d "$(jq -cn --arg key "${CRT_PAT}" '{"accessKey":$key}')")
 
