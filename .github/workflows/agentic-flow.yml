@@ -148,7 +148,7 @@ jobs:
           echo "CRT_API_KEY length: ${#CRT_API_KEY} chars"  # debug: verify secret is set
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST "https://api.eu-robotic.copado.com/pace/v4/projects/${CRT_PROJECT_ID}/jobs/${CRT_JOB_ID}/builds" \
-            -H "X-API-Key: ${CRT_API_KEY}" \
+            -H "Authorization: Token ${CRT_API_KEY}" \
             -H "Content-Type: application/json" \
             -d "${PAYLOAD}")
 
