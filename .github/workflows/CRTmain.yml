@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 🚀 Trigger CRT Job
+      - name: Trigger CRT Job
         env:
           PROJECT_ID: ${{ secrets.CRT_PROJECT_ID }}
           JOB_ID: ${{ secrets.CRT_TEST_JOB_ID }}
