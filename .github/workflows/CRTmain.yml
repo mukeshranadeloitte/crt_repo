@@ -1,0 +1,22 @@
+name: Trigger Copado Robotic Testing Job
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main 
+
+jobs:
+  trigger-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger CRT Job
+        run: |
+          curl -X POST "https://eu-robotic.copado.com/api/v3/jobs/${CRT_JOB_ID}/run"  \
+            -H "Authorization: Bearer ${{ secrets.CRT_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "projectId": "${{ secrets.CRT_PROJECT_ID }}",
+              "testJobId": "${{ secrets.CRT_TEST_JOB_ID }}"
+            }'
