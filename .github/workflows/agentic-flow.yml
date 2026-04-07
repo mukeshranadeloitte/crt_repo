@@ -121,16 +121,16 @@ jobs:
     steps:
       - name: Trigger CRT Test Suite Run
         env:
-          CRT_API_KEY:    ${{ secrets.CRT_API_KEY }}
+          CRT_PAT:        ${{ secrets.CRT_PAT }}
           CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID }}
           CRT_JOB_ID:     ${{ vars.CRT_JOB_ID }}
           CRT_ORG_ID:     ${{ vars.CRT_ORG_ID }}
         run: |
           set -euo pipefail
-          if [ -z "${CRT_API_KEY}" ] || [ -z "${CRT_PROJECT_ID}" ] || [ -z "${CRT_JOB_ID}" ]; then
+          if [ -z "${CRT_PAT}" ] || [ -z "${CRT_PROJECT_ID}" ] || [ -z "${CRT_JOB_ID}" ]; then
             echo "Missing required values — set these repository variables:"
             echo "  CRT_PROJECT_ID (e.g. 73283)  CRT_JOB_ID (e.g. 115686)"
-            echo "And this secret: CRT_API_KEY"
+            echo "And this secret: CRT_PAT"
             exit 1
           fi
 
@@ -141,14 +141,13 @@ jobs:
             PAYLOAD='{}'
           fi
 
-          # POST /pace/v4/projects/{projectId}/jobs/{jobId}/builds — trigger a job build.
-          # Pace v4 uses Bearer token auth. Generate the token in CRT:
-          #   Profile icon → API Tokens → Create token → copy the full token string.
-          # Store it as secret CRT_API_KEY (no "apiKey " prefix — just the raw token).
-          echo "CRT_API_KEY length: ${#CRT_API_KEY} chars"  # debug: verify secret is set
+          # External PAT uses Bearer auth.
+          # To generate: eu-robotic.copado.com → Profile → External Personal Access Tokens
+          #              → New Token → copy and store as secret CRT_PAT.
+          echo "CRT_PAT length: ${#CRT_PAT} chars"
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST "https://api.eu-robotic.copado.com/pace/v4/projects/${CRT_PROJECT_ID}/jobs/${CRT_JOB_ID}/builds" \
-            -H "Authorization: Token ${CRT_API_KEY}" \
+            -H "Authorization: Bearer ${CRT_PAT}" \
             -H "Content-Type: application/json" \
             -d "${PAYLOAD}")
 
