@@ -141,13 +141,35 @@ jobs:
             PAYLOAD='{}'
           fi
 
-          # External PAT uses Bearer auth.
-          # To generate: eu-robotic.copado.com → Profile → External Personal Access Tokens
-          #              → New Token → copy and store as secret CRT_PAT.
+          # Step 1 — Exchange PAT for a short-lived JWT.
+          # The Pace v4 API does not accept the raw PAT directly; it must be
+          # exchanged for a session token first.
           echo "CRT_PAT length: ${#CRT_PAT} chars"
+          AUTH_RESPONSE=$(curl -sS -w "\n%{http_code}" \
+            -X POST "https://api.eu-robotic.copado.com/pace/v4/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -cn --arg key "${CRT_PAT}" '{"accessKey":$key}')")
+
+          AUTH_CODE=$(echo "${AUTH_RESPONSE}" | tail -1)
+          AUTH_BODY=$(echo "${AUTH_RESPONSE}" | head -n -1)
+          echo "Auth HTTP ${AUTH_CODE}"
+
+          if [[ "${AUTH_CODE}" -lt 200 || "${AUTH_CODE}" -ge 300 ]]; then
+            echo "::error::CRT auth failed with HTTP ${AUTH_CODE}: ${AUTH_BODY}"
+            exit 1
+          fi
+
+          JWT=$(echo "${AUTH_BODY}" | jq -r '.token // .accessToken // .jwt // empty')
+          if [ -z "${JWT}" ]; then
+            echo "::error::Could not parse JWT from auth response: ${AUTH_BODY}"
+            exit 1
+          fi
+          echo "Auth token obtained (${#JWT} chars)"
+
+          # Step 2 — Trigger the job build using the JWT as Bearer token.
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST "https://api.eu-robotic.copado.com/pace/v4/projects/${CRT_PROJECT_ID}/jobs/${CRT_JOB_ID}/builds" \
-            -H "Authorization: Bearer ${CRT_PAT}" \
+            -H "Authorization: Bearer ${JWT}" \
             -H "Content-Type: application/json" \
             -d "${PAYLOAD}")
 
