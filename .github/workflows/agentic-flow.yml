@@ -114,26 +114,31 @@ jobs:
         run: echo "Manual validation complete. Releasing robots."
 
   robotic-testing:
-    name: Robotic Execution
+    name: Trigger CRT Test Job
     needs: manual-validation
     runs-on: ubuntu-latest
 
     steps:
-      - name: Invoke Copado Robotic Testing
+      - name: Trigger CRT Test Job via API
         env:
-          COPADO_BASE_URL: ${{ secrets.COPADO_BASE_URL }}
-          COPADO_PROJECT_ID: ${{ secrets.COPADO_PROJECT_ID }}
-          COPADO_API_KEY: ${{ secrets.COPADO_API_KEY }}
+          CRT_API_TOKEN: ${{ secrets.CRT_API_TOKEN }}
+          CRT_SUITE_ID:  ${{ vars.CRT_SUITE_ID }}
+          CRT_ROBOT_ID:  ${{ vars.CRT_ROBOT_ID || '64280' }}
         run: |
-          if [ -z "$COPADO_BASE_URL" ] || [ -z "$COPADO_PROJECT_ID" ] || [ -z "$COPADO_API_KEY" ]; then
-            echo "Missing one or more Copado secrets: COPADO_BASE_URL, COPADO_PROJECT_ID, COPADO_API_KEY"
+          set -euo pipefail
+          if [ -z "${CRT_API_TOKEN}" ]; then
+            echo "Missing required secret: CRT_API_TOKEN"
             exit 1
           fi
 
-          curl -sS -X POST "${COPADO_BASE_URL}/${COPADO_PROJECT_ID}/robots/trigger" \
-            -H "Authorization: Bearer ${COPADO_API_KEY}" \
+          curl -sS -f -X POST "https://eu-robotic.copado.com/api/v3/suites/${CRT_SUITE_ID}/runs" \
+            -H "Authorization: Bearer ${CRT_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d '{"testSuite": "Regression_Suite_v2"}'
+            -d "{
+              \"suite_id\": \"${CRT_SUITE_ID}\",
+              \"robot_id\": \"${CRT_ROBOT_ID}\",
+              \"environment\": \"production\"
+            }"
 
       - name: Mark story deployed
         uses: actions/github-script@v7
@@ -143,5 +148,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: "Deployed: Copado robots have been triggered."
+              body: "Deployed: CRT robotic tests have been triggered via Qentinel Pace."
             });
