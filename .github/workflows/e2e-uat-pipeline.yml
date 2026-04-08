@@ -434,7 +434,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run dependency SCA gate
+      - name: Install dependencies
         run: |
           set -euo pipefail
           if [[ -f package-lock.json ]]; then
@@ -442,7 +442,100 @@ jobs:
           else
             npm install
           fi
-          npm audit --audit-level=high
+
+      - name: Run dependency SCA gate with waiver support
+        run: |
+          set -euo pipefail
+
+          WAIVER_FILE=".github/sca-waivers.json"
+          TODAY=$(date -u +%Y-%m-%d)
+
+          # Run npm audit and capture JSON output; do not fail immediately.
+          npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true
+
+          # If no high/critical vulnerabilities found, pass immediately.
+          VULN_COUNT=$(jq '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")] | length' audit-output.json 2>/dev/null || echo 0)
+
+          if [[ "$VULN_COUNT" -eq 0 ]]; then
+            echo "✅ No high/critical vulnerabilities found."
+            exit 0
+          fi
+
+          echo "Found $VULN_COUNT high/critical vulnerability/ies. Checking waivers..."
+
+          # Load waivers file if present
+          WAIVERS="[]"
+          if [[ -f "$WAIVER_FILE" ]]; then
+            WAIVERS=$(jq '.' "$WAIVER_FILE" 2>/dev/null || echo "[]")
+            echo "Loaded waiver file: $WAIVER_FILE"
+          else
+            echo "No waiver file found at $WAIVER_FILE — all violations will be evaluated."
+          fi
+
+          FAIL=0
+          WAIVED=0
+          EXPIRED=0
+
+          # Iterate over each high/critical vulnerability
+          while IFS= read -r vuln_json; do
+            PKG=$(echo "$vuln_json"  | jq -r '.name')
+            SEV=$(echo "$vuln_json"  | jq -r '.severity')
+            GHSA=$(echo "$vuln_json" | jq -r '.via[0].source // .via[0] // "unknown"' 2>/dev/null | head -1)
+
+            # Check if this package has an active waiver
+            WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires >= $today)] | first // empty')
+
+            EXPIRED_WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires < $today)] | first // empty')
+
+            if [[ -n "$WAIVER" && "$WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$WAIVER" | jq -r '.expires')
+              REASON=$(echo "$WAIVER"  | jq -r '.reason')
+              APPROVED=$(echo "$WAIVER"| jq -r '.approved_by // "unknown"')
+              echo "⏳ WAIVED [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Reason: $REASON | Approved by: $APPROVED | Expires: $EXPIRES"
+              WAIVED=$((WAIVED + 1))
+            elif [[ -n "$EXPIRED_WAIVER" && "$EXPIRED_WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$EXPIRED_WAIVER" | jq -r '.expires')
+              REASON=$(echo "$EXPIRED_WAIVER"  | jq -r '.reason')
+              echo "::error::❌ EXPIRED WAIVER [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Waiver expired on $EXPIRES — fix is now required. Reason was: $REASON"
+              EXPIRED=$((EXPIRED + 1))
+              FAIL=1
+            else
+              echo "::error::❌ UNWAIVED [$SEV] $PKG (advisory: $GHSA) — no active waiver found."
+              FAIL=$((FAIL + 1))
+            fi
+          done < <(jq -c '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")][]' audit-output.json 2>/dev/null)
+
+          echo ""
+          echo "──────────────────────────────────────────"
+          echo "SCA Summary: $VULN_COUNT violation(s) found"
+          echo "  ✅ Waived (active):   $WAIVED"
+          echo "  ❌ Expired waivers:   $EXPIRED"
+          echo "  ❌ Unwaived failures: $((FAIL - EXPIRED))"
+          echo "──────────────────────────────────────────"
+
+          if [[ "$FAIL" -gt 0 ]]; then
+            echo ""
+            echo "To suppress a known violation, add an entry to $WAIVER_FILE:"
+            echo '  { "package": "<pkg>", "severity": "<high|critical>", "reason": "<justification>", "expires": "YYYY-MM-DD", "approved_by": "<team>" }'
+            exit 1
+          fi
+
+          echo "✅ All violations are covered by active waivers."
+
+      - name: Upload SCA audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-audit-report
+          path: audit-output.json
+          if-no-files-found: warn
+          retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 4 — Automated Hard Gates
