@@ -26,7 +26,6 @@ on:
   pull_request:
     branches:
       - uat
-      - UberDemo
     types:
       - opened
       - reopened
