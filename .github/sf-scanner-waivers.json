@@ -1,0 +1,18 @@
+[
+  {
+    "_comment": "SCHEMA: rule (string, required), file (string, required), description (string, required), expiry (YYYY-MM-DD, required), reason (string, required)",
+    "_instructions": [
+      "Add entries here to waive Salesforce Code Analyzer rule violations until the expiry date.",
+      "Once 'expiry' passes, the pipeline will FAIL again — fix the violation or renew the waiver.",
+      "Partial matches are used: 'rule' matches the Rule column and 'file' matches the File path.",
+      "Remove entries once violations are resolved."
+    ]
+  },
+  {
+    "rule": "ApexDoc",
+    "file": "CoverageDemoService.cls",
+    "description": "Missing ApexDoc comment violation for CoverageDemoService.cls",
+    "expiry": "2026-04-09",
+    "reason": "Temporary waiver - ApexDoc comments to be added by April 9"
+  }
+]
