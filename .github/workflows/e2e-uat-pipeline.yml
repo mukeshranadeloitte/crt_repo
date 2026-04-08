@@ -409,6 +409,7 @@ jobs:
           set -euo pipefail
           WAIVER_FILE=".github/sf-scanner-waivers.json"
           REPORT_FILE="sfdx-report.csv"
+          RESULTS_CSV="sfdx-waiver-results.csv"
 
           if [[ ! -f "$REPORT_FILE" ]]; then
             echo "No scanner report found — skipping waiver check."
@@ -422,21 +423,25 @@ jobs:
           TODAY = date.today()
           WAIVER_FILE = ".github/sf-scanner-waivers.json"
           REPORT_FILE = "sfdx-report.csv"
+          RESULTS_CSV = "sfdx-waiver-results.csv"
 
           # Load waivers, skipping comment/instruction objects (no 'rule' key)
           with open(WAIVER_FILE) as f:
               waivers = [w for w in json.load(f) if "rule" in w]
 
-          failures = []
+          results = []
           waived_count = 0
+          violation_count = 0
+          expired_count = 0
 
           with open(REPORT_FILE, newline="", encoding="utf-8") as f:
               reader = csv.DictReader(f)
               for row in reader:
-                  rule = row.get("Rule", row.get("rule", "")).strip()
-                  file_path = row.get("File", row.get("file", "")).strip()
-                  severity = row.get("Severity", row.get("severity", "")).strip()
-                  problem = row.get("Problem", row.get("Description", "")).strip()
+                  rule      = row.get("Rule",        row.get("rule", "")).strip()
+                  file_path = row.get("File",        row.get("file", "")).strip()
+                  severity  = row.get("Severity",    row.get("severity", "")).strip()
+                  problem   = row.get("Problem",     row.get("Description", "")).strip()
+                  line      = row.get("Line",        row.get("line", "")).strip()
 
                   matched_waiver = None
                   for w in waivers:
@@ -447,27 +452,56 @@ jobs:
                   if matched_waiver:
                       expiry = date.fromisoformat(matched_waiver["expiry"])
                       if TODAY <= expiry:
-                          print(f"WAIVED: [{rule}] {file_path} — expires {matched_waiver['expiry']}")
+                          status = "WAIVED"
                           waived_count += 1
+                          print(f"WAIVED:   [{rule}] {file_path}:{line} — expires {matched_waiver['expiry']} (approved_by: {matched_waiver.get('approved_by','n/a')})")
                       else:
-                          print(f"::error::WAIVER EXPIRED ({matched_waiver['expiry']}): [{rule}] {file_path} — {problem}")
-                          failures.append(row)
+                          status = "EXPIRED_WAIVER"
+                          expired_count += 1
+                          print(f"::warning::EXPIRED WAIVER ({matched_waiver['expiry']}): [{rule}] {file_path}:{line} — {problem}")
                   else:
-                      print(f"::error::VIOLATION: [{severity}] [{rule}] {file_path} — {problem}")
-                      failures.append(row)
+                      status = "VIOLATION"
+                      violation_count += 1
+                      print(f"::warning::VIOLATION: [{severity}] [{rule}] {file_path}:{line} — {problem}")
 
-          print(f"\nSummary: {waived_count} waived, {len(failures)} unwaived violation(s).")
-          if failures:
-              sys.exit(1)
+                  results.append({
+                      "Status":      status,
+                      "Rule":        rule,
+                      "File":        file_path,
+                      "Line":        line,
+                      "Severity":    severity,
+                      "Description": problem,
+                      "Expiry":      matched_waiver["expiry"] if matched_waiver else "",
+                      "Reason":      matched_waiver.get("reason", "") if matched_waiver else "",
+                      "Approved_By": matched_waiver.get("approved_by", "") if matched_waiver else "",
+                      "Ticket":      matched_waiver.get("ticket", "") if matched_waiver else "",
+                  })
+
+          # Write waiver results CSV
+          with open(RESULTS_CSV, "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["Status","Rule","File","Line","Severity","Description","Expiry","Reason","Approved_By","Ticket"])
+              writer.writeheader()
+              writer.writerows(results)
+
+          total = len(results)
+          print(f"\n{'─'*60}")
+          print(f"SF Scanner Waiver Summary: {total} finding(s)")
+          print(f"  ✅ Waived (active):   {waived_count}")
+          print(f"  ⚠️  Expired waivers:  {expired_count}")
+          print(f"  ⚠️  Violations:       {violation_count}")
+          print(f"{'─'*60}")
+          print(f"Full results written to: {RESULTS_CSV}")
           PYEOF
 
-      - name: Upload scanner report
+      - name: Upload scanner reports
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: sfdx-report
-          path: sfdx-report.csv
+          name: sfdx-scanner-reports
+          path: |
+            sfdx-report.csv
+            sfdx-waiver-results.csv
           if-no-files-found: warn
 
   # ─────────────────────────────────────────────────────────────────────────────

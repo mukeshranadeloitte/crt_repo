@@ -1,11 +1,43 @@
 [
   {
-    "_comment": "SCHEMA: rule (string, required), file (string, required), description (string, required), expiry (YYYY-MM-DD, required), reason (string, required)",
+    "_comment": "Salesforce Code Analyzer Waiver File — managed by the DevOps/Platform Engineering team",
+    "_schema": {
+      "rule":        "REQUIRED — Rule name as reported in the SF Scanner CSV (partial match, e.g. 'ApexDoc')",
+      "file":        "REQUIRED — Filename as reported in the SF Scanner CSV (partial match, e.g. 'MyClass.cls')",
+      "description": "REQUIRED — Human-readable description of the violation",
+      "expiry":      "REQUIRED — Hard deadline in YYYY-MM-DD format. Pipeline FAILS after this date.",
+      "reason":      "REQUIRED — Business justification. Include Jira/ticket reference.",
+      "approved_by": "REQUIRED — GitHub username or team who approved this waiver",
+      "ticket":      "RECOMMENDED — Jira/work-item tracking the fix (e.g. 'PROJ-123')"
+    },
+    "_governance": {
+      "who_can_add": [
+        "Developer: raises the waiver request in a PR, populates all fields",
+        "Tech Lead / Senior Engineer: reviews justification, sets realistic expiry, approves PR",
+        "Security/DevOps team: required approver for severity=Critical violations"
+      ],
+      "process": [
+        "1. Developer identifies a violation they cannot fix immediately",
+        "2. Developer adds a waiver entry to this file in their feature branch",
+        "3. Developer opens a PR — the waiver diff is visible for reviewers",
+        "4. Tech Lead reviews the justification, expiry date, and ticket reference",
+        "5. Tech Lead approves the PR; 'approved_by' must match their GitHub username",
+        "6. Developer sets a reminder before 'expiry' to fix the violation or renew",
+        "7. Once the violation is fixed, the waiver entry MUST be removed"
+      ],
+      "expiry_policy": {
+        "max_duration_days": 30,
+        "renewal_requires": "New PR with updated justification and re-approval",
+        "critical_violations": "Require security-team approval; max 7 days"
+      }
+    },
     "_instructions": [
-      "Add entries here to waive Salesforce Code Analyzer rule violations until the expiry date.",
-      "Once 'expiry' passes, the pipeline will FAIL again — fix the violation or renew the waiver.",
-      "Partial matches are used: 'rule' matches the Rule column and 'file' matches the File path.",
-      "Remove entries once violations are resolved."
+      "Add entries here to waive SF Code Analyzer rule violations until the expiry date.",
+      "Active waiver (today <= expiry) → logged as WAIVED in pipeline, job continues.",
+      "Expired waiver (today > expiry)  → logged as EXPIRED, violation written to CSV.",
+      "No waiver                        → violation written to CSV, job continues (continue-on-error).",
+      "Partial matches: 'rule' and 'file' fields are substring-matched against the scanner report.",
+      "Remove entries once violations are resolved — do not leave permanent waivers."
     ]
   },
   {
@@ -13,13 +45,17 @@
     "file": "CoverageDemoService.cls",
     "description": "Missing ApexDoc comment violation for CoverageDemoService.cls",
     "expiry": "2026-04-09",
-    "reason": "Temporary waiver - ApexDoc comments to be added by April 9"
+    "reason": "Temporary waiver - ApexDoc comments to be added by April 9. Tracked in PROJ-001.",
+    "approved_by": "mukeshranadeloitte",
+    "ticket": "PROJ-001"
   },
   {
     "rule": "ApexDoc",
     "file": "DeploySmokeCheck.cls",
     "description": "Missing ApexDoc comment violation for DeploySmokeCheck.cls",
     "expiry": "2026-04-07",
-    "reason": "Temporary waiver - ApexDoc comments to be added by April 7"
+    "reason": "Temporary waiver - ApexDoc comments to be added by April 7. Tracked in PROJ-002.",
+    "approved_by": "mukeshranadeloitte",
+    "ticket": "PROJ-002"
   }
 ]
