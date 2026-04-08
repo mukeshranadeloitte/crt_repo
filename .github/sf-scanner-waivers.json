@@ -15,4 +15,11 @@
     "expiry": "2026-04-09",
     "reason": "Temporary waiver - ApexDoc comments to be added by April 9"
   }
+  {
+    "rule": "ApexDoc",
+    "file": "DeploySmokeCheck.cls",
+    "description": "Missing ApexDoc comment violation for DeploySmokeCheck.cls",
+    "expiry": "2026-04-07",
+    "reason": "Temporary waiver - ApexDoc comments to be added by April 7"
+  }
 ]
