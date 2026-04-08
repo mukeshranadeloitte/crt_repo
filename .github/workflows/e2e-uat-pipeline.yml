@@ -141,19 +141,10 @@ jobs:
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
 
-      - name: Authenticate target org
-        env:
-          SFDX_AUTH_URL: ${{ secrets[env.SFDX_AUTH_SECRET_NAME] }}
+      - name: Authenticate to UAT org
         run: |
-          set -euo pipefail
-          if [[ -z "${SFDX_AUTH_URL:-}" ]]; then
-            echo "::error::Required auth URL secret '$SFDX_AUTH_SECRET_NAME' is missing or empty."
-            exit 1
-          fi
-          printf '%s' "$SFDX_AUTH_URL" > sfdxAuthUrl.txt
-          sf org login sfdx-url --sfdx-url-file sfdxAuthUrl.txt --alias "$ORG_ALIAS"
-          rm -f sfdxAuthUrl.txt
-          sf org display --target-org "$ORG_ALIAS"
+          echo "${{ secrets.CRT_UAT_AUTHURL }}" > SF_envnameLogin_URL.txt
+          sf org login sfdx-url --sfdx-url-file SF_envnameLogin_URL.txt
 
       - name: Extract test classes from PR description and comments
         id: pr-tests
