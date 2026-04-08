@@ -178,18 +178,12 @@ jobs:
           echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Build delta package
-        env:
-          DELTA_FROM_COMMIT: ${{ vars[env.DELTA_FROM_COMMIT_VAR] }}
+      - name: Build delta package (PR head vs UAT base)
+        # Computes the diff between the PR head commit and the target UAT branch tip
         run: |
-          set -euo pipefail
-          if [[ -z "${DELTA_FROM_COMMIT:-}" ]]; then
-            echo "::error::Required repository variable '$DELTA_FROM_COMMIT_VAR' is missing or empty."
-            exit 1
-          fi
           sf sgd:source:delta \
-            --to "HEAD" \
-            --from "$DELTA_FROM_COMMIT" \
+            --to   "HEAD" \
+            --from "${{ github.event.pull_request.base.sha }}" \
             --output-dir "." \
             --source-dir force-app/
 
