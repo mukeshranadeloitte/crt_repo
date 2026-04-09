@@ -1270,50 +1270,42 @@ jobs:
     steps:
       - name: Trigger CRT Test Execution
         env:
-          CRT_PAT:        ${{ secrets.CRT_PAT }}
+          CRT_API_TOKEN:  ${{ secrets.CRT_API_TOKEN }}
           CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
           CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
           CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
         run: |
           set -euo pipefail
-          if [ -z "${CRT_PAT}" ]; then
-            echo "::error::Missing required secret: CRT_PAT"
+          if [ -z "${CRT_API_TOKEN}" ]; then
+            echo "::error::Missing required secret: CRT_API_TOKEN"
             exit 1
           fi
-
-          # Use jq to safely build the GraphQL JSON payload — avoids quote-escaping issues
-          PAYLOAD=$(jq -n \
-            --arg jobId     "${CRT_JOB_ID}" \
-            --arg orgId     "${CRT_ORG_ID}" \
-            --arg projectId "${CRT_PROJECT_ID}" \
-            '{"query": "mutation RunJob($jobId: String!, $orgId: String!, $projectId: String!) { runJob(jobId: $jobId, orgId: $orgId, projectId: $projectId) { id status } }", "variables": {"jobId": $jobId, "orgId": $orgId, "projectId": $projectId}}')
 
           echo "Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})"
 
-          RESPONSE=$(curl -sS -w "\n%{http_code}" \
-            -X POST "https://graphql.eu-robotic.copado.com/v1" \
-            -H "Authorization: apiKey ${CRT_PAT}" \
-            -H "Content-Type: application/json" \
-            -d "${PAYLOAD}")
+          RESPONSE=$(curl -s \
+            --header "X-Authorization: ${CRT_API_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --json "{\"query\":\"mutation { createBuild(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { message data { id buildNumber status startTime } } }\"}" \
+            https://graphql.eu-robotic.copado.com/v1)
 
-          HTTP_CODE=$(echo "${RESPONSE}" | tail -1)
-          BODY=$(echo "${RESPONSE}" | head -n -1)
-          echo "HTTP ${HTTP_CODE}: ${BODY}"
+          echo "Response: ${RESPONSE}"
 
-          if [[ "${HTTP_CODE}" -lt 200 || "${HTTP_CODE}" -ge 300 ]]; then
-            echo "::error::CRT API call failed with HTTP ${HTTP_CODE}"
+          if echo "${RESPONSE}" | grep -q '"errors"'; then
+            ERR_MSG=$(echo "${RESPONSE}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['errors'][0].get('message','unknown'))" 2>/dev/null || echo "unknown")
+            echo "::error::Failed to trigger CRT job: ${ERR_MSG}"
             exit 1
           fi
 
-          echo "✅ CRT job triggered successfully (HTTP ${HTTP_CODE})"
+          BUILD_ID=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['id'])")
+          STATUS=$(echo "${RESPONSE}"   | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['status'])")
+          BUILD_NO=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data'].get('buildNumber','n/a'))")
 
-          # GraphQL response shape: { "data": { "runJob": { "id": "...", "status": "..." } } }
-          RUN_ID=$(echo "${BODY}" | jq -r '.data.runJob.id // .id // .runId // .executionId // empty' 2>/dev/null || true)
-          if [ -n "${RUN_ID}" ]; then
-            echo "CRT Run ID: ${RUN_ID}"
-          else
-            echo "Run started. Response: ${BODY:-<empty>}"
-          fi
+          echo "✅ CRT job triggered successfully"
+          echo "   Build ID:     ${BUILD_ID}"
+          echo "   Build Number: ${BUILD_NO}"
+          echo "   Status:       ${STATUS}"
+
 
       - name: Post CRT deployment comment
         uses: actions/github-script@v7
