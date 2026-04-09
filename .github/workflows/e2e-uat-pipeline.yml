@@ -1345,26 +1345,15 @@ jobs:
               "${CRT_API}")
 
             # Extract status for our specific BUILD_ID from the list
-            FINAL_STATUS=$(echo "${POLL_RESPONSE}" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-builds = d.get('data', {}).get('latestBuilds', []) or []
-build = next((b for b in builds if str(b.get('id','')) == '${BUILD_ID}'), None)
-if build:
-    print(build.get('status', ''))
-else:
-    print('NOT_FOUND')
-" 2>/dev/null || echo "")
+            FINAL_STATUS=$(echo "${POLL_RESPONSE}" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin); builds=d.get('data',{}).get('latestBuilds',[]) or []; b=next((x for x in builds if str(x.get('id',''))=='${BUILD_ID}'),None); print(b.get('status','') if b else 'NOT_FOUND')" \
+              2>/dev/null || echo "")
 
             # Also extract test counts when we have a terminal status
             if [ -n "${FINAL_STATUS}" ] && [ "${FINAL_STATUS}" != "NOT_FOUND" ]; then
-              read TOTAL PASSED_T FAILED_T SKIPPED_T <<< $(echo "${POLL_RESPONSE}" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-builds = d.get('data', {}).get('latestBuilds', []) or []
-b = next((b for b in builds if str(b.get('id','')) == '${BUILD_ID}'), {})
-print(b.get('totalTests',0), b.get('passedTests',0), b.get('failedTests',0), b.get('skippedTests',0))
-" 2>/dev/null || echo "0 0 0 0")
+              read TOTAL PASSED_T FAILED_T SKIPPED_T <<< "$(echo "${POLL_RESPONSE}" | python3 -c \
+                "import sys,json; d=json.load(sys.stdin); builds=d.get('data',{}).get('latestBuilds',[]) or []; b=next((x for x in builds if str(x.get('id',''))=='${BUILD_ID}'),{}); print(b.get('totalTests',0),b.get('passedTests',0),b.get('failedTests',0),b.get('skippedTests',0))" \
+                2>/dev/null || echo "0 0 0 0")"
             fi
 
             echo "  [${ELAPSED}s] Build ${BUILD_ID} — Status: ${FINAL_STATUS:-unknown} | Tests: ${PASSED_T} passed / ${FAILED_T} failed / ${SKIPPED_T} skipped"

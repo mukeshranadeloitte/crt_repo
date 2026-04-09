@@ -1,0 +1,38 @@
+c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo
+├── .github
+│   ├── agents
+│   │   └── e2e-uat-pipeline.agent.md
+│   ├── prompts
+│   │   └── create-e2e-uat-pipeline.prompt.md
+│   ├── sca-waivers.json
+│   ├── sf-scanner-waivers.json
+│   └── workflows
+│       ├── e2e-uat-pipeline.yml
+│       └── pr-uat-deployment.yml
+├── create-e2e-uat-pipeline.prompt.md (source)
+└── e2e-uat-pipeline.agent.md (source)
+
+INSTRUCTIONS FOR COMPLETION:
+
+Since the PowerShell tool is not available in this environment, please follow these manual steps:
+
+1. Open Command Prompt or PowerShell (regular Windows PowerShell)
+
+2. Run this command:
+   mkdir "c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo\.github\agents"
+   mkdir "c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo\.github\prompts"
+
+3. Run this command to copy the files:
+   copy "c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo\e2e-uat-pipeline.agent.md" "c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo\.github\agents\e2e-uat-pipeline.agent.md"
+   copy "c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo\create-e2e-uat-pipeline.prompt.md" "c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo\.github\prompts\create-e2e-uat-pipeline.prompt.md"
+
+4. Or run the Python script in the repo:
+   cd c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo
+   python run_copy_files.py
+
+5. Or run the batch file:
+   c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo\run_script.bat
+
+6. Or run the Node.js script:
+   cd c:\Users\mukerana\Documents\VS_Code\github_repo\crt_repo
+   node setup_dirs.js
