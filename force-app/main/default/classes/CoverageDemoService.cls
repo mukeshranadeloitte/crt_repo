@@ -72,3 +72,4 @@ public with sharing class CoverageDemoService {
         return v;
     }
 }
+
