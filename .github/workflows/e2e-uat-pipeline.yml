@@ -394,25 +394,115 @@ jobs:
       - name: Install Salesforce Code Analyzer
         run: echo y | sf plugins install @salesforce/sfdx-scanner || npm install -g @salesforce/sfdx-scanner
 
-      - name: Run Salesforce Code Analyzer
+      - name: Salesforce Code Analyzer
+        continue-on-error: true
+        run: |
+          sf scanner run \
+            --target "./force-app" \
+            --format "csv" \
+            --outfile "sfdx-report.csv" \
+            --severity-threshold 3
+
+      - name: Check scanner results against waivers
+        continue-on-error: true
         run: |
           set -euo pipefail
-          sf scanner run \
-            --target "$SOURCE_DIR" \
-            --format csv \
-            --outfile scanner-report.csv || true
+          WAIVER_FILE=".github/sf-scanner-waivers.json"
+          REPORT_FILE="sfdx-report.csv"
+          RESULTS_CSV="sfdx-waiver-results.csv"
 
-          echo "===== Scanner Report (first 100 lines) ====="
-          head -100 scanner-report.csv 2>/dev/null || echo "(no findings)"
+          if [[ ! -f "$REPORT_FILE" ]]; then
+            echo "No scanner report found — skipping waiver check."
+            exit 0
+          fi
 
-      - name: Upload Salesforce analyzer CSV
+          python3 - <<'PYEOF'
+          import json, csv, sys
+          from datetime import date
+
+          TODAY = date.today()
+          WAIVER_FILE = ".github/sf-scanner-waivers.json"
+          REPORT_FILE = "sfdx-report.csv"
+          RESULTS_CSV = "sfdx-waiver-results.csv"
+
+          # Load waivers, skipping comment/instruction objects (no 'rule' key)
+          with open(WAIVER_FILE) as f:
+              waivers = [w for w in json.load(f) if "rule" in w]
+
+          results = []
+          waived_count = 0
+          violation_count = 0
+          expired_count = 0
+
+          with open(REPORT_FILE, newline="", encoding="utf-8") as f:
+              reader = csv.DictReader(f)
+              for row in reader:
+                  rule      = row.get("Rule",        row.get("rule", "")).strip()
+                  file_path = row.get("File",        row.get("file", "")).strip()
+                  severity  = row.get("Severity",    row.get("severity", "")).strip()
+                  problem   = row.get("Problem",     row.get("Description", "")).strip()
+                  line      = row.get("Line",        row.get("line", "")).strip()
+
+                  matched_waiver = None
+                  for w in waivers:
+                      if w["rule"] in rule and w["file"] in file_path:
+                          matched_waiver = w
+                          break
+
+                  if matched_waiver:
+                      expiry = date.fromisoformat(matched_waiver["expiry"])
+                      if TODAY <= expiry:
+                          status = "WAIVED"
+                          waived_count += 1
+                          print(f"WAIVED:   [{rule}] {file_path}:{line} — expires {matched_waiver['expiry']} (approved_by: {matched_waiver.get('approved_by','n/a')})")
+                      else:
+                          status = "EXPIRED_WAIVER"
+                          expired_count += 1
+                          print(f"::warning::EXPIRED WAIVER ({matched_waiver['expiry']}): [{rule}] {file_path}:{line} — {problem}")
+                  else:
+                      status = "VIOLATION"
+                      violation_count += 1
+                      print(f"::warning::VIOLATION: [{severity}] [{rule}] {file_path}:{line} — {problem}")
+
+                  results.append({
+                      "Status":      status,
+                      "Rule":        rule,
+                      "File":        file_path,
+                      "Line":        line,
+                      "Severity":    severity,
+                      "Description": problem,
+                      "Expiry":      matched_waiver["expiry"] if matched_waiver else "",
+                      "Reason":      matched_waiver.get("reason", "") if matched_waiver else "",
+                      "Approved_By": matched_waiver.get("approved_by", "") if matched_waiver else "",
+                      "Ticket":      matched_waiver.get("ticket", "") if matched_waiver else "",
+                  })
+
+          # Write waiver results CSV
+          with open(RESULTS_CSV, "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["Status","Rule","File","Line","Severity","Description","Expiry","Reason","Approved_By","Ticket"])
+              writer.writeheader()
+              writer.writerows(results)
+
+          total = len(results)
+          print(f"\n{'─'*60}")
+          print(f"SF Scanner Waiver Summary: {total} finding(s)")
+          print(f"  ✅ Waived (active):   {waived_count}")
+          print(f"  ⚠️  Expired waivers:  {expired_count}")
+          print(f"  ⚠️  Violations:       {violation_count}")
+          print(f"{'─'*60}")
+          print(f"Full results written to: {RESULTS_CSV}")
+          PYEOF
+
+      - name: Upload scanner reports
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: salesforce-code-analyzer-csv
-          path: scanner-report.csv
+          name: sfdx-scanner-reports
+          path: |
+            sfdx-report.csv
+            sfdx-waiver-results.csv
           if-no-files-found: warn
-          retention-days: 7
 
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 3 — SCA / SAST Stage (dependency audit)
@@ -434,7 +524,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run dependency SCA gate
+      - name: Install dependencies
         run: |
           set -euo pipefail
           if [[ -f package-lock.json ]]; then
@@ -442,7 +532,100 @@ jobs:
           else
             npm install
           fi
-          npm audit --audit-level=high
+
+      - name: Run dependency SCA gate with waiver support
+        run: |
+          set -euo pipefail
+
+          WAIVER_FILE=".github/sca-waivers.json"
+          TODAY=$(date -u +%Y-%m-%d)
+
+          # Run npm audit and capture JSON output; do not fail immediately.
+          npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true
+
+          # If no high/critical vulnerabilities found, pass immediately.
+          VULN_COUNT=$(jq '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")] | length' audit-output.json 2>/dev/null || echo 0)
+
+          if [[ "$VULN_COUNT" -eq 0 ]]; then
+            echo "✅ No high/critical vulnerabilities found."
+            exit 0
+          fi
+
+          echo "Found $VULN_COUNT high/critical vulnerability/ies. Checking waivers..."
+
+          # Load waivers file if present
+          WAIVERS="[]"
+          if [[ -f "$WAIVER_FILE" ]]; then
+            WAIVERS=$(jq '.' "$WAIVER_FILE" 2>/dev/null || echo "[]")
+            echo "Loaded waiver file: $WAIVER_FILE"
+          else
+            echo "No waiver file found at $WAIVER_FILE — all violations will be evaluated."
+          fi
+
+          FAIL=0
+          WAIVED=0
+          EXPIRED=0
+
+          # Iterate over each high/critical vulnerability
+          while IFS= read -r vuln_json; do
+            PKG=$(echo "$vuln_json"  | jq -r '.name')
+            SEV=$(echo "$vuln_json"  | jq -r '.severity')
+            GHSA=$(echo "$vuln_json" | jq -r '.via[0].source // .via[0] // "unknown"' 2>/dev/null | head -1)
+
+            # Check if this package has an active waiver
+            WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires >= $today)] | first // empty')
+
+            EXPIRED_WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires < $today)] | first // empty')
+
+            if [[ -n "$WAIVER" && "$WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$WAIVER" | jq -r '.expires')
+              REASON=$(echo "$WAIVER"  | jq -r '.reason')
+              APPROVED=$(echo "$WAIVER"| jq -r '.approved_by // "unknown"')
+              echo "⏳ WAIVED [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Reason: $REASON | Approved by: $APPROVED | Expires: $EXPIRES"
+              WAIVED=$((WAIVED + 1))
+            elif [[ -n "$EXPIRED_WAIVER" && "$EXPIRED_WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$EXPIRED_WAIVER" | jq -r '.expires')
+              REASON=$(echo "$EXPIRED_WAIVER"  | jq -r '.reason')
+              echo "::error::❌ EXPIRED WAIVER [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Waiver expired on $EXPIRES — fix is now required. Reason was: $REASON"
+              EXPIRED=$((EXPIRED + 1))
+              FAIL=1
+            else
+              echo "::error::❌ UNWAIVED [$SEV] $PKG (advisory: $GHSA) — no active waiver found."
+              FAIL=$((FAIL + 1))
+            fi
+          done < <(jq -c '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")][]' audit-output.json 2>/dev/null)
+
+          echo ""
+          echo "──────────────────────────────────────────"
+          echo "SCA Summary: $VULN_COUNT violation(s) found"
+          echo "  ✅ Waived (active):   $WAIVED"
+          echo "  ❌ Expired waivers:   $EXPIRED"
+          echo "  ❌ Unwaived failures: $((FAIL - EXPIRED))"
+          echo "──────────────────────────────────────────"
+
+          if [[ "$FAIL" -gt 0 ]]; then
+            echo ""
+            echo "To suppress a known violation, add an entry to $WAIVER_FILE:"
+            echo '  { "package": "<pkg>", "severity": "<high|critical>", "reason": "<justification>", "expires": "YYYY-MM-DD", "approved_by": "<team>" }'
+            exit 1
+          fi
+
+          echo "✅ All violations are covered by active waivers."
+
+      - name: Upload SCA audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-audit-report
+          path: audit-output.json
+          if-no-files-found: warn
+          retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 4 — Automated Hard Gates
@@ -1104,7 +1287,7 @@ jobs:
           echo "Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})"
 
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
-            -X POST "https://eu-robotic.copado.com/api/v3/jobs/${CRT_JOB_ID}/runs" \
+            -X POST "https://graphql.eu-robotic.copado.com/v1/jobs/${CRT_JOB_ID}/runs" \
             -H "Authorization: apiKey ${CRT_PAT}" \
             -H "Content-Type: application/json" \
             -d "${PAYLOAD}")

@@ -19,5 +19,3 @@ global with sharing class SmokeTestPingResource {
         return res;
     }
 }
-
-

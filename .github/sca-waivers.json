@@ -1,0 +1,19 @@
+[
+  {
+    "_comment": "SCHEMA: package (string, required), severity (high|critical, required), reason (string, required), expires (YYYY-MM-DD, required), approved_by (string, required), advisory (GHSA ID or CVE, optional)",
+    "_instructions": [
+      "Add entries here to bypass SCA violations until the expiry date.",
+      "Once 'expires' passes, the pipeline will FAIL again — fix the vulnerability or renew the waiver.",
+      "Waivers must be reviewed and approved before merging. Remove entries once vulnerabilities are fixed.",
+      "Run 'npm audit --json' locally to find the exact package names and advisory IDs."
+    ]
+  },
+  {
+    "package": "example-vulnerable-pkg",
+    "severity": "high",
+    "advisory": "GHSA-0000-0000-0000",
+    "reason": "No upstream fix available as of 2026-04-08. Mitigated by WAF rule WA-123. Tracked in JIRA-456.",
+    "expires": "2026-07-08",
+    "approved_by": "security-team"
+  }
+]
