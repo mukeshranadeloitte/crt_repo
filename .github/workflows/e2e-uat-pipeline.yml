@@ -1287,7 +1287,7 @@ jobs:
           echo "Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})"
 
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
-            -X POST "https://eu-robotic.copado.com/api/v3/jobs/${CRT_JOB_ID}/runs" \
+            -X POST "https://graphql.eu-robotic.copado.com/v1/jobs/${CRT_JOB_ID}/runs" \
             -H "Authorization: apiKey ${CRT_PAT}" \
             -H "Content-Type: application/json" \
             -d "${PAYLOAD}")
