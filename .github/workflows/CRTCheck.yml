@@ -4,8 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
-      - uat
+      - my-uat
 
 jobs:
   trigger-test:
@@ -128,4 +127,19 @@ jobs:
 
       # ── STEP 4 ─ Print full summary to workflow logs ───────────────────────
       - name: Print Job Summary
-        if: steps.pr_meta.out
+        if: steps.pr_meta.outputs.has_pr == 'true'
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║        CRT Job Execution Summary         ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "  PR Number       : #${{ steps.pr_meta.outputs.pr_number }}"
+          echo "  Workflow Run #  : ${{ steps.pr_meta.outputs.run_number }}"
+          echo "  PR Raiser       : ${{ steps.pr_meta.outputs.pr_raiser }}"
+          echo "  PR Approver     : ${{ steps.pr_meta.outputs.pr_approver }}"
+          echo "  Test Job Name   : ${{ steps.crt.outputs.job_name }}"
+          echo "  Test Job ID     : ${{ steps.crt.outputs.job_id }}"
+          echo "  Build ID        : ${{ steps.crt.outputs.build_id }}"
+          echo "  Test Result     : ${{ steps.crt.outputs.crt_status }}"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""
