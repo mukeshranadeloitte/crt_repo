@@ -1,4 +1,4 @@
-name: checkCRT Trigger Copado Robotic Testing Job
+name: Trigger Copado Robotic Testing Job
 
 on:
   workflow_dispatch:
