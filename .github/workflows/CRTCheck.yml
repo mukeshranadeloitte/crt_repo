@@ -1,0 +1,33 @@
+name: New Trigger Copado Robotic Testing Job
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  trigger-crt-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger CRT Job
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.eu-robotic.copado.com/pace/v4/projects/${{ secrets.CRT_PROJECT_ID }}/builds" \
+            -H "Authorization: ${{ secrets.CRT_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "[{\"jobId\": ${{ secrets.CRT_JOB_ID }}, \"record\": \"none\", \"runType\": \"normal\", \"stream\": false}]")
+
+          HTTP_BODY=$(echo "$RESPONSE" | head -n -1)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $HTTP_BODY"
+
+          if [ "$HTTP_CODE" -ne 200 ] && [ "$HTTP_CODE" -ne 201 ]; then
+            echo "❌ Failed to trigger CRT job. HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ CRT Job triggered successfully!"
