@@ -1,10 +1,10 @@
-name: Trigger Copado Robotic Testing Job
+name: checkCRT Trigger Copado Robotic Testing Job
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - checkCRT
 
 jobs:
   trigger-crt-test:
