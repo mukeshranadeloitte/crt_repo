@@ -1,11 +1,69 @@
-# ── STEP 3 ─ Trigger CRT job, get job name, poll to completion ─────────
+name: Trigger Copado Robotic Testing Job
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - my-uat
+
+jobs:
+  trigger-test:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      contents: read
+
+    steps:
+      # ── STEP 1 ─ Checkout so config file is available ─────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── STEP 2 ─ Find merged PR and collect all metadata ──────────────────
+      - name: Collect PR Metadata
+        id: pr_meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          COMMIT_SHA="${{ github.sha }}"
+
+          PR_DATA=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github.groot-preview+json" \
+            "https://api.github.com/repos/$REPO/commits/$COMMIT_SHA/pulls")
+
+          PR_NUMBER=$(echo "$PR_DATA" | jq -r '.[0].number // empty')
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "⏭️  Direct push — no associated PR. Skipping."
+            echo "has_pr=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "has_pr=true"          >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "run_number=${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+          PR_RAISER=$(echo "$PR_DATA" | jq -r '.[0].user.login // empty')
+          echo "pr_raiser=$PR_RAISER" >> $GITHUB_OUTPUT
+
+          APPROVER=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            | jq -r '[.[] | select(.state=="APPROVED")] | last | .user.login // "No approver found"')
+          echo "pr_approver=$APPROVER" >> $GITHUB_OUTPUT
+
+          echo "--- GITHUB_OUTPUT contents ---"
+          cat $GITHUB_OUTPUT
+
+      # ── STEP 3 ─ Trigger CRT job, get job name, poll to completion ─────────
       - name: Trigger and Poll CRT Job
         id: crt
         if: steps.pr_meta.outputs.has_pr == 'true'
         env:
           PROJECT_ID: ${{ secrets.CRT_PROJECT_ID }}
           JOB_ID:     ${{ secrets.CRT_TEST_JOB_ID }}
-          API_KEY:    ${{ secrets.CRT_API_KEY }}
+          API_KEY:    ${{ secrets.CRT_API_TOKEN }}
         run: |
           GQL="https://graphql.eu-robotic.copado.com/v1"
 
@@ -163,3 +221,22 @@
 
           echo "crt_status=$FINAL_STATUS" >> $GITHUB_OUTPUT
           echo "Final CRT result: $FINAL_STATUS"
+
+      # ── STEP 4 ─ Print summary — always runs if PR was found ───────────────
+      - name: Print Job Summary
+        if: always() && steps.pr_meta.outputs.has_pr == 'true'
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║        CRT Job Execution Summary         ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "  PR Number       : #${{ steps.pr_meta.outputs.pr_number }}"
+          echo "  Workflow Run #  : ${{ steps.pr_meta.outputs.run_number }}"
+          echo "  PR Raiser       : ${{ steps.pr_meta.outputs.pr_raiser }}"
+          echo "  PR Approver     : ${{ steps.pr_meta.outputs.pr_approver }}"
+          echo "  Test Job Name   : ${{ steps.crt.outputs.job_name }}"
+          echo "  Test Job ID     : ${{ steps.crt.outputs.job_id }}"
+          echo "  Build ID        : ${{ steps.crt.outputs.build_id }}"
+          echo "  Test Result     : ${{ steps.crt.outputs.crt_status }}"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""
