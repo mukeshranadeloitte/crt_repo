@@ -11,74 +11,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger CRT Job and Wait for Result
+      - name: Trigger CRT Job
         run: |
-          echo "🚀 Triggering Copado Robotic Testing job..."
-
-          # Trigger the job
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            "https://eu-robotic.copado.com/api/v3/jobs/${{ secrets.CRT_JOB_ID }}/run" \
-            -H "Authorization: Bearer ${{ secrets.CRT_API_TOKEN }}" \
+            "https://api.eu-robotic.copado.com/pace/v4/projects/${{ secrets.CRT_PROJECT_ID }}/builds" \
+            -H "Authorization: ${{ secrets.CRT_API_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "{\"projectId\": \"${{ secrets.CRT_PROJECT_ID }}\"}")
+            -d "[{\"jobId\": ${{ secrets.CRT_JOB_ID }}, \"record\": \"none\", \"runType\": \"normal\", \"stream\": false}]")
 
-          # Split response body and HTTP status code
           HTTP_BODY=$(echo "$RESPONSE" | head -n -1)
           HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
 
-          echo "📨 HTTP Status Code: $HTTP_CODE"
-          echo "📦 Response Body: $HTTP_BODY"
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $HTTP_BODY"
 
-          # Validate HTTP response
           if [ "$HTTP_CODE" -ne 200 ] && [ "$HTTP_CODE" -ne 201 ]; then
-            echo "❌ Failed to trigger job. HTTP $HTTP_CODE"
-            echo "Response: $HTTP_BODY"
+            echo "❌ Failed to trigger CRT job. HTTP $HTTP_CODE"
             exit 1
           fi
 
-          # Extract Build/Run ID from response
-          BUILD_ID=$(echo "$HTTP_BODY" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('id') or data.get('buildId') or data.get('runId') or '')" 2>/dev/null)
-
-          if [ -z "$BUILD_ID" ]; then
-            echo "⚠️  Job triggered but could not extract Build ID. Check response above."
-          else
-            echo "✅ Job triggered successfully!"
-            echo "🔑 Build ID: $BUILD_ID"
-            echo "BUILD_ID=$BUILD_ID" >> $GITHUB_ENV
-          fi
-
-      - name: Poll Job Status (optional - waits for completion)
-        if: env.BUILD_ID != ''
-        run: |
-          echo "⏳ Polling job status for Build ID: $BUILD_ID"
-          MAX_RETRIES=20
-          RETRY=0
-          SLEEP_SECONDS=30
-
-          while [ $RETRY -lt $MAX_RETRIES ]; do
-            STATUS_RESPONSE=$(curl -s -X GET \
-              "https://eu-robotic.copado.com/api/v3/runs/$BUILD_ID" \
-              -H "Authorization: Bearer ${{ secrets.CRT_API_TOKEN }}" \
-              -H "Content-Type: application/json")
-
-            echo "📊 Status Response: $STATUS_RESPONSE"
-
-            STATUS=$(echo "$STATUS_RESPONSE" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('status') or data.get('state') or 'unknown')" 2>/dev/null)
-
-            echo "🔄 Current Status: $STATUS"
-
-            if [ "$STATUS" = "passed" ] || [ "$STATUS" = "success" ] || [ "$STATUS" = "completed" ]; then
-              echo "✅ Test job PASSED!"
-              exit 0
-            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "error" ]; then
-              echo "❌ Test job FAILED!"
-              exit 1
-            fi
-
-            RETRY=$((RETRY + 1))
-            echo "⏳ Attempt $RETRY/$MAX_RETRIES — Waiting ${SLEEP_SECONDS}s..."
-            sleep $SLEEP_SECONDS
-          done
-
-          echo "⏰ Timed out waiting for job to complete."
-          exit 1
+          echo "✅ CRT Job triggered successfully!"
