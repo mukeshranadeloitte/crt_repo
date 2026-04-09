@@ -78,150 +78,39 @@ jobs:
             exit 1
           fi
 
-          # ── Probe which header the GQL endpoint accepts ────────────────────
-          echo "--- Probing auth header on GraphQL endpoint ---"
+          # ── Probe FL-specific header variants ─────────────────────────────
+          echo "--- Probing FL auth headers ---"
 
-          echo "-- 1) Authorization: Bearer --"
+          echo "-- 1) fl-access-key --"
           R1=$(curl -s -X POST \
-            -H "Authorization: Bearer $API_KEY" \
+            -H "fl-access-key: $API_KEY" \
             -H "Content-Type: application/json" \
             -d '{"query":"{ __typename }"}' \
             "$GQL")
           echo "$R1"
 
-          echo "-- 2) x-api-key --"
+          echo "-- 2) x-fl-access-key --"
           R2=$(curl -s -X POST \
-            -H "x-api-key: $API_KEY" \
+            -H "x-fl-access-key: $API_KEY" \
             -H "Content-Type: application/json" \
             -d '{"query":"{ __typename }"}' \
             "$GQL")
           echo "$R2"
 
-          echo "-- 3) pace-api-key --"
+          echo "-- 3) fl-token --"
           R3=$(curl -s -X POST \
-            -H "pace-api-key: $API_KEY" \
+            -H "fl-token: $API_KEY" \
             -H "Content-Type: application/json" \
             -d '{"query":"{ __typename }"}' \
             "$GQL")
           echo "$R3"
 
-          echo "-- 4) x-access-key --"
+          echo "-- 4) fluorine-access-key --"
           R4=$(curl -s -X POST \
-            -H "x-access-key: $API_KEY" \
+            -H "fluorine-access-key: $API_KEY" \
             -H "Content-Type: application/json" \
-            -d '{"query":"{ __typename }"}' \
-            "$GQL")
-          echo "$R4"
-
-          echo "-- 5) No auth header --"
-          R5=$(curl -s -X POST \
-            -H "Content-Type: application/json" \
-            -d '{"query":"{ __typename }"}' \
-            "$GQL")
-          echo "$R5"
-
-          # ── Pick whichever returned data, not an error ─────────────────────
-          AUTH_HEADER=""
-          for combo in \
-            "Authorization: Bearer $API_KEY|$R1" \
-            "x-api-key: $API_KEY|$R2" \
-            "pace-api-key: $API_KEY|$R3" \
-            "x-access-key: $API_KEY|$R4" \
-            "none|$R5"; do
-            HDR="${combo%%|*}"
-            RESP="${combo##*|}"
-            if echo "$RESP" | jq -e '.data' > /dev/null 2>&1; then
-              AUTH_HEADER="$HDR"
-              echo "✅ Working auth header: $HDR"
-              break
-            fi
-          done
-
-          if [ -z "$AUTH_HEADER" ]; then
-            echo "❌ All auth headers failed — paste logs above and share"
-            echo "crt_status=AUTH FAILED" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-
-          # ── Fetch job name ─────────────────────────────────────────────────
-          echo "--- Fetching job info ---"
-          JOB_QUERY=$(jq -n \
-            --arg pid "$PROJECT_ID" \
-            --arg jid "$JOB_ID" \
-            '{"query":"query { job(projectId: \"\($pid)\", jobId: \"\($jid)\") { id name status } }"}')
-
-          JOB_INFO=$(curl -s -X POST \
-            -H "$AUTH_HEADER" \
-            -H "Content-Type: application/json" \
-            -d "$JOB_QUERY" \
-            "$GQL")
-          echo "Job info response: $JOB_INFO"
-
-          JOB_NAME=$(echo "$JOB_INFO" | jq -r '.data.job.name // "Unknown Job"')
-          echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
-          echo "job_id=$JOB_ID"     >> $GITHUB_OUTPUT
-
-          # ── Trigger build ──────────────────────────────────────────────────
-          echo "--- Triggering build ---"
-          BUILD_MUTATION=$(jq -n \
-            --arg pid "$PROJECT_ID" \
-            --arg jid "$JOB_ID" \
-            '{"query":"mutation { createBuild(projectId: \"\($pid)\", jobId: \"\($jid)\") { message data { id buildNumber status startTime } } }"}')
-
-          RESPONSE=$(curl -s -X POST \
-            -H "$AUTH_HEADER" \
-            -H "Content-Type: application/json" \
-            -d "$BUILD_MUTATION" \
-            "$GQL")
-          echo "Trigger response: $RESPONSE"
-
-          BUILD_ID=$(echo "$RESPONSE" | jq -r '.data.createBuild.data.id // empty')
-          if [ -z "$BUILD_ID" ] || [ "$BUILD_ID" = "null" ]; then
-            echo "❌ Failed to extract Build ID"
-            echo "crt_status=TRIGGER FAILED" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          echo "✅ Build triggered — Build ID: $BUILD_ID"
-          echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
-
-          # ── Poll build status ──────────────────────────────────────────────
-          MAX_ATTEMPTS=60
-          ATTEMPT=0
-          FINAL_STATUS="TIMED OUT"
-
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            ATTEMPT=$((ATTEMPT + 1))
-            sleep 30
-
-            STATUS_QUERY=$(jq -n \
-              --arg pid "$PROJECT_ID" \
-              --arg bid "$BUILD_ID" \
-              '{"query":"query { build(projectId: \"\($pid)\", buildId: \"\($bid)\") { id status } }"}')
-
-            STATUS_RESP=$(curl -s -X POST \
-              -H "$AUTH_HEADER" \
-              -H "Content-Type: application/json" \
-              -d "$STATUS_QUERY" \
-              "$GQL" || echo '{}')
-
-            STATUS=$(echo "$STATUS_RESP" | jq -r '.data.build.status // "UNKNOWN"')
-            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS — Status: $STATUS"
-
-            case "$STATUS" in
-              PASSED|SUCCESS|COMPLETED)
-                FINAL_STATUS="PASSED"; break ;;
-              FAILED|ERROR|ABORTED)
-                FINAL_STATUS="FAILED ($STATUS)"; break ;;
-              RUNNING|PENDING|QUEUED|IN_PROGRESS)
-                echo "⏳ Still in progress..." ;;
-              *)
-                echo "⚠️  Unrecognised status: $STATUS" ;;
-            esac
-          done
-
-          echo "crt_status=$FINAL_STATUS" >> $GITHUB_OUTPUT
-          echo "Final CRT result: $FINAL_STATUS"
-
+            -d '{"query":"{ __
+            
       # ── STEP 4 ─ Print summary — always runs if PR was found ───────────────
       - name: Print Job Summary
         if: always() && steps.pr_meta.outputs.has_pr == 'true'
