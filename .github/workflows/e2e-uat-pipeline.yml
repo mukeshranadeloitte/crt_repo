@@ -1281,9 +1281,12 @@ jobs:
             exit 1
           fi
 
-          # Build GraphQL mutation payload
-          PAYLOAD=$(printf '{"query":"mutation { runJob(jobId: \"%s\", orgId: \"%s\", projectId: \"%s\") { id status } }"}' \
-            "${CRT_JOB_ID}" "${CRT_ORG_ID}" "${CRT_PROJECT_ID}")
+          # Use jq to safely build the GraphQL JSON payload — avoids quote-escaping issues
+          PAYLOAD=$(jq -n \
+            --arg jobId     "${CRT_JOB_ID}" \
+            --arg orgId     "${CRT_ORG_ID}" \
+            --arg projectId "${CRT_PROJECT_ID}" \
+            '{"query": "mutation RunJob($jobId: String!, $orgId: String!, $projectId: String!) { runJob(jobId: $jobId, orgId: $orgId, projectId: $projectId) { id status } }", "variables": {"jobId": $jobId, "orgId": $orgId, "projectId": $projectId}}')
 
           echo "Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})"
 
