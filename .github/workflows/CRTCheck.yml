@@ -63,7 +63,7 @@ jobs:
         env:
           PROJECT_ID: ${{ secrets.CRT_PROJECT_ID }}
           JOB_ID:     ${{ secrets.CRT_TEST_JOB_ID }}
-          API_KEY:    ${{ secrets.CRT_API_KEY }}
+          API_KEY:    ${{ secrets.CRT_API_TOKEN }}
         run: |
           BASE="https://api.eu-robotic.copado.com/pace/v4"
 
