@@ -1397,6 +1397,28 @@ jobs:
             && cp destructiveChanges/destructiveChanges.xml "deployment-packages/${PKG_NAME}/destructiveChanges.xml" \
             || true
 
+          # Zip the actual source files being deployed (delta output from sfdx-git-delta)
+          # sfdx-git-delta writes changed components to the 'source' output directory
+          if [[ -d "source" && -n "$(ls -A source 2>/dev/null)" ]]; then
+            echo "Zipping deployed components from delta output (source/)..."
+            (cd source && zip -r "../deployment-packages/${PKG_NAME}/components.zip" . --exclude "*.DS_Store")
+            echo "components_zip=components.zip" >> "$GITHUB_OUTPUT"
+            echo "Component zip contents:"
+            unzip -l "deployment-packages/${PKG_NAME}/components.zip" | head -50
+          elif [[ -d "force-app" ]]; then
+            # Fallback: zip only the files changed in this PR's delta
+            echo "No delta source dir found — zipping changed force-app files from git diff..."
+            CHANGED=$(git diff --name-only --diff-filter=ACM "${DELTA_FROM_COMMIT}...${DEPLOYED_COMMIT}" \
+              | grep '^force-app/' || true)
+            if [[ -n "$CHANGED" ]]; then
+              echo "$CHANGED" | zip "deployment-packages/${PKG_NAME}/components.zip" -@
+              echo "Component zip contents:"
+              unzip -l "deployment-packages/${PKG_NAME}/components.zip" | head -50
+            else
+              echo "No changed force-app files found — skipping zip."
+            fi
+          fi
+
           # Write deployment metadata
           cat > "deployment-packages/${PKG_NAME}/deployment-info.json" <<EOF
           {
@@ -1416,7 +1438,7 @@ jobs:
           echo "pkg_dir=deployment-packages/${PKG_NAME}" >> "$GITHUB_OUTPUT"
 
           echo "===== Deployment package: ${PKG_NAME} ====="
-          ls -la "deployment-packages/${PKG_NAME}/"
+          ls -lh "deployment-packages/${PKG_NAME}/"
           echo ""
           cat "deployment-packages/${PKG_NAME}/deployment-info.json"
 
