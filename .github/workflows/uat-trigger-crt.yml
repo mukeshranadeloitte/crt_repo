@@ -178,7 +178,7 @@ jobs:
           echo "  Workflow Run #  : ${{ steps.pr_meta.outputs.run_number }}"
           echo "  PR Raiser       : ${{ steps.pr_meta.outputs.pr_raiser }}"
           echo "  PR Approver     : ${{ steps.pr_meta.outputs.pr_approver }}"
-          echo "  Test Build ID        : ${{ steps.crt.outputs.build_id }}"
+          echo "  Test Build ID   : ${{ steps.crt.outputs.build_id }}"
           echo "  Test Result     : ${{ steps.crt.outputs.crt_status }}"
           echo "╚══════════════════════════════════════════╝"
           echo ""
