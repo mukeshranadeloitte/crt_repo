@@ -174,15 +174,37 @@ This means the next PR's delta calculation always starts from the last successfu
 
 ```
 [ ] Secret CRT_UAT_AUTHURL set to valid SFDX auth URL
-[ ] Secret CRT_API_TOKEN set for CRT GraphQL API
+[ ] Secret CRT_API_TOKEN set for CRT GraphQL API (X-Authorization header)
 [ ] Secret GH_PAT set (Fine-Grained PAT, Variables: Read and write)
 [ ] Variable DELTA_FROM_COMMIT set to baseline commit SHA (first deploy only)
+[ ] Variable ORG_ALIAS set (default: uat)
+[ ] Variable COVERAGE_THRESHOLD set (default: 85)
 [ ] Environment ReleaseGate created with required reviewers
 [ ] Branch protection configured on uat branch
-[ ] (Optional) CheckMarx secrets configured
-[ ] (Optional) Fortify secrets and variables configured
-[ ] (Optional) CRT_JOB_ID / CRT_PROJECT_ID / CRT_ORG_ID variables set
+[ ] (Optional) CheckMarx secrets configured: CX_BASE_URI, CX_TENANT, CX_CLIENT_ID, CX_CLIENT_SECRET
+[ ] (Optional) Fortify secrets: FOD_CLIENT_ID, FOD_CLIENT_SECRET, FOD_APP_NAME, FOD_RELEASE_NAME
+[ ] (Optional) Fortify variables: FOD_URL, FOD_DAST_ASSESSMENT_TYPE, FOD_DAST_FREQUENCY, FOD_DAST_ENVIRONMENT
+[ ] (Optional) CRT variables: CRT_JOB_ID, CRT_PROJECT_ID, CRT_ORG_ID
 ```
+
+---
+
+## 8. No-Delta Behaviour (skip logic)
+
+When a PR contains no Salesforce component changes (e.g. only workflow YAML or docs changed), the pipeline **automatically skips** expensive steps:
+
+| What is skipped | Condition |
+|---|---|
+| Deploy validation (`sf project deploy validate`) | `has_delta == false` |
+| Apex coverage check | `has_delta == false` |
+| SF Code Analyzer install + scan | `has_delta == false` |
+| Scanner waiver check + CSV report | `has_delta == false` |
+| `sca-sast-stage` job (npm audit) | `has_delta == false` |
+| `automated-governance` job | `has_delta == false` |
+| `manual-validation` / ReleaseGate | `has_delta == false` |
+| CheckMarx / Fortify jobs | `has_delta == false` (via sca-sast-stage dependency) |
+
+The `has_delta` flag is set by the `Compute Apex delta and infer tests` step in Job 2. It is `true` when either `package/package.xml` or `destructiveChanges/destructiveChanges.xml` contains members.
 
 ---
 
@@ -190,4 +212,5 @@ This means the next PR's delta calculation always starts from the last successfu
 
 - [Pipeline Overview](./pipeline-overview.md)
 - [Manual Runbook](./manual_runbook.md)
+- [SCA Waivers](./sca-waivers.md)
 - [Troubleshooting](./troubleshooting.md)
