@@ -448,17 +448,75 @@ jobs:
           echo "════════════════════════════════════════════════════════════════"
           echo ""
 
+          # ── Add --async so we can stream live progress ────────────────────
+          deploy_cmd+=(--async)
+
           set +e
-          "${deploy_cmd[@]}" > deploy-output.json 2>deploy-stderr.log
-          rc=$?
+          "${deploy_cmd[@]}" > deploy-start.json 2>deploy-stderr.log
+          start_rc=$?
           set -e
 
-          if [[ $rc -ne 0 ]]; then
-            echo "::error::Deploy validation failed (exit $rc)."
+          if [[ $start_rc -ne 0 ]]; then
+            echo "::error::Failed to start deploy validation."
+            cat deploy-stderr.log || true
+            cat deploy-start.json || true
+            exit 1
+          fi
+
+          JOB_ID=$(jq -r '.result.id // empty' deploy-start.json 2>/dev/null || true)
+          if [[ -z "$JOB_ID" ]]; then
+            # Ran synchronously (no async job ID returned) — use start output directly
+            cp deploy-start.json deploy-output.json
+            STATUS=$(jq -r '.result.status // "Unknown"' deploy-output.json 2>/dev/null)
+          else
+            echo "🚀 Validation job started — ID: ${JOB_ID}"
+            echo ""
+            echo "  Time  │ Status         │ Components        │ Tests"
+            echo "────────┼────────────────┼───────────────────┼──────────────────────"
+
+            ELAPSED=0
+            MAX_WAIT=1800
+            STATUS="Pending"
+
+            while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+              REPORT=$(sf project deploy report --job-id "$JOB_ID" --json 2>/dev/null || echo '{}')
+              STATUS=$(echo  "$REPORT" | jq -r '.result.status             // "Unknown"')
+              DEPLOYED=$(echo "$REPORT" | jq -r '.result.numberComponentsDeployed // 0')
+              TOTAL=$(echo    "$REPORT" | jq -r '.result.numberComponentsTotal    // 0')
+              COMP_ERR=$(echo "$REPORT" | jq -r '.result.numberComponentErrors    // 0')
+              T_DONE=$(echo   "$REPORT" | jq -r '.result.numberTestsCompleted     // 0')
+              T_TOTAL=$(echo  "$REPORT" | jq -r '.result.numberTestsTotal         // 0')
+              T_ERR=$(echo    "$REPORT" | jq -r '.result.numberTestErrors         // 0')
+              DETAIL=$(echo   "$REPORT" | jq -r '.result.stateDetail              // ""')
+
+              printf "  %3ds  │ %-14s │ %4d/%-4d err:%-3d │ %3d/%-3d err:%-3d  %s\n" \
+                "$ELAPSED" "$STATUS" "$DEPLOYED" "$TOTAL" "$COMP_ERR" \
+                "$T_DONE" "$T_TOTAL" "$T_ERR" "${DETAIL:+(${DETAIL:0:40})}"
+
+              case "$STATUS" in
+                Succeeded|Failed|Canceled|SucceededPartial|Error) break ;;
+              esac
+
+              sleep 15
+              ELAPSED=$((ELAPSED + 15))
+            done
+
+            echo "────────┴────────────────┴───────────────────┴──────────────────────"
+            echo "$REPORT" > deploy-output.json
+          fi
+
+          if [[ "$STATUS" == "Failed" || "$STATUS" == "Canceled" || "$STATUS" == "Error" ]]; then
+            echo "::error::Deploy validation failed (status: $STATUS)."
             echo "--- stderr ---"
             cat deploy-stderr.log || true
-            echo "--- status / message ---"
-            jq -r '"Status: \(.status // "n/a")  Message: \(.message // "n/a")"' deploy-output.json 2>/dev/null || cat deploy-output.json
+            echo "--- components processed before failure ---"
+            jq -r '.result.details.componentSuccesses[]?
+              | if .created   == true then "  ➕ CREATED   [\(.componentType)] \(.fileName // .fullName)"
+                elif .changed == true then "  ✏️  UPDATED   [\(.componentType)] \(.fileName // .fullName)"
+                elif .deleted == true then "  🗑️  DELETED   [\(.componentType)] \(.fileName // .fullName)"
+                else                       "  ✅ UNCHANGED [\(.componentType)] \(.fileName // .fullName)"
+                end' \
+              deploy-output.json 2>/dev/null | sort || true
             echo "--- component failures ---"
             jq -r '.result.details.componentFailures[]?
               | "  ❌ [\(.componentType)] \(.fileName // .fullName // "unknown"):\(.lineNumber // "?")\n     \(.problem)"' \
@@ -474,7 +532,21 @@ jobs:
             exit 1
           fi
 
-          echo "✅ Validation passed."
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  VALIDATION RESULT — Component Status from Org"
+          echo "════════════════════════════════════════════════════════════════"
+          jq -r '"✅ Status: \(.result.status // "n/a")  | Components checked: \(.result.numberComponentsDeployed // 0), errors: \(.result.numberComponentErrors // 0)"' \
+            deploy-output.json 2>/dev/null || true
+          echo ""
+          echo "Component breakdown:"
+          jq -r '.result.details.componentSuccesses[]?
+            | if .created   == true then "  ➕ CREATED   [\(.componentType)] \(.fileName // .fullName)"
+              elif .changed == true then "  ✏️  UPDATED   [\(.componentType)] \(.fileName // .fullName)"
+              elif .deleted == true then "  🗑️  DELETED   [\(.componentType)] \(.fileName // .fullName)"
+              else                       "  ✅ UNCHANGED [\(.componentType)] \(.fileName // .fullName)"
+              end' \
+            deploy-output.json 2>/dev/null | sort || echo "  (no component detail available)"
+          echo "════════════════════════════════════════════════════════════════"
 
       - name: Check Apex test coverage
         run: |
@@ -1470,17 +1542,74 @@ jobs:
           echo "════════════════════════════════════════════════════════════════"
           echo ""
 
+          # ── Add --async so we can stream live progress ────────────────────
+          deploy_cmd+=(--async)
+
           set +e
-          "${deploy_cmd[@]}" > deploy-output.json 2>deploy-stderr.log
-          rc=$?
+          "${deploy_cmd[@]}" > deploy-start.json 2>deploy-stderr.log
+          start_rc=$?
           set -e
 
-          if [[ $rc -ne 0 ]]; then
-            echo "::error::Deployment failed (exit $rc)."
+          if [[ $start_rc -ne 0 ]]; then
+            echo "::error::Failed to start deployment."
+            cat deploy-stderr.log || true
+            cat deploy-start.json || true
+            exit 1
+          fi
+
+          JOB_ID=$(jq -r '.result.id // empty' deploy-start.json 2>/dev/null || true)
+          if [[ -z "$JOB_ID" ]]; then
+            cp deploy-start.json deploy-output.json
+            STATUS=$(jq -r '.result.status // "Unknown"' deploy-output.json 2>/dev/null)
+          else
+            echo "🚀 Deployment started — ID: ${JOB_ID}"
+            echo ""
+            echo "  Time  │ Status         │ Components        │ Tests"
+            echo "────────┼────────────────┼───────────────────┼──────────────────────"
+
+            ELAPSED=0
+            MAX_WAIT=3600
+            STATUS="Pending"
+
+            while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+              REPORT=$(sf project deploy report --job-id "$JOB_ID" --json 2>/dev/null || echo '{}')
+              STATUS=$(echo   "$REPORT" | jq -r '.result.status             // "Unknown"')
+              DEPLOYED=$(echo "$REPORT" | jq -r '.result.numberComponentsDeployed // 0')
+              TOTAL=$(echo    "$REPORT" | jq -r '.result.numberComponentsTotal    // 0')
+              COMP_ERR=$(echo "$REPORT" | jq -r '.result.numberComponentErrors    // 0')
+              T_DONE=$(echo   "$REPORT" | jq -r '.result.numberTestsCompleted     // 0')
+              T_TOTAL=$(echo  "$REPORT" | jq -r '.result.numberTestsTotal         // 0')
+              T_ERR=$(echo    "$REPORT" | jq -r '.result.numberTestErrors         // 0')
+              DETAIL=$(echo   "$REPORT" | jq -r '.result.stateDetail              // ""')
+
+              printf "  %3ds  │ %-14s │ %4d/%-4d err:%-3d │ %3d/%-3d err:%-3d  %s\n" \
+                "$ELAPSED" "$STATUS" "$DEPLOYED" "$TOTAL" "$COMP_ERR" \
+                "$T_DONE" "$T_TOTAL" "$T_ERR" "${DETAIL:+(${DETAIL:0:40})}"
+
+              case "$STATUS" in
+                Succeeded|Failed|Canceled|SucceededPartial|Error) break ;;
+              esac
+
+              sleep 15
+              ELAPSED=$((ELAPSED + 15))
+            done
+
+            echo "────────┴────────────────┴───────────────────┴──────────────────────"
+            echo "$REPORT" > deploy-output.json
+          fi
+
+          if [[ "$STATUS" == "Failed" || "$STATUS" == "Canceled" || "$STATUS" == "Error" ]]; then
+            echo "::error::Deployment failed (status: $STATUS)."
             echo "--- stderr ---"
             cat deploy-stderr.log || true
-            echo "--- status / message ---"
-            jq -r '"Status: \(.status // "n/a")  Message: \(.message // "n/a")"' deploy-output.json 2>/dev/null || cat deploy-output.json
+            echo "--- components processed before failure ---"
+            jq -r '.result.details.componentSuccesses[]?
+              | if .created   == true then "  ➕ CREATED   [\(.componentType)] \(.fileName // .fullName)"
+                elif .changed == true then "  ✏️  UPDATED   [\(.componentType)] \(.fileName // .fullName)"
+                elif .deleted == true then "  🗑️  DELETED   [\(.componentType)] \(.fileName // .fullName)"
+                else                       "  ✅ UNCHANGED [\(.componentType)] \(.fileName // .fullName)"
+                end' \
+              deploy-output.json 2>/dev/null | sort || true
             echo "--- component failures ---"
             jq -r '.result.details.componentFailures[]?
               | "  ❌ [\(.componentType)] \(.fileName // .fullName // "unknown"):\(.lineNumber // "?")\n     \(.problem)"' \
@@ -1502,10 +1631,19 @@ jobs:
           fi
 
           echo "════════════════════════════════════════════════════════════════"
-          echo "  DEPLOYMENT RESULT"
+          echo "  DEPLOYMENT RESULT — Component Status from Org"
           echo "════════════════════════════════════════════════════════════════"
           jq -r '"✅ Status: \(.result.status // "n/a")  | Components: \(.result.numberComponentsDeployed // 0) deployed, \(.result.numberComponentErrors // 0) errors"' \
             deploy-output.json 2>/dev/null || true
+          echo ""
+          echo "Component breakdown:"
+          jq -r '.result.details.componentSuccesses[]?
+            | if .created   == true then "  ➕ CREATED   [\(.componentType)] \(.fileName // .fullName)"
+              elif .changed == true then "  ✏️  UPDATED   [\(.componentType)] \(.fileName // .fullName)"
+              elif .deleted == true then "  🗑️  DELETED   [\(.componentType)] \(.fileName // .fullName)"
+              else                       "  ✅ UNCHANGED [\(.componentType)] \(.fileName // .fullName)"
+              end' \
+            deploy-output.json 2>/dev/null | sort || echo "  (no component detail available)"
           echo ""
           echo "Per-class coverage:"
           jq -r '.result.details.runTestResult.codeCoverage[]?
