@@ -628,14 +628,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Always fetch from main — ensures developers cannot tamper with waivers in their PR
-          echo "Fetching .github/sf-scanner-waivers.csv from main branch..."
-          HTTP=$(curl -sSL -w "%{http_code}" -o waiver-response.json \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository }}/contents/.github/sf-scanner-waivers.csv?ref=main")
+          WAIVER_PATH=".github/sf-scanner-waivers.csv"
+          REPO="${{ github.repository }}"
+          API="https://api.github.com/repos/${REPO}/contents/${WAIVER_PATH}"
 
-          if [[ "$HTTP" == "200" ]]; then
+          decode_and_save() {
             python3 -c "
           import json, base64
           with open('waiver-response.json') as f:
@@ -643,15 +640,62 @@ jobs:
           content = base64.b64decode(data['content']).decode('utf-8')
           with open('fetched-waivers.csv', 'w') as out:
               out.write(content)
-          print(f'Waivers fetched: {len(content.splitlines())-1} entries (excl. header)')
+          rows = [l for l in content.splitlines() if l and not l.startswith('#')]
+          print(f'Waivers loaded: {max(0,len(rows)-1)} entries (excl. header/comments)')
           "
+          }
+
+          fetch_from() {
+            local REF="$1"
+            curl -sSL -w "%{http_code}" -o waiver-response.json \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${API}?ref=${REF}"
+          }
+
+          # Priority 1: main branch (canonical protected copy)
+          echo "Fetching ${WAIVER_PATH} from main branch..."
+          HTTP=$(fetch_from "main")
+          if [[ "$HTTP" == "200" ]]; then
+            decode_and_save
             echo "waiver_source=main" >> "$GITHUB_OUTPUT"
             echo "✅ Waiver file fetched from main branch."
-          else
-            echo "::warning::Could not fetch waivers from main (HTTP ${HTTP}). Continuing without waiver check."
-            echo "" > fetched-waivers.csv
-            echo "waiver_source=unavailable" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "  main returned HTTP ${HTTP}."
+
+          # Priority 2: PR base branch (e.g. uat — for first-time introduction of the file)
+          BASE_REF="${{ github.base_ref }}"
+          if [[ -n "$BASE_REF" && "$BASE_REF" != "main" ]]; then
+            echo "Trying base branch (${BASE_REF})..."
+            HTTP=$(fetch_from "$BASE_REF")
+            if [[ "$HTTP" == "200" ]]; then
+              decode_and_save
+              echo "waiver_source=${BASE_REF}" >> "$GITHUB_OUTPUT"
+              echo "::warning::⚠️  Waivers fetched from base branch '${BASE_REF}' (not main). Merge the waiver file to main to enforce governance."
+              exit 0
+            fi
+            echo "  ${BASE_REF} returned HTTP ${HTTP}."
+          fi
+
+          # Priority 3: PR head branch (file being introduced for the first time)
+          HEAD_REF="${{ github.head_ref }}"
+          if [[ -n "$HEAD_REF" ]]; then
+            echo "Trying PR head branch (${HEAD_REF})..."
+            HTTP=$(fetch_from "$HEAD_REF")
+            if [[ "$HTTP" == "200" ]]; then
+              decode_and_save
+              echo "waiver_source=${HEAD_REF}(PR branch)" >> "$GITHUB_OUTPUT"
+              echo "::warning::⚠️  Waivers fetched from PR head branch '${HEAD_REF}'."
+              echo "::warning::   Once this PR merges, merge the waiver file to main to prevent tampering."
+              exit 0
+            fi
+            echo "  ${HEAD_REF} returned HTTP ${HTTP}."
+          fi
+
+          echo "::warning::Waiver file not found on main, ${BASE_REF}, or ${HEAD_REF} — continuing without waiver check."
+          echo "" > fetched-waivers.csv
+          echo "waiver_source=unavailable" >> "$GITHUB_OUTPUT"
 
       - name: Detect changed Salesforce files for SCA
         id: sca-targets
