@@ -1,4 +1,4 @@
-name: Test Result Check and Display
+name: Test Result Check and Display-updated
 
 on:
   workflow_dispatch:
