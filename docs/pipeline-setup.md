@@ -42,7 +42,21 @@ Set these under **Settings → Secrets and variables → Actions → Secrets**.
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `CRT_PAT` | ✅ | External Personal Access Token from Copado EU Robotic instance |
+| `CRT_PAT` | ⬜ Legacy | Old PAT — replaced by `CRT_API_TOKEN` |
+| `CRT_API_TOKEN` | ✅ | API token for `X-Authorization` header on the CRT GraphQL API |
+
+### Deployment Automation
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `GH_PAT` | ✅ Recommended | Fine-Grained PAT with **Variables: Read and write** permission. Used to auto-update `DELTA_FROM_COMMIT` after each deploy. Without this, the variable must be updated manually. |
+
+**How to create `GH_PAT`:**
+1. Go to GitHub → **Settings → Developer settings → Personal access tokens → Fine-grained tokens**
+2. Click **Generate new token**
+3. Set expiry and select this repository
+4. Under **Repository permissions** → **Variables** → set to **Read and write**
+5. Copy the token and save it as secret `GH_PAT` in this repository
 
 ---
 
@@ -55,7 +69,7 @@ Set these under **Settings → Secrets and variables → Actions → Variables**
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ORG_ALIAS` | `uat` | Alias used when authenticating to the target SF org |
-| `DELTA_FROM_COMMIT` | *(none — required)* | Baseline commit SHA for `sfdx-git-delta`. Set to the SHA of the last successfully deployed commit. Update after each successful deployment. |
+| `DELTA_FROM_COMMIT` | *(none — required)* | Baseline commit SHA for `sfdx-git-delta`. **Auto-updated** after each successful deployment via `GH_PAT`. Set manually on first use. |
 | `COVERAGE_THRESHOLD` | `85` | Minimum Apex coverage % enforced by the workflow coverage check |
 | `SOURCE_DIR` | `force-app/main/default` | Source directory passed to `sf scanner run` and fallback deploy |
 
@@ -109,38 +123,65 @@ For the merge gate to work correctly, configure branch protection on `uat`:
 
 ---
 
-## 5. Quick Start Checklist
+## 5. `pr_packages` Branch — Deployment Package History
+
+After every successful deployment, the pipeline automatically commits a deployment package to the `pr_packages` branch. This branch serves as a permanent audit log of everything deployed.
+
+**Branch location:** `pr_packages` (created automatically on first deploy)
+
+**Each commit contains:**
+
+| File | Content |
+|------|---------|
+| `package.xml` | Salesforce components that were deployed |
+| `destructiveChanges.xml` | Components that were deleted (if any) |
+| `deployment-info.json` | PR number, commit SHA, timestamps, actor, run URL |
+
+**Package naming:** `deploy-pr<PR>-<sha>-<timestamp>`
+
+Example:
+```
+pr_packages/
+  deploy-pr42-a1b2c3d4e5-20260409T143000Z/
+    package.xml
+    destructiveChanges.xml
+    deployment-info.json
+```
+
+**Browse deployment history:**
+```bash
+git fetch origin pr_packages
+git log origin/pr_packages --oneline
+git show origin/pr_packages -- deploy-pr42-a1b2c3d4e5-20260409T143000Z/deployment-info.json
+```
+
+---
+
+## 6. DELTA_FROM_COMMIT — Automatic Update
+
+After every successful deployment, the pipeline **automatically updates** `DELTA_FROM_COMMIT` to the deployed commit SHA using the GitHub API via `GH_PAT`.
+
+This means the next PR's delta calculation always starts from the last successfully deployed state — no manual steps required.
+
+**If `GH_PAT` is not set:**
+- The step will print a warning with the correct SHA
+- You must update `DELTA_FROM_COMMIT` manually in **Settings → Variables**
+- The SHA is also recorded in the `pr_packages` branch commit and `deployment-info.json`
+
+---
+
+## 7. Quick Start Checklist
 
 ```
 [ ] Secret CRT_UAT_AUTHURL set to valid SFDX auth URL
-[ ] Variable DELTA_FROM_COMMIT set to baseline commit SHA
+[ ] Secret CRT_API_TOKEN set for CRT GraphQL API
+[ ] Secret GH_PAT set (Fine-Grained PAT, Variables: Read and write)
+[ ] Variable DELTA_FROM_COMMIT set to baseline commit SHA (first deploy only)
 [ ] Environment ReleaseGate created with required reviewers
 [ ] Branch protection configured on uat branch
 [ ] (Optional) CheckMarx secrets configured
 [ ] (Optional) Fortify secrets and variables configured
 [ ] (Optional) CRT_JOB_ID / CRT_PROJECT_ID / CRT_ORG_ID variables set
-```
-
----
-
-## 6. Updating DELTA_FROM_COMMIT After Each Deploy
-
-After every successful deployment, update the variable to the new baseline:
-
-1. Go to **Settings → Secrets and variables → Actions → Variables**
-2. Edit `DELTA_FROM_COMMIT`
-3. Set it to the merge commit SHA from the last successful run (visible in the `Deploy merged commit` job logs)
-
-Or automate it by adding a step at the end of `deploy-after-merge`:
-
-```yaml
-- name: Update DELTA_FROM_COMMIT variable
-  env:
-    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  run: |
-    gh api --method PATCH \
-      "repos/${{ github.repository }}/actions/variables/DELTA_FROM_COMMIT" \
-      -f value="${{ needs.approval-merge-gate.outputs.merge_commit_sha }}"
 ```
 
 ---

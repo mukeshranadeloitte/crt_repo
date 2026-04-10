@@ -34,6 +34,8 @@ on:
       - ready_for_review
     paths:
       - force-app/**
+      - .github/workflows/e2e-uat-pipeline.yml
+      - .github/sf-scanner-waivers.json
 
   pull_request_review:
     types:
@@ -50,6 +52,22 @@ on:
           - all
           - checkmarx
           - fortify
+      action:
+        description: "Action to perform"
+        required: false
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - rollback
+      rollback_commit_sha:
+        description: "Rollback: commit SHA to revert TO (the last known-good commit). Required when action=rollback."
+        required: false
+        type: string
+      rollback_pr_number:
+        description: "Rollback: PR number that was deployed (used to fetch test classes). Optional."
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.review.pull_request_url || github.ref_name || github.run_id }}
@@ -394,16 +412,55 @@ jobs:
       - name: Install Salesforce Code Analyzer
         run: echo y | sf plugins install @salesforce/sfdx-scanner || npm install -g @salesforce/sfdx-scanner
 
+      - name: Detect changed Salesforce files for SCA
+        id: sca-targets
+        run: |
+          set -euo pipefail
+
+          # Get files changed in this PR compared to the base branch
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM "${BASE}...${HEAD}" \
+            | grep '^force-app/' \
+            | grep -E '\.(cls|trigger|js|html|css)$' \
+            || true)
+
+          if [[ -z "$CHANGED_FILES" ]]; then
+            echo "No scannable Salesforce files changed — skipping SCA."
+            echo "targets=" >> "$GITHUB_OUTPUT"
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Log each changed file
+          echo "Changed Salesforce files to scan:"
+          echo "$CHANGED_FILES"
+
+          # Build a comma-separated list for --target
+          TARGETS=$(echo "$CHANGED_FILES" | paste -sd ',' -)
+
+          # Summarise what component types were found
+          APEX=$(echo "$CHANGED_FILES" | grep -cE '\.(cls|trigger)$' || echo 0)
+          LWC=$(echo "$CHANGED_FILES"  | grep -cE '\.(js|html|css)$'  || echo 0)
+          echo ""
+          echo "Scan targets: ${APEX} Apex file(s), ${LWC} LWC/JS file(s)"
+
+          echo "targets=${TARGETS}" >> "$GITHUB_OUTPUT"
+          echo "has_targets=true"   >> "$GITHUB_OUTPUT"
+
       - name: Salesforce Code Analyzer
+        if: steps.sca-targets.outputs.has_targets == 'true'
         continue-on-error: true
         run: |
           sf scanner run \
-            --target "./force-app" \
+            --target "${{ steps.sca-targets.outputs.targets }}" \
             --format "csv" \
             --outfile "sfdx-report.csv" \
             --severity-threshold 3
 
       - name: Check scanner results against waivers
+        if: steps.sca-targets.outputs.has_targets == 'true'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -644,6 +701,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -706,11 +765,41 @@ jobs:
       - name: Install Salesforce Scanner plugin
         run: sf plugins install @salesforce/sfdx-scanner
 
+      - name: Detect changed Salesforce files for SCA
+        id: sca-targets
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM "${BASE}...${HEAD}" \
+            | grep '^force-app/' \
+            | grep -E '\.(cls|trigger|js|html|css)$' \
+            || true)
+
+          if [[ -z "$CHANGED_FILES" ]]; then
+            echo "No scannable Salesforce files changed — skipping SCA."
+            echo "targets=" >> "$GITHUB_OUTPUT"
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Changed Salesforce files to scan:"
+          echo "$CHANGED_FILES"
+          TARGETS=$(echo "$CHANGED_FILES" | paste -sd ',' -)
+          APEX=$(echo "$CHANGED_FILES" | grep -cE '\.(cls|trigger)$' || echo 0)
+          LWC=$(echo "$CHANGED_FILES"  | grep -cE '\.(js|html|css)$'  || echo 0)
+          echo "Scan targets: ${APEX} Apex file(s), ${LWC} LWC/JS file(s)"
+
+          echo "targets=${TARGETS}" >> "$GITHUB_OUTPUT"
+          echo "has_targets=true"   >> "$GITHUB_OUTPUT"
+
       - name: Salesforce Code Analyzer
+        if: steps.sca-targets.outputs.has_targets == 'true'
         continue-on-error: true
         run: |
           sf scanner run \
-            --target "./force-app" \
+            --target "${{ steps.sca-targets.outputs.targets }}" \
             --format "csv" \
             --outfile "sfdx-report.csv" \
             --severity-threshold 3
@@ -1036,7 +1125,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     permissions:
-      contents: read
+      contents: write
       pull-requests: read
     steps:
       - name: Checkout merged commit
@@ -1255,6 +1344,178 @@ jobs:
             exit 1
           fi
 
+          # ── Capture rollback manifest ─────────────────────────────────────────
+          # Record what was deployed so the rollback job can invert it:
+          # - Components from package.xml  → become destructiveChanges in rollback
+          # - Components from destructiveChanges.xml → become additions in rollback (re-deploy from prior commit)
+          DEPLOYED_COMMIT=$(git rev-parse HEAD)
+          ROLLBACK_COMMIT=$(git rev-parse HEAD^)
+          echo "Deployed commit:  ${DEPLOYED_COMMIT}"
+          echo "Rollback-to commit: ${ROLLBACK_COMMIT}"
+
+          mkdir -p rollback-manifest
+          echo "${DEPLOYED_COMMIT}" > rollback-manifest/deployed-commit.txt
+          echo "${ROLLBACK_COMMIT}" > rollback-manifest/rollback-to-commit.txt
+
+          # Copy the forward delta manifests — rollback job inverts these
+          [[ -f package/package.xml ]] && cp package/package.xml rollback-manifest/forward-package.xml || true
+          [[ -f destructiveChanges/destructiveChanges.xml ]] && cp destructiveChanges/destructiveChanges.xml rollback-manifest/forward-destructive.xml || true
+
+          echo "Rollback manifest saved."
+          cat rollback-manifest/deployed-commit.txt
+          cat rollback-manifest/rollback-to-commit.txt
+
+      - name: Upload rollback manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-manifest-${{ github.run_id }}
+          path: rollback-manifest/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Build deployment package and upload artifact
+        id: pkg
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.review.pull_request_url }}
+          MERGE_SHA: ${{ needs.approval-merge-gate.outputs.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          DEPLOYED_COMMIT=$(git rev-parse HEAD)
+          TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+          SHORT_SHA=${DEPLOYED_COMMIT:0:10}
+          PKG_NAME="deploy-pr${PR_NUMBER:-0}-${SHORT_SHA}-${TIMESTAMP}"
+
+          mkdir -p "deployment-packages/${PKG_NAME}"
+
+          # Copy delta manifests
+          [[ -f package/package.xml ]] \
+            && cp package/package.xml "deployment-packages/${PKG_NAME}/package.xml" \
+            || echo "(no package.xml)" > "deployment-packages/${PKG_NAME}/package.xml.missing"
+
+          [[ -f destructiveChanges/destructiveChanges.xml ]] \
+            && cp destructiveChanges/destructiveChanges.xml "deployment-packages/${PKG_NAME}/destructiveChanges.xml" \
+            || true
+
+          # Write deployment metadata
+          cat > "deployment-packages/${PKG_NAME}/deployment-info.json" <<EOF
+          {
+            "pr_number":       "${PR_NUMBER:-unknown}",
+            "deployed_commit": "${DEPLOYED_COMMIT}",
+            "delta_from":      "${DELTA_FROM_COMMIT}",
+            "deployed_at":     "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "deployed_by":     "${{ github.actor }}",
+            "org_alias":       "${ORG_ALIAS}",
+            "run_id":          "${{ github.run_id }}",
+            "run_url":         "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+
+          echo "pkg_name=${PKG_NAME}"             >> "$GITHUB_OUTPUT"
+          echo "deployed_commit=${DEPLOYED_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "pkg_dir=deployment-packages/${PKG_NAME}" >> "$GITHUB_OUTPUT"
+
+          echo "===== Deployment package: ${PKG_NAME} ====="
+          ls -la "deployment-packages/${PKG_NAME}/"
+          echo ""
+          cat "deployment-packages/${PKG_NAME}/deployment-info.json"
+
+      - name: Upload deployment package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.pkg_name }}
+          path: deployment-packages/${{ steps.pkg.outputs.pkg_name }}/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Commit deployment package to pr_packages branch
+        env:
+          PKG_NAME:    ${{ steps.pkg.outputs.pkg_name }}
+          PKG_DIR:     ${{ steps.pkg.outputs.pkg_dir }}
+          DEPLOY_SHA:  ${{ steps.pkg.outputs.deployed_commit }}
+          GH_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Ensure pr_packages branch exists (create orphan if first time)
+          if git ls-remote --exit-code --heads origin pr_packages > /dev/null 2>&1; then
+            git fetch origin pr_packages
+            git checkout pr_packages
+          else
+            echo "Creating orphan branch pr_packages..."
+            git checkout --orphan pr_packages
+            git reset --hard
+            git commit --allow-empty -m "chore: initialise pr_packages branch"
+          fi
+
+          # Copy the package into the branch
+          mkdir -p "${PKG_NAME}"
+          cp -r "${GITHUB_WORKSPACE}/${PKG_DIR}/." "${PKG_NAME}/"
+
+          git add "${PKG_NAME}"
+          git commit -m "deploy: ${PKG_NAME}
+
+          Deployed commit: ${DEPLOY_SHA}
+          PR: ${{ github.event.pull_request.number || 'n/a' }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          git push origin pr_packages
+          echo "✅ Package committed to pr_packages branch: ${PKG_NAME}"
+
+      - name: Update DELTA_FROM_COMMIT variable to deployed commit
+        env:
+          DEPLOY_SHA: ${{ steps.pkg.outputs.deployed_commit }}
+          GH_PAT:     ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "Updating DELTA_FROM_COMMIT → ${DEPLOY_SHA}"
+
+          # GITHUB_TOKEN cannot write Actions variables (requires 'vars' write scope).
+          # Set secret GH_PAT as a Fine-Grained PAT with:
+          #   Repository permissions → Variables → Read and write
+          # If GH_PAT is not set, falls back to GITHUB_TOKEN which will return 403/404
+          # and the step will warn gracefully — the SHA is still available in pr_packages branch.
+
+          HTTP=$(curl -sS -o /tmp/var_response.json -w "%{http_code}" \
+            -X PATCH \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/variables/DELTA_FROM_COMMIT" \
+            -d "{\"name\":\"DELTA_FROM_COMMIT\",\"value\":\"${DEPLOY_SHA}\"}")
+
+          if [[ "${HTTP}" == "204" ]]; then
+            echo "✅ DELTA_FROM_COMMIT updated to ${DEPLOY_SHA}"
+          elif [[ "${HTTP}" == "404" ]]; then
+            echo "Variable not found — creating it..."
+            HTTP2=$(curl -sS -o /tmp/var_create.json -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/variables" \
+              -d "{\"name\":\"DELTA_FROM_COMMIT\",\"value\":\"${DEPLOY_SHA}\"}")
+            if [[ "${HTTP2}" == "201" ]]; then
+              echo "✅ DELTA_FROM_COMMIT created with value ${DEPLOY_SHA}"
+            else
+              echo "::warning::Could not create DELTA_FROM_COMMIT (HTTP ${HTTP2}). Set secret GH_PAT with Variables read/write permission, or update manually."
+              cat /tmp/var_create.json || true
+            fi
+          elif [[ "${HTTP}" == "403" ]]; then
+            echo "::warning::Permission denied (HTTP 403) — GITHUB_TOKEN cannot write repository variables."
+            echo "::warning::Create a Fine-Grained PAT with 'Variables: Read and write' and store it as secret GH_PAT."
+            echo "::warning::Next PR delta baseline must be set manually to: ${DEPLOY_SHA}"
+          else
+            echo "::warning::Unexpected HTTP ${HTTP} updating DELTA_FROM_COMMIT."
+            cat /tmp/var_response.json || true
+          fi
+
+          echo "Next PR delta will be calculated from: ${DEPLOY_SHA}"
+
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 10 — Trigger CRT Smoke Tests
   # Triggers a Copado Robotic Testing job after a successful deployment.
@@ -1269,7 +1530,6 @@ jobs:
       pull-requests: write
     steps:
       - name: Trigger CRT Test Execution
-        id: crt-trigger
         env:
           CRT_API_TOKEN:  ${{ secrets.CRT_API_TOKEN }}
           CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
@@ -1281,222 +1541,316 @@ jobs:
             echo "::error::Missing required secret: CRT_API_TOKEN"
             exit 1
           fi
-
           echo "Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})"
-
           RESPONSE=$(curl -s \
             --header "X-Authorization: ${CRT_API_TOKEN}" \
             --header "Content-Type: application/json" \
             --json "{\"query\":\"mutation { createBuild(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { message data { id buildNumber status startTime } } }\"}" \
             https://graphql.eu-robotic.copado.com/v1)
-
           echo "Response: ${RESPONSE}"
-
           if echo "${RESPONSE}" | grep -q '"errors"'; then
             ERR_MSG=$(echo "${RESPONSE}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['errors'][0].get('message','unknown'))" 2>/dev/null || echo "unknown")
             echo "::error::Failed to trigger CRT job: ${ERR_MSG}"
             exit 1
           fi
-
           BUILD_ID=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['id'])")
           STATUS=$(echo "${RESPONSE}"   | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['status'])")
           BUILD_NO=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data'].get('buildNumber','n/a'))")
-
           echo "✅ CRT job triggered successfully"
           echo "   Build ID:     ${BUILD_ID}"
           echo "   Build Number: ${BUILD_NO}"
           echo "   Status:       ${STATUS}"
-
-          # Expose outputs for the poll step
-          echo "build_id=${BUILD_ID}"    >> "$GITHUB_OUTPUT"
-          echo "build_no=${BUILD_NO}"    >> "$GITHUB_OUTPUT"
-
-      - name: Wait for CRT Job Result
-        id: crt-result
-        env:
-          CRT_API_TOKEN:  ${{ secrets.CRT_API_TOKEN }}
-          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
-          BUILD_ID:       ${{ steps.crt-trigger.outputs.build_id }}
-          BUILD_NO:       ${{ steps.crt-trigger.outputs.build_no }}
-          POLL_INTERVAL:  30    # seconds between polls
-          MAX_WAIT:       1800  # 30 minutes max
-        run: |
-          set -euo pipefail
-          CRT_API="https://graphql.eu-robotic.copado.com/v1"
-
-          if [ -z "${BUILD_ID}" ]; then
-            echo "::error::No BUILD_ID from trigger step — cannot poll for result."
-            exit 1
-          fi
-
-          echo "Polling CRT build ${BUILD_ID} every ${POLL_INTERVAL}s (max ${MAX_WAIT}s)..."
-          echo "Using: latestBuilds(projectId: ${CRT_PROJECT_ID}, resultSize: 10)"
-
-          ELAPSED=0
-          FINAL_STATUS=""
-          TOTAL=0; PASSED_T=0; FAILED_T=0; SKIPPED_T=0
-
-          while [ "${ELAPSED}" -lt "${MAX_WAIT}" ]; do
-
-            POLL_RESPONSE=$(curl -s \
-              --header "X-Authorization: ${CRT_API_TOKEN}" \
-              --header "Content-Type: application/json" \
-              --json "{\"query\":\"{ latestBuilds(projectId: ${CRT_PROJECT_ID}, resultSize: 10) { id status buildNumber startTime endTime totalTests passedTests failedTests skippedTests } }\"}" \
-              "${CRT_API}")
-
-            # Extract status for our specific BUILD_ID from the list
-            FINAL_STATUS=$(echo "${POLL_RESPONSE}" | python3 -c \
-              "import sys,json; d=json.load(sys.stdin); builds=d.get('data',{}).get('latestBuilds',[]) or []; b=next((x for x in builds if str(x.get('id',''))=='${BUILD_ID}'),None); print(b.get('status','') if b else 'NOT_FOUND')" \
-              2>/dev/null || echo "")
-
-            # Also extract test counts when we have a terminal status
-            if [ -n "${FINAL_STATUS}" ] && [ "${FINAL_STATUS}" != "NOT_FOUND" ]; then
-              read TOTAL PASSED_T FAILED_T SKIPPED_T <<< "$(echo "${POLL_RESPONSE}" | python3 -c \
-                "import sys,json; d=json.load(sys.stdin); builds=d.get('data',{}).get('latestBuilds',[]) or []; b=next((x for x in builds if str(x.get('id',''))=='${BUILD_ID}'),{}); print(b.get('totalTests',0),b.get('passedTests',0),b.get('failedTests',0),b.get('skippedTests',0))" \
-                2>/dev/null || echo "0 0 0 0")"
-            fi
-
-            echo "  [${ELAPSED}s] Build ${BUILD_ID} — Status: ${FINAL_STATUS:-unknown} | Tests: ${PASSED_T} passed / ${FAILED_T} failed / ${SKIPPED_T} skipped"
-
-            case "${FINAL_STATUS^^}" in
-              PASSED|SUCCESS|COMPLETED)
-                echo "final_status=${FINAL_STATUS}"       >> "$GITHUB_OUTPUT"
-                echo "total_tests=${TOTAL}"               >> "$GITHUB_OUTPUT"
-                echo "passed_tests=${PASSED_T}"           >> "$GITHUB_OUTPUT"
-                echo "failed_tests=${FAILED_T}"           >> "$GITHUB_OUTPUT"
-                echo "skipped_tests=${SKIPPED_T}"         >> "$GITHUB_OUTPUT"
-                echo ""
-                echo "✅ CRT Smoke Tests PASSED"
-                echo "   Total:   ${TOTAL}"
-                echo "   Passed:  ${PASSED_T}"
-                echo "   Failed:  ${FAILED_T}"
-                echo "   Skipped: ${SKIPPED_T}"
-                exit 0
-                ;;
-              FAILED|FAILURE|ERROR)
-                echo "final_status=${FINAL_STATUS}"       >> "$GITHUB_OUTPUT"
-                echo "total_tests=${TOTAL}"               >> "$GITHUB_OUTPUT"
-                echo "passed_tests=${PASSED_T}"           >> "$GITHUB_OUTPUT"
-                echo "failed_tests=${FAILED_T}"           >> "$GITHUB_OUTPUT"
-                echo "skipped_tests=${SKIPPED_T}"         >> "$GITHUB_OUTPUT"
-                echo ""
-                echo "::error::❌ CRT Smoke Tests FAILED"
-                echo "   Total:   ${TOTAL}"
-                echo "   Passed:  ${PASSED_T}"
-                echo "   Failed:  ${FAILED_T}"
-                echo "   Skipped: ${SKIPPED_T}"
-                exit 1
-                ;;
-              ABORTED|CANCELLED|TIMEOUT)
-                echo "final_status=${FINAL_STATUS}" >> "$GITHUB_OUTPUT"
-                echo "::error::⚠️ CRT job ${FINAL_STATUS}"
-                exit 1
-                ;;
-            esac
-
-            sleep "${POLL_INTERVAL}"
-            ELAPSED=$(( ELAPSED + POLL_INTERVAL ))
-          done
-
-          echo "::error::CRT job did not complete within ${MAX_WAIT}s (last status: ${FINAL_STATUS:-unknown})"
-          echo "final_status=TIMEOUT" >> "$GITHUB_OUTPUT"
-          exit 1
-
-
       - name: Post CRT deployment comment
-        if: always()
         uses: actions/github-script@v7
-        env:
-          CRT_STATUS:    ${{ steps.crt-result.outputs.final_status || 'TRIGGERED' }}
-          BUILD_ID:      ${{ steps.crt-trigger.outputs.build_id }}
-          BUILD_NO:      ${{ steps.crt-trigger.outputs.build_no }}
-          TOTAL_TESTS:   ${{ steps.crt-result.outputs.total_tests   || '0' }}
-          PASSED_TESTS:  ${{ steps.crt-result.outputs.passed_tests  || '0' }}
-          FAILED_TESTS:  ${{ steps.crt-result.outputs.failed_tests  || '0' }}
-          SKIPPED_TESTS: ${{ steps.crt-result.outputs.skipped_tests || '0' }}
-          CRT_JOB_ID:    ${{ vars.CRT_JOB_ID     || '115686' }}
-          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
-          CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
         with:
           script: |
-            const status   = process.env.CRT_STATUS || 'UNKNOWN';
-            const buildId  = process.env.BUILD_ID   || 'n/a';
-            const buildNo  = process.env.BUILD_NO   || 'n/a';
-            const total    = process.env.TOTAL_TESTS;
-            const passed   = process.env.PASSED_TESTS;
-            const failed   = process.env.FAILED_TESTS;
-            const skipped  = process.env.SKIPPED_TESTS;
-            const projId   = process.env.CRT_PROJECT_ID;
-            const orgId    = process.env.CRT_ORG_ID;
-            const jobId    = process.env.CRT_JOB_ID;
-
-            const UP  = status.toUpperCase();
-            const isPass = ['PASSED','SUCCESS','COMPLETED'].includes(UP);
-            const isPending = ['TRIGGERED','UNKNOWN',''].includes(UP);
-            const icon = isPass ? '✅' : isPending ? '🚀' : '❌';
-            const dashUrl = `https://eu-robotic.copado.com/builds/${buildId}?projectId=${projId}&orgId=${orgId}`;
-
-            const body = [
-              `${icon} **CRT Smoke Tests — ${status}**`,
-              '',
-              `| Field | Value |`,
-              `|-------|-------|`,
-              `| **Status** | ${icon} **${status}** |`,
-              `| Build Number | ${buildNo} |`,
-              `| Build ID | ${buildId} |`,
-              `| Job ID | ${jobId} |`,
-              `| ✅ Passed | ${passed} |`,
-              `| ❌ Failed | ${failed} |`,
-              `| ⏭️ Skipped | ${skipped} |`,
-              `| Total | ${total} |`,
-              `| Dashboard | [View Results](${dashUrl}) |`,
-            ].join('\n');
-
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body,
+              body: "🤖 Deployed to UAT: CRT robotic tests have been triggered via Copado EU Robotic Testing."
             });
-
       - name: CRT Test Execution Summary
         if: always()
         env:
           CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
           CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
           CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
-          BUILD_ID:       ${{ steps.crt-trigger.outputs.build_id   || 'n/a' }}
-          BUILD_NO:       ${{ steps.crt-trigger.outputs.build_no   || 'n/a' }}
-          CRT_STATUS:     ${{ steps.crt-result.outputs.final_status || 'UNKNOWN' }}
-          TOTAL_TESTS:    ${{ steps.crt-result.outputs.total_tests   || '0' }}
-          PASSED_TESTS:   ${{ steps.crt-result.outputs.passed_tests  || '0' }}
-          FAILED_TESTS:   ${{ steps.crt-result.outputs.failed_tests  || '0' }}
-          SKIPPED_TESTS:  ${{ steps.crt-result.outputs.skipped_tests || '0' }}
         run: |
-          case "${CRT_STATUS^^}" in
-            PASSED|SUCCESS|COMPLETED) STATUS_ICON="✅" ;;
-            FAILED|FAILURE|ERROR)     STATUS_ICON="❌" ;;
-            *)                        STATUS_ICON="⚠️" ;;
-          esac
-
           {
-            echo "## 🧪 CRT Smoke Test Results"
+            echo "## 🧪 CRT Test Execution Summary"
             echo ""
             echo "| Detail | Value |"
             echo "|--------|-------|"
-            echo "| **Status** | ${STATUS_ICON} **${CRT_STATUS}** |"
-            echo "| **Build Number** | ${BUILD_NO} |"
-            echo "| **Build ID** | ${BUILD_ID} |"
-            echo "| **✅ Passed** | ${PASSED_TESTS} |"
-            echo "| **❌ Failed** | ${FAILED_TESTS} |"
-            echo "| **⏭️ Skipped** | ${SKIPPED_TESTS} |"
-            echo "| **Total** | ${TOTAL_TESTS} |"
             echo "| **Instance** | https://eu-robotic.copado.com |"
             echo "| **Org ID** | ${CRT_ORG_ID} |"
             echo "| **Project ID** | ${CRT_PROJECT_ID} |"
             echo "| **Job ID** | ${CRT_JOB_ID} |"
             echo ""
             echo "### 🔗 View Results"
-            echo "[Open CRT Dashboard](https://eu-robotic.copado.com/builds/${BUILD_ID}?projectId=${CRT_PROJECT_ID}&orgId=${CRT_ORG_ID})"
+            echo "[Open CRT Dashboard](https://eu-robotic.copado.com/jobs/${CRT_JOB_ID}?projectId=${CRT_PROJECT_ID}&orgId=${CRT_ORG_ID})"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 11 — Rollback
+  # Triggered manually via workflow_dispatch (action=rollback).
+  # Inverts the last deployment:
+  #   • Components that were ADDED (package.xml)   → deleted via destructiveChanges
+  #   • Components that were DELETED (destructive) → re-deployed from rollback commit
+  #   • New metadata created by the PR             → treated as destructive (deleted)
+  # ─────────────────────────────────────────────────────────────────────────────
+  rollback:
+    name: "🔄 Rollback Deployment"
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'rollback' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Validate rollback inputs
+        run: |
+          set -euo pipefail
+          if [[ -z "${{ github.event.inputs.rollback_commit_sha }}" ]]; then
+            echo "::error::rollback_commit_sha is required. Provide the last known-good commit SHA to revert to."
+            exit 1
+          fi
+          echo "Rollback target commit: ${{ github.event.inputs.rollback_commit_sha }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install npm dependencies
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then npm ci; else npm install; fi
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+
+      - name: Install sfdx-git-delta plugin
+        run: |
+          set -euo pipefail
+          echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Authenticate target org
+        env:
+          SFDX_AUTH_URL: ${{ secrets.CRT_UAT_AUTHURL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SFDX_AUTH_URL:-}" ]]; then
+            echo "::error::Secret CRT_UAT_AUTHURL is missing or empty."
+            exit 1
+          fi
+          printf '%s' "$SFDX_AUTH_URL" > sfdxAuthUrl.txt
+          sf org login sfdx-url --sfdx-url-file sfdxAuthUrl.txt --alias "$ORG_ALIAS" --set-default
+          rm -f sfdxAuthUrl.txt
+          sf org display --target-org "$ORG_ALIAS"
+
+      - name: Build rollback delta (HEAD → rollback commit)
+        id: rollback-delta
+        env:
+          ROLLBACK_SHA: ${{ github.event.inputs.rollback_commit_sha }}
+        run: |
+          set -euo pipefail
+          CURRENT_HEAD=$(git rev-parse HEAD)
+          echo "Current HEAD (deployed state): ${CURRENT_HEAD}"
+          echo "Rolling back TO:               ${ROLLBACK_SHA}"
+
+          # sfdx-git-delta from rollback_sha → HEAD gives what was ADDED in the PR
+          # We invert: what was added becomes destructive, what was removed needs re-adding
+          sf sgd:source:delta \
+            --to  "HEAD" \
+            --from "${ROLLBACK_SHA}" \
+            --output-dir "forward-delta/" \
+            --source-dir force-app/
+
+          echo "===== Forward delta (what was deployed by the PR) ====="
+          echo "--- package.xml (added/changed — will be DELETED in rollback) ---"
+          cat forward-delta/package/package.xml 2>/dev/null || echo "(none)"
+          echo "--- destructiveChanges.xml (was deleted by PR — will be RE-DEPLOYED in rollback) ---"
+          cat forward-delta/destructiveChanges/destructiveChanges.xml 2>/dev/null || echo "(none)"
+
+          # Now build the rollback delta in reverse: rollback_sha is the "new" state
+          sf sgd:source:delta \
+            --to  "${ROLLBACK_SHA}" \
+            --from "HEAD" \
+            --output-dir "rollback-delta/" \
+            --source-dir force-app/
+
+          echo "===== Rollback delta (what will be deployed to revert) ====="
+          echo "--- package.xml (re-additions = previously deleted components) ---"
+          cat rollback-delta/package/package.xml 2>/dev/null || echo "(none)"
+          echo "--- destructiveChanges.xml (deletions = components added by the PR, incl. new metadata) ---"
+          cat rollback-delta/destructiveChanges/destructiveChanges.xml 2>/dev/null || echo "(none)"
+
+          # NEW METADATA RULE: any component in the forward package.xml that didn't
+          # exist before the PR is treated as destructive in rollback.
+          # sfdx-git-delta's reverse delta already handles this — components added
+          # by the PR appear in rollback-delta/destructiveChanges/destructiveChanges.xml.
+
+          rollback_deploy_manifest=""
+          if [[ -f rollback-delta/package/package.xml ]] && grep -q '<members>' rollback-delta/package/package.xml; then
+            rollback_deploy_manifest="rollback-delta/package/package.xml"
+          fi
+
+          rollback_destructive_manifest=""
+          if [[ -f rollback-delta/destructiveChanges/destructiveChanges.xml ]] && grep -q '<members>' rollback-delta/destructiveChanges/destructiveChanges.xml; then
+            rollback_destructive_manifest="rollback-delta/destructiveChanges/destructiveChanges.xml"
+          fi
+
+          has_apex=false
+          if [[ -f rollback-delta/package/package.xml ]] && grep -qE '<name>ApexClass|ApexTrigger</name>' rollback-delta/package/package.xml; then
+            has_apex=true
+          fi
+
+          echo "rollback_deploy_manifest=${rollback_deploy_manifest}"       >> "$GITHUB_OUTPUT"
+          echo "rollback_destructive_manifest=${rollback_destructive_manifest}" >> "$GITHUB_OUTPUT"
+          echo "has_apex=${has_apex}"                                        >> "$GITHUB_OUTPUT"
+          echo "rollback_sha=${ROLLBACK_SHA}"                                >> "$GITHUB_OUTPUT"
+          echo "current_head=${CURRENT_HEAD}"                                >> "$GITHUB_OUTPUT"
+
+      - name: Upload rollback delta artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-delta-${{ github.run_id }}
+          path: |
+            rollback-delta/
+            forward-delta/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Execute rollback deployment
+        id: rollback-deploy
+        env:
+          ROLLBACK_DEPLOY_MANIFEST:      ${{ steps.rollback-delta.outputs.rollback_deploy_manifest }}
+          ROLLBACK_DESTRUCTIVE_MANIFEST: ${{ steps.rollback-delta.outputs.rollback_destructive_manifest }}
+          HAS_APEX:                      ${{ steps.rollback-delta.outputs.has_apex }}
+          ROLLBACK_SHA:                  ${{ steps.rollback-delta.outputs.rollback_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ROLLBACK_DEPLOY_MANIFEST}" && -z "${ROLLBACK_DESTRUCTIVE_MANIFEST}" ]]; then
+            echo "::error::Nothing to rollback — no delta found between HEAD and ${ROLLBACK_SHA}."
+            echo "This may mean the PR only had non-Salesforce changes, or the commit SHA is incorrect."
+            exit 1
+          fi
+
+          rollback_cmd=(sf project deploy start --target-org "$ORG_ALIAS" --wait 60 --json)
+
+          if [[ -n "${ROLLBACK_DEPLOY_MANIFEST}" ]]; then
+            rollback_cmd+=(--manifest "${ROLLBACK_DEPLOY_MANIFEST}")
+          fi
+
+          if [[ -n "${ROLLBACK_DESTRUCTIVE_MANIFEST}" ]]; then
+            # Pre-destructive: delete new metadata BEFORE re-deploying old state
+            rollback_cmd+=(--pre-destructive-changes "${ROLLBACK_DESTRUCTIVE_MANIFEST}")
+          fi
+
+          if [[ "${HAS_APEX}" == "true" ]]; then
+            rollback_cmd+=(--test-level RunLocalTests)
+          else
+            rollback_cmd+=(--test-level NoTestRun)
+          fi
+
+          echo "Executing rollback: ${rollback_cmd[*]}"
+
+          set +e
+          "${rollback_cmd[@]}" > rollback-output.json 2>rollback-stderr.log
+          rc=$?
+          set -e
+
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::Rollback deployment FAILED (exit $rc)."
+            echo "--- stderr ---"
+            cat rollback-stderr.log || true
+            echo "--- component failures ---"
+            jq -r '.result.details.componentFailures[]? | "[\(.componentType)] \(.fileName): \(.problem)"' rollback-output.json 2>/dev/null || true
+            echo "--- test failures ---"
+            jq -r '.result.details.runTestResult.failures[]? | "\(.name).\(.methodName): \(.message)"' rollback-output.json 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "✅ Rollback deployed successfully to ${ORG_ALIAS}"
+
+      - name: Post rollback PR/issue comment
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          ROLLBACK_STATUS: ${{ job.status }}
+          ROLLBACK_SHA:    ${{ steps.rollback-delta.outputs.rollback_sha }}
+          CURRENT_HEAD:    ${{ steps.rollback-delta.outputs.current_head }}
+          PR_NUMBER:       ${{ github.event.inputs.rollback_pr_number }}
+        with:
+          script: |
+            const status      = process.env.ROLLBACK_STATUS;
+            const rollbackSha = process.env.ROLLBACK_SHA || 'unknown';
+            const deployedSha = process.env.CURRENT_HEAD || 'unknown';
+            const prNumber    = process.env.PR_NUMBER;
+            const runUrl      = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const icon        = status === 'success' ? '✅' : '❌';
+
+            const body = [
+              `${icon} **Rollback ${status === 'success' ? 'Completed' : 'FAILED'}**`,
+              '',
+              `| Field | Value |`,
+              `|-------|-------|`,
+              `| Triggered by | @${context.actor} |`,
+              `| Rolled back FROM | \`${deployedSha.substring(0,10)}\` |`,
+              `| Rolled back TO | \`${rollbackSha.substring(0,10)}\` |`,
+              `| Status | **${status}** |`,
+              `| Actions run | [View logs](${runUrl}) |`,
+            ].join('\n');
+
+            // Post to PR if number provided, otherwise create a repo issue comment
+            const issueNumber = prNumber ? parseInt(prNumber) : null;
+            if (issueNumber) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: issueNumber,
+                body,
+              });
+            } else {
+              core.notice(`Rollback ${status}. Rolled back from ${deployedSha.substring(0,10)} to ${rollbackSha.substring(0,10)}.`);
+            }
+
+      - name: Rollback Step Summary
+        if: always()
+        env:
+          ROLLBACK_SHA:  ${{ steps.rollback-delta.outputs.rollback_sha }}
+          CURRENT_HEAD:  ${{ steps.rollback-delta.outputs.current_head }}
+          HAS_APEX:      ${{ steps.rollback-delta.outputs.has_apex }}
+        run: |
+          case "${{ job.status }}" in
+            success) ICON="✅" ;;
+            failure) ICON="❌" ;;
+            *)       ICON="⚠️" ;;
+          esac
+          {
+            echo "## 🔄 Rollback Summary"
+            echo ""
+            echo "| Detail | Value |"
+            echo "|--------|-------|"
+            echo "| **Status** | ${ICON} **${{ job.status }}** |"
+            echo "| **Triggered by** | @${{ github.actor }} |"
+            echo "| **Rolled back FROM** | \`${CURRENT_HEAD:0:10}\` |"
+            echo "| **Rolled back TO** | \`${ROLLBACK_SHA:0:10}\` |"
+            echo "| **Org** | ${ORG_ALIAS} |"
+            echo "| **Apex tests run** | ${HAS_APEX} |"
+            echo ""
+            echo "### What was rolled back"
+            echo "- Components **added** by the PR were **deleted** (treated as destructive)"
+            echo "- Components **deleted** by the PR were **re-deployed** from the rollback commit"
+            echo "- Any **new metadata** created by the PR was **removed** from the org"
+          } >> "$GITHUB_STEP_SUMMARY"
