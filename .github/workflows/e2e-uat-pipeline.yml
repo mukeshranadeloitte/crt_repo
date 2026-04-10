@@ -689,7 +689,24 @@ jobs:
           fi
           log_error "${DEFAULT_BRANCH}" "${HTTP}"
 
-          # Priority 2: PR base branch (e.g. uat — for first-time introduction of the file)
+          # Diagnose: list .github/ folder contents on default branch to spot path/name issues
+          echo "  Listing .github/ on ${DEFAULT_BRANCH} to verify file path..."
+          curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/contents/.github?ref=${DEFAULT_BRANCH}" \
+            | python3 -c "
+          import json,sys
+          try:
+              items = json.load(sys.stdin)
+              if isinstance(items, list):
+                  print('  .github/ contents on ${DEFAULT_BRANCH}:')
+                  for i in items: print(f'    {i[\"type\"]:4s}  {i[\"name\"]}')
+              else:
+                  print(f'  Unexpected response: {items.get(\"message\",items)}')
+          except Exception as e:
+              print(f'  Could not parse listing: {e}')
+          " 2>/dev/null || echo "  Could not list .github/ folder."
           BASE_REF="${{ github.base_ref }}"
           if [[ -n "$BASE_REF" && "$BASE_REF" != "main" ]]; then
             echo "Trying base branch (${BASE_REF})..."
@@ -797,15 +814,15 @@ jobs:
           COMMENT_MD     = "sca-pr-comment.md"
 
           def parse_date(val):
-              """Parse YYYY-MM-DD or DD-MM-YYYY or DD/MM/YYYY date strings."""
+              """Parse DD-MM-YYYY (primary), YYYY-MM-DD, DD/MM/YYYY date strings."""
               val = val.strip()
-              for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m-%d-%Y", "%m/%d/%Y"):
+              from datetime import datetime
+              for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y"):
                   try:
-                      from datetime import datetime
                       return datetime.strptime(val, fmt).date()
                   except ValueError:
                       continue
-              raise ValueError(f"Unrecognised date format '{val}'. Use YYYY-MM-DD.")
+              raise ValueError(f"Unrecognised date format '{val}'. Accepted: DD-MM-YYYY or YYYY-MM-DD.")
 
           # ── Load waivers from main branch CSV ────────────────────────────────
           waivers = []
