@@ -1,0 +1,237 @@
+name: UAT Trigger Copado Robotic Testing Job
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - my-uat
+
+jobs:
+  trigger-test:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      contents: read
+
+    steps:
+      # ── STEP 1 ─ Checkout repository ──────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── STEP 2 ─ Find merged PR by merge_commit_sha ───────────────────────
+      #
+      #  ROOT-CAUSE FIX: When a PR merges, GitHub pushes a *merge commit* to
+      #  the target branch.  The  GET /commits/{sha}/pulls  endpoint only
+      #  resolves the PR for the *PR head* commit, not the merge commit, so it
+      #  always returns [] here — making the old code think it was a direct push.
+      #
+      #  Instead we list recently-closed PRs targeting my-uat and find the one
+      #  whose merge_commit_sha equals the current push SHA.  That is reliable
+      #  for any merge strategy (merge commit, squash, rebase).
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Collect PR Metadata
+        id: pr_meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          COMMIT_SHA="${{ github.sha }}"
+          TARGET_BRANCH="my-uat"
+
+          echo "🔍 Looking for a merged PR whose merge_commit_sha = $COMMIT_SHA"
+
+          # Fetch the last 20 closed PRs targeting the branch (usually 1 page is enough)
+          PR_DATA=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/pulls?state=closed&base=$TARGET_BRANCH&per_page=20")
+
+          # Match by merge_commit_sha
+          PR_NUMBER=$(echo "$PR_DATA" | jq -r \
+            --arg sha "$COMMIT_SHA" \
+            '.[] | select(.merged_at != null and .merge_commit_sha == $sha) | .number' \
+            | head -1)
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "⏭️  No merged PR found for this commit — treating as a direct push. Skipping CRT."
+            echo "has_pr=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "✅ Found PR #$PR_NUMBER merged via commit $COMMIT_SHA"
+          echo "has_pr=true"          >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "run_number=${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+          # Pull the matched PR object for extra fields
+          MATCHED_PR=$(echo "$PR_DATA" | jq \
+            --arg sha "$COMMIT_SHA" \
+            '.[] | select(.merged_at != null and .merge_commit_sha == $sha)' \
+            | head -c 100000)
+
+          PR_RAISER=$(echo "$MATCHED_PR" | jq -r '.user.login // "unknown"')
+          echo "pr_raiser=$PR_RAISER" >> $GITHUB_OUTPUT
+
+          APPROVER=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            | jq -r '[.[] | select(.state=="APPROVED")] | last | .user.login // "No approver found"')
+          echo "pr_approver=$APPROVER" >> $GITHUB_OUTPUT
+
+          echo "--- GITHUB_OUTPUT contents ---"
+          cat $GITHUB_OUTPUT
+
+      # ── STEP 3 ─ Trigger CRT job, get job name, poll to completion ─────────
+      - name: Trigger and Poll CRT Job
+        id: crt
+        if: steps.pr_meta.outputs.has_pr == 'true'
+        env:
+          PROJECT_ID: ${{ secrets.CRT_PROJECT_ID }}
+          JOB_ID:     ${{ secrets.CRT_TEST_JOB_ID }}
+          API_KEY:    ${{ secrets.CRT_API_TOKEN }}
+        run: |
+          BASE="https://eu-robotic.copado.com/pace/v4"
+
+          echo "job_name=Unknown Job" >> $GITHUB_OUTPUT
+          echo "job_id=${JOB_ID}"     >> $GITHUB_OUTPUT
+          echo "build_id=N/A"         >> $GITHUB_OUTPUT
+          echo "crt_status=NOT RUN"   >> $GITHUB_OUTPUT
+
+          if [ -z "$PROJECT_ID" ] || [ -z "$JOB_ID" ]; then
+            echo "❌ Missing PROJECT_ID or JOB_ID"
+            echo "crt_status=MISSING SECRETS" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "Using PROJECT_ID=$PROJECT_ID  JOB_ID=$JOB_ID"
+
+          # ── Token exchange ─────────────────────────────────────────────────
+          echo "--- Token exchange ---"
+          TOKEN_RESP=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"accessKey\":\"$API_KEY\"}" \
+            "https://eu-robotic.copado.com/pace/v4/auth/login")
+          echo "Login response: $TOKEN_RESP"
+
+          SESSION_TOKEN=$(echo "$TOKEN_RESP" | jq -r '.token // .data.token // .accessToken // .data.accessToken // empty')
+
+          if [ -z "$SESSION_TOKEN" ]; then
+            echo "--- Trying cookie auth ---"
+            COOKIE_RESP=$(curl -s -c /tmp/crt_cookies.txt \
+              -H "Content-Type: application/json" \
+              -d "{\"accessKey\":\"$API_KEY\"}" \
+              "https://eu-robotic.copado.com/pace/v4/auth/login")
+            echo "Cookie login response: $COOKIE_RESP"
+            SESSION_TOKEN=$(echo "$COOKIE_RESP" | jq -r '.token // .data.token // empty')
+          fi
+
+          if [ -z "$SESSION_TOKEN" ]; then
+            echo "--- Trying x-access-key directly ---"
+            DIRECT_RESP=$(curl -s \
+              -H "x-access-key: $API_KEY" \
+              -H "Content-Type: application/json" \
+              "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID")
+            echo "Direct x-access-key response: $DIRECT_RESP"
+            if echo "$DIRECT_RESP" | jq -e '.id' > /dev/null 2>&1; then
+              echo "✅ x-access-key works directly"
+              USE_DIRECT_KEY=true
+            fi
+          fi
+
+          # ── Fetch job name ─────────────────────────────────────────────────
+          echo "--- Fetching job info ---"
+          if [ "${USE_DIRECT_KEY}" = "true" ]; then
+            JOB_INFO=$(curl -s -H "x-access-key: $API_KEY" -H "Content-Type: application/json" \
+              "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID")
+          elif [ -f /tmp/crt_cookies.txt ]; then
+            JOB_INFO=$(curl -s -b /tmp/crt_cookies.txt -H "Content-Type: application/json" \
+              "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID")
+          else
+            JOB_INFO=$(curl -s -H "Authorization: Bearer $SESSION_TOKEN" -H "Content-Type: application/json" \
+              "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID")
+          fi
+          echo "Job info response: $JOB_INFO"
+
+          JOB_NAME=$(echo "$JOB_INFO" | jq -r '.name // "Unknown Job"')
+          echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
+          echo "job_id=$JOB_ID"     >> $GITHUB_OUTPUT
+
+          # ── Trigger build ──────────────────────────────────────────────────
+          echo "--- Triggering build ---"
+          if [ "${USE_DIRECT_KEY}" = "true" ]; then
+            RESPONSE=$(curl -s -X POST -H "x-access-key: $API_KEY" -H "Content-Type: application/json" \
+              "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID/builds")
+          elif [ -f /tmp/crt_cookies.txt ]; then
+            RESPONSE=$(curl -s -X POST -b /tmp/crt_cookies.txt -H "Content-Type: application/json" \
+              "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID/builds")
+          else
+            RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $SESSION_TOKEN" -H "Content-Type: application/json" \
+              "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID/builds")
+          fi
+          echo "Trigger response: $RESPONSE"
+
+          BUILD_ID=$(echo "$RESPONSE" | jq -r '.id // .data.id // empty')
+          if [ -z "$BUILD_ID" ] || [ "$BUILD_ID" = "null" ]; then
+            echo "❌ Failed to extract Build ID"
+            echo "crt_status=TRIGGER FAILED" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "✅ Build triggered — Build ID: $BUILD_ID"
+          echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+
+          # ── Poll build status ──────────────────────────────────────────────
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          FINAL_STATUS="TIMED OUT"
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 30
+
+            if [ "${USE_DIRECT_KEY}" = "true" ]; then
+              STATUS_RESP=$(curl -s -H "x-access-key: $API_KEY" -H "Content-Type: application/json" \
+                "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID/builds/$BUILD_ID" || echo '{}')
+            elif [ -f /tmp/crt_cookies.txt ]; then
+              STATUS_RESP=$(curl -s -b /tmp/crt_cookies.txt -H "Content-Type: application/json" \
+                "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID/builds/$BUILD_ID" || echo '{}')
+            else
+              STATUS_RESP=$(curl -s -H "Authorization: Bearer $SESSION_TOKEN" -H "Content-Type: application/json" \
+                "$BASE/projects/$PROJECT_ID/jobs/$JOB_ID/builds/$BUILD_ID" || echo '{}')
+            fi
+
+            STATUS=$(echo "$STATUS_RESP" | jq -r '.status // "UNKNOWN"')
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS — Status: $STATUS"
+
+            case "$STATUS" in
+              PASSED|SUCCESS|COMPLETED)
+                FINAL_STATUS="PASSED"; break ;;
+              FAILED|ERROR|ABORTED)
+                FINAL_STATUS="FAILED ($STATUS)"; break ;;
+              RUNNING|PENDING|QUEUED|IN_PROGRESS)
+                echo "⏳ Still in progress..." ;;
+              *)
+                echo "⚠️  Unrecognised status: $STATUS" ;;
+            esac
+          done
+
+          echo "crt_status=$FINAL_STATUS" >> $GITHUB_OUTPUT
+          echo "Final CRT result: $FINAL_STATUS"
+
+      # ── STEP 4 ─ Print summary ─────────────────────────────────────────────
+      - name: Print Job Summary
+        if: always() && steps.pr_meta.outputs.has_pr == 'true'
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║        CRT Job Execution Summary         ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "  PR Number       : #${{ steps.pr_meta.outputs.pr_number }}"
+          echo "  Workflow Run #  : ${{ steps.pr_meta.outputs.run_number }}"
+          echo "  PR Raiser       : ${{ steps.pr_meta.outputs.pr_raiser }}"
+          echo "  PR Approver     : ${{ steps.pr_meta.outputs.pr_approver }}"
+          echo "  Test Job Name   : ${{ steps.crt.outputs.job_name }}"
+          echo "  Test Job ID     : ${{ steps.crt.outputs.job_id }}"
+          echo "  Build ID        : ${{ steps.crt.outputs.build_id }}"
+          echo "  Test Result     : ${{ steps.crt.outputs.crt_status }}"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""
