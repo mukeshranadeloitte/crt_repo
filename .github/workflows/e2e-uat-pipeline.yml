@@ -1368,15 +1368,29 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Build delta package from merged commit
+        id: delta_pkg
         run: |
           set -euo pipefail
-          if [[ -z "${DELTA_FROM_COMMIT:-}" ]]; then
-            echo "::error::Repository variable DELTA_FROM_COMMIT is missing or empty. Set it to the baseline commit SHA."
-            exit 1
+          # Use HEAD^1 (the UAT branch tip just before this PR merged) as the FROM reference.
+          # This mirrors exactly what validation used (github.event.pull_request.base.sha),
+          # ensuring the same components are deployed as were validated.
+          MERGE_BASE=$(git rev-parse HEAD^1 2>/dev/null || true)
+          if [[ -z "$MERGE_BASE" ]]; then
+            # Shallow clone fallback: use DELTA_FROM_COMMIT if git parent not available
+            if [[ -z "${DELTA_FROM_COMMIT:-}" ]]; then
+              echo "::error::Cannot determine delta base. Set repository variable DELTA_FROM_COMMIT to the baseline SHA."
+              exit 1
+            fi
+            MERGE_BASE="$DELTA_FROM_COMMIT"
+            echo "ℹ️  Using DELTA_FROM_COMMIT as fallback FROM: ${MERGE_BASE}"
+          else
+            echo "✅ Using merge parent (HEAD^1) as FROM: ${MERGE_BASE}"
           fi
+          echo "   TO: HEAD ($(git rev-parse HEAD))"
+          echo "merge_base=${MERGE_BASE}" >> "$GITHUB_OUTPUT"
           sf sgd:source:delta \
             --to "HEAD" \
-            --from "$DELTA_FROM_COMMIT" \
+            --from "$MERGE_BASE" \
             --output-dir "." \
             --source-dir force-app/
 
@@ -1708,6 +1722,7 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.review.pull_request_url }}
           MERGE_SHA: ${{ needs.approval-merge-gate.outputs.merge_commit_sha }}
+          DELTA_BASE: ${{ steps.delta_pkg.outputs.merge_base }}
         run: |
           set -euo pipefail
           DEPLOYED_COMMIT=$(git rev-parse HEAD)
@@ -1737,7 +1752,7 @@ jobs:
           elif [[ -d "force-app" ]]; then
             # Fallback: zip only the files changed in this PR's delta
             echo "No delta source dir found — zipping changed force-app files from git diff..."
-            CHANGED=$(git diff --name-only --diff-filter=ACM "${DELTA_FROM_COMMIT}...${DEPLOYED_COMMIT}" \
+            CHANGED=$(git diff --name-only --diff-filter=ACM "${DELTA_BASE:-${DELTA_FROM_COMMIT}}...${DEPLOYED_COMMIT}" \
               | grep '^force-app/' || true)
             if [[ -n "$CHANGED" ]]; then
               echo "$CHANGED" | zip "deployment-packages/${PKG_NAME}/components.zip" -@
@@ -1753,7 +1768,7 @@ jobs:
           {
             "pr_number":       "${PR_NUMBER:-unknown}",
             "deployed_commit": "${DEPLOYED_COMMIT}",
-            "delta_from":      "${DELTA_FROM_COMMIT}",
+            "delta_from":      "${DELTA_BASE:-${DELTA_FROM_COMMIT}}",
             "deployed_at":     "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
             "deployed_by":     "${{ github.actor }}",
             "org_alias":       "${ORG_ALIAS}",
