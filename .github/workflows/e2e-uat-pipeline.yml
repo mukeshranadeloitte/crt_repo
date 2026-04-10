@@ -653,16 +653,41 @@ jobs:
               "${API}?ref=${REF}"
           }
 
-          # Priority 1: main branch (canonical protected copy)
-          echo "Fetching ${WAIVER_PATH} from main branch..."
-          HTTP=$(fetch_from "main")
+          log_error() {
+            local REF="$1" HTTP="$2"
+            echo "  ${REF} returned HTTP ${HTTP}."
+            # Print GitHub's error message to help diagnose path/permission issues
+            python3 -c "
+          import json
+          try:
+              d = json.load(open('waiver-response.json'))
+              msg = d.get('message') or d.get('error') or ''
+              if msg:
+                  print(f'  GitHub says: {msg}')
+          except Exception:
+              pass
+          " 2>/dev/null || true
+          }
+
+          # Priority 1: default branch via repo API (handles renamed default branches)
+          echo "Detecting default branch..."
+          DEFAULT_BRANCH=$(curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin).get('default_branch','main'))" 2>/dev/null || echo "main")
+          echo "  Default branch: ${DEFAULT_BRANCH}"
+
+          # Priority 2: main branch (canonical protected copy)
+          echo "Fetching ${WAIVER_PATH} from ${DEFAULT_BRANCH} branch..."
+          HTTP=$(fetch_from "${DEFAULT_BRANCH}")
           if [[ "$HTTP" == "200" ]]; then
             decode_and_save
-            echo "waiver_source=main" >> "$GITHUB_OUTPUT"
-            echo "✅ Waiver file fetched from main branch."
+            echo "waiver_source=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+            echo "✅ Waiver file fetched from ${DEFAULT_BRANCH} branch."
             exit 0
           fi
-          echo "  main returned HTTP ${HTTP}."
+          log_error "${DEFAULT_BRANCH}" "${HTTP}"
 
           # Priority 2: PR base branch (e.g. uat — for first-time introduction of the file)
           BASE_REF="${{ github.base_ref }}"
@@ -675,7 +700,7 @@ jobs:
               echo "::warning::⚠️  Waivers fetched from base branch '${BASE_REF}' (not main). Merge the waiver file to main to enforce governance."
               exit 0
             fi
-            echo "  ${BASE_REF} returned HTTP ${HTTP}."
+            log_error "${BASE_REF}" "${HTTP}"
           fi
 
           # Priority 3: PR head branch (file being introduced for the first time)
@@ -690,7 +715,7 @@ jobs:
               echo "::warning::   Once this PR merges, merge the waiver file to main to prevent tampering."
               exit 0
             fi
-            echo "  ${HEAD_REF} returned HTTP ${HTTP}."
+            log_error "${HEAD_REF}" "${HTTP}"
           fi
 
           echo "::warning::Waiver file not found on main, ${BASE_REF}, or ${HEAD_REF} — continuing without waiver check."
