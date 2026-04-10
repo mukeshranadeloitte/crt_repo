@@ -24,5 +24,5 @@ rule,file_pattern,message_contains,severity_threshold,expiry,reason,approved_by,
 #   6. Once fixed, update status to REVOKED (do NOT delete - preserves audit trail),,,,,,,,
 #   7. Critical violations (severity 1–2) require Security/DevOps approval; max 7-day waiver,,,,,,,,,
 # --------------------------------------------------------------------------------------------------------------,,,,,,,,,
-ApexDoc,CoverageDemoService.cls,,3,11-04-2026,Missing ApexDoc on public methods - comments will be added by April 9 2026. Tracked in PROJ-001.,mukeshranadeloitte,10-03-2026,PROJ-001,ACTIVE
+ApexDoc,CoverageDemoService.cls,,3,11-04-2026,Missing ApexDoc on public methods - comments will be added by April 11 2026. Tracked in PROJ-001.,mukeshranadeloitte,10-03-2026,PROJ-001,ACTIVE
 ApexDoc,DeploySmokeCheck.cls,,3,07-04-2026,Missing ApexDoc on public methods - comments will be added by April 7 2026. Tracked in PROJ-002.,mukeshranadeloitte,07-03-2026,PROJ-002,ACTIVE
