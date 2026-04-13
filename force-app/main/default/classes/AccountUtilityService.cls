@@ -13,6 +13,7 @@ public with sharing class AccountUtilityService {
         ];
     }
 
+    
     public static Integer updateAccountDescriptions(Set<Id> accountIds, String appendText) {
         if (accountIds == null || accountIds.isEmpty() || String.isBlank(appendText)) {
             return 0;

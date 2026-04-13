@@ -17,3 +17,4 @@ private class SmokeTestPingResourceTest {
         System.assert(out.timestampUtc != null && out.timestampUtc.contains('T'));
     }
 }
+

@@ -23,6 +23,8 @@ private class DeploySmokeCheckTest {
     }
 
     
+
+    
     @IsTest
     static void run_customMessage_trim_and_truncate() {
         String longMsg = '   ' + String.valueOf('X').repeat(200) + '   ';

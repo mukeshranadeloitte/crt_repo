@@ -2185,29 +2185,96 @@ jobs:
             echo "::error::Missing required secret: CRT_API_TOKEN"
             exit 1
           fi
-          echo "Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})"
+
+          # ── Trigger the build ────────────────────────────────────────────────
+          echo "🚀 Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})..."
           RESPONSE=$(curl -s \
             --header "X-Authorization: ${CRT_API_TOKEN}" \
             --header "Content-Type: application/json" \
             --json "{\"query\":\"mutation { createBuild(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { message data { id buildNumber status startTime } } }\"}" \
             https://graphql.eu-robotic.copado.com/v1)
-          echo "Response: ${RESPONSE}"
+
           if echo "${RESPONSE}" | grep -q '"errors"'; then
             ERR_MSG=$(echo "${RESPONSE}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['errors'][0].get('message','unknown'))" 2>/dev/null || echo "unknown")
             echo "::error::Failed to trigger CRT job: ${ERR_MSG}"
-            echo "build_id=n/a"    >> "$GITHUB_OUTPUT"
-            echo "crt_status=FAILED" >> "$GITHUB_OUTPUT"
+            echo "build_id=n/a"       >> "$GITHUB_OUTPUT"
+            echo "crt_status=FAILED"  >> "$GITHUB_OUTPUT"
             exit 1
           fi
+
           BUILD_ID=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['id'])")
-          STATUS=$(echo "${RESPONSE}"   | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['status'])")
           BUILD_NO=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data'].get('buildNumber','n/a'))")
-          echo "✅ CRT job triggered successfully"
-          echo "   Build ID:     ${BUILD_ID}"
-          echo "   Build Number: ${BUILD_NO}"
-          echo "   Status:       ${STATUS}"
-          echo "build_id=${BUILD_ID}"   >> "$GITHUB_OUTPUT"
-          echo "crt_status=${STATUS}"   >> "$GITHUB_OUTPUT"
+          INIT_STATUS=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['status'])")
+
+          echo "✅ CRT build triggered — ID: ${BUILD_ID}  Build#: ${BUILD_NO}"
+          echo ""
+          echo "  Elapsed │ Status"
+          echo "──────────┼──────────────────────"
+
+          # ── Poll until terminal status ────────────────────────────────────────
+          # CRT terminal statuses: Passed, Failed, Error, Cancelled, Skipped
+          TERMINAL="Passed Failed Error Cancelled Skipped"
+          ELAPSED=0
+          POLL_INTERVAL=30
+          MAX_WAIT=3600
+          FINAL_STATUS="${INIT_STATUS}"
+          PREV_STATUS=""
+
+          while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+            # Only print if status changed or on first iteration
+            if [[ "${FINAL_STATUS}" != "${PREV_STATUS}" ]]; then
+              printf "  %6ds │ %s\n" "${ELAPSED}" "${FINAL_STATUS}"
+              PREV_STATUS="${FINAL_STATUS}"
+            fi
+
+            # Check terminal
+            for T in $TERMINAL; do
+              if [[ "${FINAL_STATUS}" == "${T}" ]]; then
+                echo "──────────┴──────────────────────"
+                break 2
+              fi
+            done
+
+            sleep ${POLL_INTERVAL}
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+
+            # Poll latest status via latestBuilds query
+            POLL_RESPONSE=$(curl -s \
+              --header "X-Authorization: ${CRT_API_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --json "{\"query\":\"{ latestBuilds(projectId: ${CRT_PROJECT_ID}, resultSize: 20) { data { id status buildNumber startTime endTime } } }\"}" \
+              https://graphql.eu-robotic.copado.com/v1)
+
+            FINAL_STATUS=$(echo "${POLL_RESPONSE}" | python3 -c "
+          import sys, json
+          try:
+              builds = json.load(sys.stdin).get('data',{}).get('latestBuilds',{}).get('data',[])
+              build  = next((b for b in builds if str(b.get('id','')) == '${BUILD_ID}'), None)
+              print(build['status'] if build else 'Unknown')
+          except Exception as e:
+              print('PollError')
+          " 2>/dev/null || echo "PollError")
+          done
+
+          if [[ $ELAPSED -ge $MAX_WAIT ]]; then
+            echo "::warning::CRT polling timed out after ${MAX_WAIT}s — last status: ${FINAL_STATUS}"
+            FINAL_STATUS="Timeout"
+          fi
+
+          echo ""
+          if [[ "${FINAL_STATUS}" == "Passed" ]]; then
+            echo "✅ CRT tests PASSED (Build ID: ${BUILD_ID})"
+          else
+            echo "❌ CRT tests ${FINAL_STATUS} (Build ID: ${BUILD_ID})"
+          fi
+
+          echo "build_id=${BUILD_ID}"           >> "$GITHUB_OUTPUT"
+          echo "crt_status=${FINAL_STATUS}"      >> "$GITHUB_OUTPUT"
+
+          # Fail the job if CRT did not pass
+          if [[ "${FINAL_STATUS}" != "Passed" && "${FINAL_STATUS}" != "Timeout" ]]; then
+            exit 1
+          fi
 
       - name: Collect PR metadata
         id: pr_meta
@@ -2280,12 +2347,25 @@ jobs:
           CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
           CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
           CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
+          BUILD_ID:       ${{ steps.crt.outputs.build_id }}
+          CRT_STATUS:     ${{ steps.crt.outputs.crt_status }}
         run: |
+          STATUS_ICON="❓"
+          case "${CRT_STATUS}" in
+            Passed)    STATUS_ICON="✅" ;;
+            Failed)    STATUS_ICON="❌" ;;
+            Error)     STATUS_ICON="🔴" ;;
+            Cancelled) STATUS_ICON="⛔" ;;
+            Timeout)   STATUS_ICON="⏱️" ;;
+            *)         STATUS_ICON="⏳" ;;
+          esac
           {
             echo "## 🧪 CRT Test Execution Summary"
             echo ""
             echo "| Detail | Value |"
             echo "|--------|-------|"
+            echo "| **Status** | ${STATUS_ICON} ${CRT_STATUS} |"
+            echo "| **Build ID** | ${BUILD_ID} |"
             echo "| **Instance** | https://eu-robotic.copado.com |"
             echo "| **Org ID** | ${CRT_ORG_ID} |"
             echo "| **Project ID** | ${CRT_PROJECT_ID} |"
