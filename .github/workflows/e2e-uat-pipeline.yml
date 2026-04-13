@@ -2165,6 +2165,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Trigger CRT Test Execution
+        id: crt
         env:
           CRT_API_TOKEN:  ${{ secrets.CRT_API_TOKEN }}
           CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
@@ -2186,6 +2187,8 @@ jobs:
           if echo "${RESPONSE}" | grep -q '"errors"'; then
             ERR_MSG=$(echo "${RESPONSE}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['errors'][0].get('message','unknown'))" 2>/dev/null || echo "unknown")
             echo "::error::Failed to trigger CRT job: ${ERR_MSG}"
+            echo "build_id=n/a"    >> "$GITHUB_OUTPUT"
+            echo "crt_status=FAILED" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           BUILD_ID=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['id'])")
@@ -2195,6 +2198,64 @@ jobs:
           echo "   Build ID:     ${BUILD_ID}"
           echo "   Build Number: ${BUILD_NO}"
           echo "   Status:       ${STATUS}"
+          echo "build_id=${BUILD_ID}"   >> "$GITHUB_OUTPUT"
+          echo "crt_status=${STATUS}"   >> "$GITHUB_OUTPUT"
+
+      - name: Collect PR metadata
+        id: pr_meta
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ github.event.review.pull_request_url }}"
+          PR_NUMBER=$(echo "$PR_NUMBER" | grep -oE '[0-9]+$' || echo "${{ github.event.pull_request.number }}")
+
+          if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "0" ]]; then
+            echo "has_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PR_DATA=$(curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+
+          PR_RAISER=$(echo "$PR_DATA"  | python3 -c "import json,sys; print(json.load(sys.stdin).get('user',{}).get('login','n/a'))" 2>/dev/null || echo "n/a")
+
+          # Get last approver from reviews
+          PR_APPROVER=$(curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+            | python3 -c "
+          import json,sys
+          reviews = json.load(sys.stdin)
+          approved = [r['user']['login'] for r in reviews if r.get('state') == 'APPROVED']
+          print(approved[-1] if approved else 'n/a')
+          " 2>/dev/null || echo "n/a")
+
+          echo "has_pr=true"               >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}"     >> "$GITHUB_OUTPUT"
+          echo "pr_raiser=${PR_RAISER}"     >> "$GITHUB_OUTPUT"
+          echo "pr_approver=${PR_APPROVER}" >> "$GITHUB_OUTPUT"
+          echo "run_number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+      - name: Print Job Summary
+        if: always() && steps.pr_meta.outputs.has_pr == 'true'
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║        CRT Job Execution Summary         ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "  PR Number       : #${{ steps.pr_meta.outputs.pr_number }}"
+          echo "  Workflow Run #  : ${{ steps.pr_meta.outputs.run_number }}"
+          echo "  PR Raiser       : ${{ steps.pr_meta.outputs.pr_raiser }}"
+          echo "  PR Approver     : ${{ steps.pr_meta.outputs.pr_approver }}"
+          echo "  Test Build ID   : ${{ steps.crt.outputs.build_id }}"
+          echo "  Test Result     : ${{ steps.crt.outputs.crt_status }}"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""
+
       - name: Post CRT deployment comment
         uses: actions/github-script@v7
         with:
