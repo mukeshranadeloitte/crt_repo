@@ -35,7 +35,7 @@ on:
     paths:
       - force-app/**
       - .github/workflows/e2e-uat-pipeline.yml
-      - .github/sf-scanner-waivers.json
+      - .github/sf-scanner-waivers.csv
 
   pull_request_review:
     types:
@@ -607,6 +607,138 @@ jobs:
         if: steps.delta.outputs.has_delta == 'true'
         run: echo y | sf plugins install @salesforce/sfdx-scanner || npm install -g @salesforce/sfdx-scanner
 
+      - name: Detect waiver file tampering
+        if: steps.delta.outputs.has_delta == 'true'
+        run: |
+          set -euo pipefail
+          # Warn if developer modified the waiver CSV in their PR branch.
+          # The pipeline always fetches waivers from main — local changes are ignored.
+          MODIFIED=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+            | grep -c 'sf-scanner-waivers.csv' || true)
+          if [[ "${MODIFIED}" -gt "0" ]]; then
+            echo "::warning::⚠️  .github/sf-scanner-waivers.csv was modified in this PR."
+            echo "::warning::   This change is IGNORED — waivers are always read from the main branch."
+            echo "::warning::   Only DevOps/Tech Lead can update waivers by merging into main."
+          fi
+
+      - name: Fetch SCA waivers from main branch
+        id: fetch-waivers
+        if: steps.delta.outputs.has_delta == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          WAIVER_PATH=".github/sf-scanner-waivers.csv"
+          REPO="${{ github.repository }}"
+          API="https://api.github.com/repos/${REPO}/contents/${WAIVER_PATH}"
+
+          decode_and_save() {
+            python3 -c "
+          import json, base64
+          with open('waiver-response.json') as f:
+              data = json.load(f)
+          content = base64.b64decode(data['content']).decode('utf-8')
+          with open('fetched-waivers.csv', 'w') as out:
+              out.write(content)
+          rows = [l for l in content.splitlines() if l and not l.startswith('#')]
+          print(f'Waivers loaded: {max(0,len(rows)-1)} entries (excl. header/comments)')
+          "
+          }
+
+          fetch_from() {
+            local REF="$1"
+            curl -sSL -w "%{http_code}" -o waiver-response.json \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${API}?ref=${REF}"
+          }
+
+          log_error() {
+            local REF="$1" HTTP="$2"
+            echo "  ${REF} returned HTTP ${HTTP}."
+            # Print GitHub's error message to help diagnose path/permission issues
+            python3 -c "
+          import json
+          try:
+              d = json.load(open('waiver-response.json'))
+              msg = d.get('message') or d.get('error') or ''
+              if msg:
+                  print(f'  GitHub says: {msg}')
+          except Exception:
+              pass
+          " 2>/dev/null || true
+          }
+
+          # Priority 1: default branch via repo API (handles renamed default branches)
+          echo "Detecting default branch..."
+          DEFAULT_BRANCH=$(curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin).get('default_branch','main'))" 2>/dev/null || echo "main")
+          echo "  Default branch: ${DEFAULT_BRANCH}"
+
+          # Priority 2: main branch (canonical protected copy)
+          echo "Fetching ${WAIVER_PATH} from ${DEFAULT_BRANCH} branch..."
+          HTTP=$(fetch_from "${DEFAULT_BRANCH}")
+          if [[ "$HTTP" == "200" ]]; then
+            decode_and_save
+            echo "waiver_source=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+            echo "✅ Waiver file fetched from ${DEFAULT_BRANCH} branch."
+            exit 0
+          fi
+          log_error "${DEFAULT_BRANCH}" "${HTTP}"
+
+          # Diagnose: list .github/ folder contents on default branch to spot path/name issues
+          echo "  Listing .github/ on ${DEFAULT_BRANCH} to verify file path..."
+          curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/contents/.github?ref=${DEFAULT_BRANCH}" \
+            | python3 -c "
+          import json,sys
+          try:
+              items = json.load(sys.stdin)
+              if isinstance(items, list):
+                  print('  .github/ contents on ${DEFAULT_BRANCH}:')
+                  for i in items: print(f'    {i[\"type\"]:4s}  {i[\"name\"]}')
+              else:
+                  print(f'  Unexpected response: {items.get(\"message\",items)}')
+          except Exception as e:
+              print(f'  Could not parse listing: {e}')
+          " 2>/dev/null || echo "  Could not list .github/ folder."
+          BASE_REF="${{ github.base_ref }}"
+          if [[ -n "$BASE_REF" && "$BASE_REF" != "main" ]]; then
+            echo "Trying base branch (${BASE_REF})..."
+            HTTP=$(fetch_from "$BASE_REF")
+            if [[ "$HTTP" == "200" ]]; then
+              decode_and_save
+              echo "waiver_source=${BASE_REF}" >> "$GITHUB_OUTPUT"
+              echo "::warning::⚠️  Waivers fetched from base branch '${BASE_REF}' (not main). Merge the waiver file to main to enforce governance."
+              exit 0
+            fi
+            log_error "${BASE_REF}" "${HTTP}"
+          fi
+
+          # Priority 3: PR head branch (file being introduced for the first time)
+          HEAD_REF="${{ github.head_ref }}"
+          if [[ -n "$HEAD_REF" ]]; then
+            echo "Trying PR head branch (${HEAD_REF})..."
+            HTTP=$(fetch_from "$HEAD_REF")
+            if [[ "$HTTP" == "200" ]]; then
+              decode_and_save
+              echo "waiver_source=${HEAD_REF}(PR branch)" >> "$GITHUB_OUTPUT"
+              echo "::warning::⚠️  Waivers fetched from PR head branch '${HEAD_REF}'."
+              echo "::warning::   Once this PR merges, merge the waiver file to main to prevent tampering."
+              exit 0
+            fi
+            log_error "${HEAD_REF}" "${HTTP}"
+          fi
+
+          echo "::warning::Waiver file not found on main, ${BASE_REF}, or ${HEAD_REF} — continuing without waiver check."
+          echo "" > fetched-waivers.csv
+          echo "waiver_source=unavailable" >> "$GITHUB_OUTPUT"
+
       - name: Detect changed Salesforce files for SCA
         id: sca-targets
         run: |
@@ -655,95 +787,242 @@ jobs:
             --severity-threshold 3
 
       - name: Check scanner results against waivers
+        id: waiver-check
         if: steps.sca-targets.outputs.has_targets == 'true'
-        continue-on-error: true
         run: |
           set -euo pipefail
-          WAIVER_FILE=".github/sf-scanner-waivers.json"
           REPORT_FILE="sfdx-report.csv"
-          RESULTS_CSV="sfdx-waiver-results.csv"
+          FETCHED_WAIVERS="fetched-waivers.csv"
+          RESULTS_CSV="sca-governance-report.csv"
 
           if [[ ! -f "$REPORT_FILE" ]]; then
             echo "No scanner report found — skipping waiver check."
+            echo "expired_count=0" >> "$GITHUB_OUTPUT"
+            echo "violation_count=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           python3 - <<'PYEOF'
-          import json, csv, sys
-          from datetime import date
+          import csv, sys, os
+          from datetime import date, timedelta
 
-          TODAY = date.today()
-          WAIVER_FILE = ".github/sf-scanner-waivers.json"
-          REPORT_FILE = "sfdx-report.csv"
-          RESULTS_CSV = "sfdx-waiver-results.csv"
+          TODAY          = date.today()
+          WARN_DAYS      = 30          # Warn when waiver expires within this many days
+          FETCHED_CSV    = "fetched-waivers.csv"
+          REPORT_FILE    = "sfdx-report.csv"
+          RESULTS_CSV    = "sca-governance-report.csv"
+          COMMENT_MD     = "sca-pr-comment.md"
 
-          # Load waivers, skipping comment/instruction objects (no 'rule' key)
-          with open(WAIVER_FILE) as f:
-              waivers = [w for w in json.load(f) if "rule" in w]
+          def parse_date(val):
+              """Parse DD-MM-YYYY (primary), YYYY-MM-DD, DD/MM/YYYY date strings."""
+              val = val.strip()
+              from datetime import datetime
+              for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y"):
+                  try:
+                      return datetime.strptime(val, fmt).date()
+                  except ValueError:
+                      continue
+              raise ValueError(f"Unrecognised date format '{val}'. Accepted: DD-MM-YYYY or YYYY-MM-DD.")
 
-          results = []
-          waived_count = 0
+          # ── Load waivers from main branch CSV ────────────────────────────────
+          waivers = []
+          if os.path.exists(FETCHED_CSV) and os.path.getsize(FETCHED_CSV) > 0:
+              with open(FETCHED_CSV, newline="", encoding="utf-8") as f:
+                  for row in csv.DictReader(f):
+                      # Skip REVOKED rows and comment rows
+                      if row.get("status", "").strip().upper() == "REVOKED":
+                          continue
+                      if row.get("rule", "").strip().startswith("#"):
+                          continue
+                      waivers.append(row)
+
+          print(f"Loaded {len(waivers)} active waiver(s) from main branch.")
+          print(f"Waiver source: main branch (.github/sf-scanner-waivers.csv)")
+
+          # Print loaded waivers for visibility
+          for i, w in enumerate(waivers):
+              print(f"  Waiver[{i}]: rule='{w.get('rule','')}' file_pattern='{w.get('file_pattern','')}' expiry='{w.get('expiry','')}' status='{w.get('status','')}'")
+          print()
+
+          # ── Process scanner violations ────────────────────────────────────────
+          results         = []
+          waived_count    = 0
+          near_expiry     = 0
+          expired_count   = 0
           violation_count = 0
-          expired_count = 0
 
           with open(REPORT_FILE, newline="", encoding="utf-8") as f:
-              reader = csv.DictReader(f)
-              for row in reader:
-                  rule      = row.get("Rule",        row.get("rule", "")).strip()
-                  file_path = row.get("File",        row.get("file", "")).strip()
-                  severity  = row.get("Severity",    row.get("severity", "")).strip()
-                  problem   = row.get("Problem",     row.get("Description", "")).strip()
-                  line      = row.get("Line",        row.get("line", "")).strip()
+              for row in csv.DictReader(f):
+                  rule      = row.get("Rule",     row.get("rule", "")).strip()
+                  file_path = row.get("File",     row.get("file", "")).strip()
+                  severity  = row.get("Severity", row.get("severity", "")).strip()
+                  problem   = row.get("Problem",  row.get("Description", row.get("problem", ""))).strip()
+                  line      = row.get("Line",     row.get("line", "")).strip()
 
-                  matched_waiver = None
+                  print(f"  Checking violation: rule='{rule}' file='{os.path.basename(file_path)}'")
+
+                  # Match against waivers: rule substring + file_pattern substring + optional message
+                  matched = None
                   for w in waivers:
-                      if w["rule"] in rule and w["file"] in file_path:
-                          matched_waiver = w
+                      w_rule = w.get("rule", "").strip()
+                      w_file = w.get("file_pattern", "").strip()
+                      w_msg  = w.get("message_contains", "").strip()
+                      rule_match = w_rule and w_rule in rule
+                      file_match = w_file and w_file in file_path
+                      msg_match  = (not w_msg) or (w_msg.lower() in problem.lower())
+                      print(f"    vs waiver rule='{w_rule}' file_pattern='{w_file}' → rule_match={rule_match} file_match={file_match} msg_match={msg_match}")
+                      if rule_match and file_match and msg_match:
+                          matched = w
                           break
 
-                  if matched_waiver:
-                      expiry = date.fromisoformat(matched_waiver["expiry"])
+                  if matched:
+                      expiry    = parse_date(matched["expiry"])
+                      days_left = (expiry - TODAY).days
+
                       if TODAY <= expiry:
-                          status = "WAIVED"
-                          waived_count += 1
-                          print(f"WAIVED:   [{rule}] {file_path}:{line} — expires {matched_waiver['expiry']} (approved_by: {matched_waiver.get('approved_by','n/a')})")
+                          if days_left <= WARN_DAYS:
+                              status = "WAIVED_EXPIRING_SOON"
+                              near_expiry += 1
+                              print(f"::warning::⏰ WAIVER EXPIRING IN {days_left}d: [{rule}] {os.path.basename(file_path)}:{line} — expires {matched['expiry']} (ticket: {matched.get('ticket','n/a')})")
+                          else:
+                              status = "WAIVED"
+                              waived_count += 1
+                              print(f"✅ WAIVED: [{rule}] {os.path.basename(file_path)}:{line} — expires {matched['expiry']} | approved_by: {matched.get('approved_by','n/a')} | ticket: {matched.get('ticket','n/a')}")
                       else:
                           status = "EXPIRED_WAIVER"
                           expired_count += 1
-                          print(f"::warning::EXPIRED WAIVER ({matched_waiver['expiry']}): [{rule}] {file_path}:{line} — {problem}")
+                          print(f"::error::❌ EXPIRED WAIVER ({matched['expiry']}): [{rule}] {os.path.basename(file_path)}:{line}")
+                          print(f"::error::   Problem: {problem}")
+                          print(f"::error::   Ticket: {matched.get('ticket','n/a')} | Approved by: {matched.get('approved_by','n/a')}")
+                          print(f"::error::   ACTION REQUIRED: Fix the violation OR renew waiver in main branch.")
                   else:
                       status = "VIOLATION"
                       violation_count += 1
-                      print(f"::warning::VIOLATION: [{severity}] [{rule}] {file_path}:{line} — {problem}")
+                      suggested_expiry = (TODAY + timedelta(days=30)).isoformat()
+                      fname = os.path.basename(file_path)
+                      suggested_row = f"{rule},{fname},,{severity or '3'},{suggested_expiry},<reason>,<approved_by>,{TODAY.isoformat()},<JIRA-000>,ACTIVE"
+                      print(f"::warning::⚠️  VIOLATION: [{severity}] [{rule}] {os.path.basename(file_path)}:{line} — {problem}")
+                      print(f"::warning::   To waive: add this row to .github/sf-scanner-waivers.csv on main:")
+                      print(f"::warning::   {suggested_row}")
 
                   results.append({
-                      "Status":      status,
-                      "Rule":        rule,
-                      "File":        file_path,
-                      "Line":        line,
-                      "Severity":    severity,
-                      "Description": problem,
-                      "Expiry":      matched_waiver["expiry"] if matched_waiver else "",
-                      "Reason":      matched_waiver.get("reason", "") if matched_waiver else "",
-                      "Approved_By": matched_waiver.get("approved_by", "") if matched_waiver else "",
-                      "Ticket":      matched_waiver.get("ticket", "") if matched_waiver else "",
+                      "Status":        status,
+                      "Rule":          rule,
+                      "File":          file_path,
+                      "Line":          line,
+                      "Severity":      severity,
+                      "Description":   problem,
+                      "Expiry":        matched["expiry"] if matched else "",
+                      "Days_Left":     str((parse_date(matched["expiry"]) - TODAY).days) if matched else "",
+                      "Reason":        matched.get("reason", "") if matched else "",
+                      "Approved_By":   matched.get("approved_by", "") if matched else "",
+                      "Approved_Date": matched.get("approved_date", "") if matched else "",
+                      "Ticket":        matched.get("ticket", "") if matched else "",
                   })
 
-          # Write waiver results CSV
+          # ── Write governance report ───────────────────────────────────────────
+          fieldnames = ["Status","Rule","File","Line","Severity","Description",
+                        "Expiry","Days_Left","Reason","Approved_By","Approved_Date","Ticket"]
           with open(RESULTS_CSV, "w", newline="", encoding="utf-8") as f:
-              writer = csv.DictWriter(f, fieldnames=["Status","Rule","File","Line","Severity","Description","Expiry","Reason","Approved_By","Ticket"])
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
               writer.writeheader()
               writer.writerows(results)
 
+          # ── Write PR comment markdown ─────────────────────────────────────────
+          status_icon = {"WAIVED":"✅","WAIVED_EXPIRING_SOON":"⏰","EXPIRED_WAIVER":"❌","VIOLATION":"⚠️"}
+          with open(COMMENT_MD, "w", encoding="utf-8") as md:
+              md.write("## 🔍 Salesforce Code Analyzer — Governance Report\n\n")
+              md.write(f"| | Count |\n|---|---|\n")
+              md.write(f"| ✅ Waived (active) | {waived_count} |\n")
+              md.write(f"| ⏰ Expiring ≤30 days | {near_expiry} |\n")
+              md.write(f"| ❌ Expired waivers | {expired_count} |\n")
+              md.write(f"| ⚠️ Unwaived violations | {violation_count} |\n\n")
+              if results:
+                  md.write("| Status | Rule | File | Line | Severity | Expiry | Ticket |\n")
+                  md.write("|--------|------|------|------|----------|--------|--------|\n")
+                  for r in results:
+                      icon = status_icon.get(r["Status"], "❓")
+                      fname = os.path.basename(r["File"])
+                      md.write(f"| {icon} {r['Status']} | {r['Rule']} | `{fname}` | {r['Line']} | {r['Severity']} | {r['Expiry']} | {r['Ticket']} |\n")
+                  md.write("\n")
+              if expired_count > 0:
+                  md.write(f"> ❌ **Pipeline will FAIL**: {expired_count} expired waiver(s). Fix the violation(s) or renew waivers in `main` branch.\n\n")
+              if violation_count > 0:
+                  md.write(f"> ⚠️ **{violation_count} unwaived violation(s)** — ask DevOps/Tech Lead to add waivers to `.github/sf-scanner-waivers.csv` on `main`.\n\n")
+              md.write(f"> 📋 Waiver source: `main` branch — only DevOps/Tech Lead can update waivers.\n")
+
+          # ── Summary ───────────────────────────────────────────────────────────
           total = len(results)
-          print(f"\n{'─'*60}")
-          print(f"SF Scanner Waiver Summary: {total} finding(s)")
-          print(f"  ✅ Waived (active):   {waived_count}")
-          print(f"  ⚠️  Expired waivers:  {expired_count}")
-          print(f"  ⚠️  Violations:       {violation_count}")
-          print(f"{'─'*60}")
-          print(f"Full results written to: {RESULTS_CSV}")
+          print(f"\n{'═'*65}")
+          print(f"  SF Code Analyzer Governance Report")
+          print(f"  Waiver source: main branch (.github/sf-scanner-waivers.csv)")
+          print(f"{'═'*65}")
+          print(f"  Total findings:              {total}")
+          print(f"  ✅ Waived (active):          {waived_count}")
+          print(f"  ⏰ Expiring ≤30 days:        {near_expiry}")
+          print(f"  ❌ Expired waivers (FAIL):   {expired_count}")
+          print(f"  ⚠️  Unwaived violations:      {violation_count}")
+          print(f"{'═'*65}")
+          print(f"Full report: {RESULTS_CSV}")
+
+          # ── Write output for downstream steps ────────────────────────────────
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"expired_count={expired_count}\n")
+              out.write(f"violation_count={violation_count}\n")
+              out.write(f"near_expiry_count={near_expiry}\n")
+
+          # Fail the step if any waiver has expired
+          if expired_count > 0:
+              print(f"\n❌ PIPELINE FAILED: {expired_count} expired waiver(s).")
+              print("   Fix violation(s) OR renew waivers in main branch (.github/sf-scanner-waivers.csv).")
+              sys.exit(1)
+
+          print("\n✅ All active waivers valid. No expired waivers.")
           PYEOF
+
+      - name: Post SCA governance report as PR comment
+        if: always() && steps.sca-targets.outputs.has_targets == 'true' && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [[ ! -f "sca-pr-comment.md" ]]; then
+            echo "No PR comment file — skipping."
+            exit 0
+          fi
+          BODY=$(cat sca-pr-comment.md)
+          # Delete previous SCA comment (if any) to avoid duplicate comments
+          EXISTING=$(curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            | python3 -c "
+          import json,sys
+          comments = json.load(sys.stdin)
+          for c in comments:
+              if '🔍 Salesforce Code Analyzer' in c.get('body',''):
+                  print(c['id'])
+                  break
+          " || true)
+          if [[ -n "$EXISTING" ]]; then
+            curl -sSL -X DELETE \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/comments/${EXISTING}" || true
+          fi
+          # Post new comment
+          python3 -c "
+          import json, sys
+          body = open('sca-pr-comment.md').read()
+          print(json.dumps({'body': body}))
+          " | curl -sSL -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d @- \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" > /dev/null
+          echo "✅ PR comment posted."
 
       - name: Upload scanner reports
         if: always()
@@ -753,7 +1032,9 @@ jobs:
           name: sfdx-scanner-reports
           path: |
             sfdx-report.csv
-            sfdx-waiver-results.csv
+            sca-governance-report.csv
+            fetched-waivers.csv
+            sca-pr-comment.md
           if-no-files-found: warn
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -1892,6 +2173,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Trigger CRT Test Execution
+        id: crt
         env:
           CRT_API_TOKEN:  ${{ secrets.CRT_API_TOKEN }}
           CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
@@ -1913,6 +2195,8 @@ jobs:
           if echo "${RESPONSE}" | grep -q '"errors"'; then
             ERR_MSG=$(echo "${RESPONSE}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['errors'][0].get('message','unknown'))" 2>/dev/null || echo "unknown")
             echo "::error::Failed to trigger CRT job: ${ERR_MSG}"
+            echo "build_id=n/a"    >> "$GITHUB_OUTPUT"
+            echo "crt_status=FAILED" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           BUILD_ID=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['id'])")
@@ -1922,6 +2206,64 @@ jobs:
           echo "   Build ID:     ${BUILD_ID}"
           echo "   Build Number: ${BUILD_NO}"
           echo "   Status:       ${STATUS}"
+          echo "build_id=${BUILD_ID}"   >> "$GITHUB_OUTPUT"
+          echo "crt_status=${STATUS}"   >> "$GITHUB_OUTPUT"
+
+      - name: Collect PR metadata
+        id: pr_meta
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ github.event.review.pull_request_url }}"
+          PR_NUMBER=$(echo "$PR_NUMBER" | grep -oE '[0-9]+$' || echo "${{ github.event.pull_request.number }}")
+
+          if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "0" ]]; then
+            echo "has_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PR_DATA=$(curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+
+          PR_RAISER=$(echo "$PR_DATA"  | python3 -c "import json,sys; print(json.load(sys.stdin).get('user',{}).get('login','n/a'))" 2>/dev/null || echo "n/a")
+
+          # Get last approver from reviews
+          PR_APPROVER=$(curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+            | python3 -c "
+          import json,sys
+          reviews = json.load(sys.stdin)
+          approved = [r['user']['login'] for r in reviews if r.get('state') == 'APPROVED']
+          print(approved[-1] if approved else 'n/a')
+          " 2>/dev/null || echo "n/a")
+
+          echo "has_pr=true"               >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}"     >> "$GITHUB_OUTPUT"
+          echo "pr_raiser=${PR_RAISER}"     >> "$GITHUB_OUTPUT"
+          echo "pr_approver=${PR_APPROVER}" >> "$GITHUB_OUTPUT"
+          echo "run_number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+      - name: Print Job Summary
+        if: always() && steps.pr_meta.outputs.has_pr == 'true'
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║        CRT Job Execution Summary         ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "  PR Number       : #${{ steps.pr_meta.outputs.pr_number }}"
+          echo "  Workflow Run #  : ${{ steps.pr_meta.outputs.run_number }}"
+          echo "  PR Raiser       : ${{ steps.pr_meta.outputs.pr_raiser }}"
+          echo "  PR Approver     : ${{ steps.pr_meta.outputs.pr_approver }}"
+          echo "  Test Build ID   : ${{ steps.crt.outputs.build_id }}"
+          echo "  Test Result     : ${{ steps.crt.outputs.crt_status }}"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""
+
       - name: Post CRT deployment comment
         uses: actions/github-script@v7
         with:

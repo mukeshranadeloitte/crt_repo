@@ -1,125 +1,107 @@
 # SCA & Code Quality Violation Waivers
 
 The pipeline supports time-boxed suppression of two categories of violations:
-1. **npm dependency vulnerabilities** — managed via `.github/sca-waivers.json`
-2. **Salesforce Code Analyzer rule violations** — managed via `.github/sf-scanner-waivers.json`
+1. **Salesforce Code Analyzer rule violations** — managed via `.github/sf-scanner-waivers.csv` (main branch only)
+2. **npm dependency vulnerabilities** — managed via `.github/sca-waivers.json`
 
-Both files are committed to the repository and version-controlled. All waiver changes are visible in the PR diff and require peer review.
+> ⚠️ **SF Code Analyzer waivers are in the `main` branch and protected.** The pipeline always fetches waivers from `main` via GitHub API — local copies in PR branches are ignored. Developers cannot approve their own waivers.
 
 ---
 
 ## Part 1 — Salesforce Code Analyzer Waivers
 
-**File:** `.github/sf-scanner-waivers.json`
+**File:** `.github/sf-scanner-waivers.csv` — **main branch only**
 
 ### How It Works
 
 During the `Salesforce PR Validation` job:
 
-1. `sf scanner run` produces `sfdx-report.csv` with all violations at severity ≥ 3
-2. Each violation is checked against the waiver file:
-   - **Active waiver** (`expiry` ≥ today) → logged as `WAIVED ✅`, job **continues**
-   - **Expired waiver** (`expiry` < today) → logged as `EXPIRED_WAIVER ⚠️`, written to results CSV, job **continues** (`continue-on-error: true`)
-   - **No waiver** → logged as `VIOLATION ⚠️`, written to results CSV, job **continues**
-3. Both `sfdx-report.csv` (raw scanner output) and `sfdx-waiver-results.csv` (annotated results) are uploaded as the `sfdx-scanner-reports` artifact
+1. `sf scanner run` produces `sfdx-report.csv` with violations at severity ≥ 3 (changed files only)
+2. Pipeline fetches `.github/sf-scanner-waivers.csv` from **main branch** via GitHub API
+3. Each violation is checked against fetched waivers:
+   - **Active waiver** (`expiry` ≥ today, `status=ACTIVE`) → `WAIVED ✅`, job continues
+   - **Expiring soon** (active, ≤30 days to expiry) → `WAIVED_EXPIRING_SOON ⏰`, warning posted
+   - **Expired waiver** (`expiry` < today) → `EXPIRED_WAIVER ❌`, **job FAILS**
+   - **No waiver** → `VIOLATION ⚠️`, warning + suggested waiver row printed, job continues
+4. A governance report (`sca-governance-report.csv`) is uploaded as artifact
+5. A PR comment table is posted (previous comment deleted before posting to avoid duplicates)
 
-> **Note:** The PR Validation job never fails due to scanner violations. The CSV artifacts provide full visibility for reviewers.
+> The pipeline only fails on **expired** waivers. Unwaived violations do not block the PR.
 
 ---
 
-### Who Can Update the Waiver File & Process
+### Governance
 
 ```
-Developer  →  Tech Lead  →  [Security Team if Critical]  →  Merge
+Developer → PR against main → Tech Lead approval → merge into main
 ```
 
 | Role | Responsibility |
 |------|---------------|
-| **Developer** | Identifies violation, creates waiver entry in feature branch PR, references Jira ticket |
-| **Tech Lead / Senior Engineer** | Reviews justification and expiry date, approves PR, their username goes in `approved_by` |
-| **Security / DevOps Team** | Required approver for critical severity violations; max 7-day waiver |
+| **Developer** | Identifies violation, raises PR **against `main`** adding waiver row, references Jira ticket |
+| **Tech Lead / Senior Engineer** | Reviews justification and expiry (max 30 days), approves PR; username goes in `approved_by` |
+| **Security / DevOps Team** | Required for critical (severity 1–2); max 7-day waiver |
 
-**Step-by-step process:**
-1. Developer encounters a violation they cannot fix immediately (e.g., tech debt, refactoring in progress)
-2. Developer adds an entry to `.github/sf-scanner-waivers.json` in their feature branch
-3. Developer opens a PR — the waiver diff is explicitly visible to reviewers
-4. Tech Lead reviews the justification, expiry date (max 30 days), and Jira ticket reference
-5. Tech Lead approves; the `approved_by` field must match their GitHub username
-6. Developer sets a calendar reminder before `expiry` to fix the violation or renew the waiver
-7. Once the violation is fixed, the entry **must** be removed in the same PR as the fix
+**Process:**
+1. Check `sca-governance-report.csv` artifact — it shows the suggested CSV row for the violation
+2. Raise a PR **against `main`** adding the row to `.github/sf-scanner-waivers.csv`
+3. Tech Lead approves and merges — `approved_by` must match their GitHub username
+4. Next PR run fetches updated CSV from main and marks violation as `WAIVED`
+5. Set reminder before `expiry` to fix or renew
+6. Once fixed: update `status` to `REVOKED` (keep row for audit trail — do NOT delete)
 
 ---
 
 ### Waiver File Schema
 
-```json
-{
-  "rule":        "ApexDoc",
-  "file":        "MyClass.cls",
-  "description": "Missing ApexDoc comment on all public methods",
-  "expiry":      "2026-05-01",
-  "reason":      "Refactoring in sprint 12. Tracked in PROJ-123.",
-  "approved_by": "tech-lead-github-username",
-  "ticket":      "PROJ-123"
-}
+```csv
+rule,file_pattern,message_contains,severity_threshold,expiry,reason,approved_by,approved_date,ticket,status
+ApexDoc,MyClass.cls,,3,2026-05-10,Reason here. Tracked in PROJ-123.,jane-techlead,2026-04-10,PROJ-123,ACTIVE
 ```
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `rule` | ✅ | Rule name from the scanner report — partial substring match (e.g. `"ApexDoc"`) |
-| `file` | ✅ | Filename from the scanner report — partial match (e.g. `"MyClass.cls"`) |
-| `description` | ✅ | Human-readable description of the violation |
-| `expiry` | ✅ | Hard deadline `YYYY-MM-DD` — pipeline writes to violation CSV after this date |
-| `reason` | ✅ | Business justification — must include Jira/work-item reference |
-| `approved_by` | ✅ | GitHub username of the approving Tech Lead |
-| `ticket` | ⬜ Recommended | Jira or work-item ID tracking the fix |
+| Column | Required | Description |
+|--------|----------|-------------|
+| `rule` | ✅ | Rule name substring match (e.g. `ApexDoc`) |
+| `file_pattern` | ✅ | Filename substring match (e.g. `MyClass.cls`) |
+| `message_contains` | ⬜ | Optional substring of violation message to narrow match |
+| `severity_threshold` | ⬜ | Only waive at this severity or above (blank = any) |
+| `expiry` | ✅ | `YYYY-MM-DD` — pipeline **FAILS** after this date |
+| `reason` | ✅ | Business justification with Jira reference |
+| `approved_by` | ✅ | GitHub username of approver |
+| `approved_date` | ✅ | Approval date `YYYY-MM-DD` |
+| `ticket` | ✅ | Jira/GitHub issue ID |
+| `status` | ✅ | `ACTIVE` or `REVOKED` |
 
 ---
 
 ### Expiry Policy
 
-| Severity | Max Duration | Approver Required |
+| Severity | Max Duration | Required Approver |
 |----------|-------------|-------------------|
-| Low / Medium | 30 days | Tech Lead |
-| High | 14 days | Tech Lead + Senior Eng |
-| Critical | 7 days | Security Team |
+| Low / Medium (3–4) | 30 days | Tech Lead |
+| High (2) | 14 days | Tech Lead + Senior Eng |
+| Critical (1) | 7 days | Security / DevOps |
 
 ---
 
-### Example — Add a Waiver
+### Governance Report CSV Columns
 
-Find the rule name from the scanner report artifact (`sfdx-report.csv`). Then add to `.github/sf-scanner-waivers.json`:
-
-```json
-{
-  "rule": "ApexDoc",
-  "file": "CoverageDemoService.cls",
-  "description": "Missing ApexDoc comments on public methods in CoverageDemoService",
-  "expiry": "2026-05-01",
-  "reason": "ApexDoc to be added during sprint 12 refactoring. Tracked in PROJ-123.",
-  "approved_by": "jane-techlead",
-  "ticket": "PROJ-123"
-}
-```
-
----
-
-### Results CSV Format
-
-The `sfdx-waiver-results.csv` artifact (in `sfdx-scanner-reports`) has columns:
+The `sca-governance-report.csv` artifact:
 
 | Column | Description |
 |--------|-------------|
-| `Status` | `WAIVED`, `EXPIRED_WAIVER`, or `VIOLATION` |
+| `Status` | `WAIVED`, `WAIVED_EXPIRING_SOON`, `EXPIRED_WAIVER`, `VIOLATION` |
 | `Rule` | Scanner rule name |
 | `File` | Source file path |
 | `Line` | Line number |
 | `Severity` | Violation severity |
-| `Description` | Violation description |
-| `Expiry` | Waiver expiry date (if waived) |
-| `Reason` | Waiver reason (if waived) |
-| `Approved_By` | Approver username (if waived) |
-| `Ticket` | Tracking ticket (if waived) |
+| `Description` | Violation message |
+| `Expiry` | Waiver expiry date |
+| `Days_Left` | Days until expiry (negative = already expired) |
+| `Reason` | Waiver reason |
+| `Approved_By` | Approver GitHub username |
+| `Approved_Date` | Date approved |
+| `Ticket` | Tracking ticket |
 
 ---
 
