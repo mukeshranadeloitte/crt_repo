@@ -22,9 +22,6 @@ private class DeploySmokeCheckTest {
         System.assertEquals(true, DeploySmokeCheck.isIsoZulu(out.timestampUtc));
     }
 
-    
-
-    
     @IsTest
     static void run_customMessage_trim_and_truncate() {
         String longMsg = '   ' + String.valueOf('X').repeat(200) + '   ';
