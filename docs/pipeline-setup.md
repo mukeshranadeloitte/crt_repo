@@ -69,9 +69,10 @@ Set these under **Settings → Secrets and variables → Actions → Variables**
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ORG_ALIAS` | `uat` | Alias used when authenticating to the target SF org |
-| `DELTA_FROM_COMMIT` | *(none — required)* | Baseline commit SHA for `sfdx-git-delta`. **Auto-updated** after each successful deployment via `GH_PAT`. Set manually on first use. |
+| `DELTA_FROM_COMMIT` | *(none — required)* | Baseline commit SHA for `sfdx-git-delta`. **Auto-updated** after each successful deployment via `GH_PAT`. Set manually on first use. Used as a shallow-clone fallback in the deploy job (primary FROM is `git rev-parse HEAD^1`). |
 | `COVERAGE_THRESHOLD` | `85` | Minimum Apex coverage % enforced by the workflow coverage check |
 | `SOURCE_DIR` | `force-app/main/default` | Source directory passed to `sf scanner run` and fallback deploy |
+| `SCA_ENFORCEMENT_MODE` | `enforce` | Controls how Salesforce Code Analyzer violations are handled: `enforce` (default) = expired waivers fail the pipeline; `warn` = all violations and expired waivers are warnings only (nothing fails); `off` = all SCA scanner steps are skipped entirely. **Set to `off` during initial project phase** to bypass all violations while getting the pipeline running. |
 
 ### Fortify on Demand
 
@@ -161,7 +162,7 @@ git show origin/pr_packages -- deploy-pr42-a1b2c3d4e5-20260409T143000Z/deploymen
 
 After every successful deployment, the pipeline **automatically updates** `DELTA_FROM_COMMIT` to the deployed commit SHA using the GitHub API via `GH_PAT`.
 
-This means the next PR's delta calculation always starts from the last successfully deployed state — no manual steps required.
+The deploy job (`deploy-after-merge`) computes its delta FROM using `git rev-parse HEAD^1` — the UAT branch tip immediately before the PR merged. This always matches what was validated in the PR, regardless of what `DELTA_FROM_COMMIT` holds. `DELTA_FROM_COMMIT` is used as a fallback only if `HEAD^1` is unavailable (shallow clone) and is still updated after deploy for rollback reference.
 
 **If `GH_PAT` is not set:**
 - The step will print a warning with the correct SHA
@@ -179,8 +180,10 @@ This means the next PR's delta calculation always starts from the last successfu
 [ ] Variable DELTA_FROM_COMMIT set to baseline commit SHA (first deploy only)
 [ ] Variable ORG_ALIAS set (default: uat)
 [ ] Variable COVERAGE_THRESHOLD set (default: 85)
+[ ] Variable SCA_ENFORCEMENT_MODE set (default: enforce; use off for initial project phase)
 [ ] Environment ReleaseGate created with required reviewers
 [ ] Branch protection configured on uat branch
+[ ] SF scanner waiver file: .github/sf-scanner-waivers.csv committed to main branch
 [ ] (Optional) CheckMarx secrets configured: CX_BASE_URI, CX_TENANT, CX_CLIENT_ID, CX_CLIENT_SECRET
 [ ] (Optional) Fortify secrets: FOD_CLIENT_ID, FOD_CLIENT_SECRET, FOD_APP_NAME, FOD_RELEASE_NAME
 [ ] (Optional) Fortify variables: FOD_URL, FOD_DAST_ASSESSMENT_TYPE, FOD_DAST_FREQUENCY, FOD_DAST_ENVIRONMENT

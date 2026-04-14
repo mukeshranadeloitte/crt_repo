@@ -8,6 +8,22 @@ The pipeline supports time-boxed suppression of two categories of violations:
 
 ---
 
+## SCA Enforcement Mode
+
+The `SCA_ENFORCEMENT_MODE` repository variable controls how the Salesforce Code Analyzer scan results are handled across Jobs 2 and 4:
+
+| Value | Behaviour |
+|-------|-----------|
+| `enforce` | **(Default)** Expired waivers **fail** the pipeline. Unwaived violations are warnings only. |
+| `warn` | Nothing fails. All expired waivers and unwaived violations are informational warnings. |
+| `off` | **All SCA steps are skipped entirely.** Use during initial project phase to bypass violations while the pipeline is being set up. |
+
+**Set in:** Settings → Variables → Actions → `SCA_ENFORCEMENT_MODE`
+
+> **Tip:** Set `SCA_ENFORCEMENT_MODE=off` when first onboarding a project to get the rest of the pipeline working before addressing code quality findings. Switch to `enforce` before going to production.
+
+---
+
 ## Part 1 — Salesforce Code Analyzer Waivers
 
 **File:** `.github/sf-scanner-waivers.csv` — **main branch only**
@@ -65,7 +81,7 @@ ApexDoc,MyClass.cls,,3,2026-05-10,Reason here. Tracked in PROJ-123.,jane-techlea
 | `file_pattern` | ✅ | Filename substring match (e.g. `MyClass.cls`) |
 | `message_contains` | ⬜ | Optional substring of violation message to narrow match |
 | `severity_threshold` | ⬜ | Only waive at this severity or above (blank = any) |
-| `expiry` | ✅ | `YYYY-MM-DD` — pipeline **FAILS** after this date |
+| `expiry` | ✅ | DD-MM-YYYY preferred (also accepts DD/MM/YYYY and YYYY-MM-DD) — pipeline **FAILS** after this date (in `enforce` mode) |
 | `reason` | ✅ | Business justification with Jira reference |
 | `approved_by` | ✅ | GitHub username of approver |
 | `approved_date` | ✅ | Approval date `YYYY-MM-DD` |
