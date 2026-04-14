@@ -2261,24 +2261,38 @@ jobs:
               --json "{\"query\":\"{ latestBuilds(projectId: ${CRT_PROJECT_ID}, resultSize: 50) { data { id status buildNumber startTime endTime } } }\"}" \
               https://graphql.eu-robotic.copado.com/v1)
 
+            # Print raw response ONCE on first poll to expose actual structure
+            if [[ $ELAPSED -eq $POLL_INTERVAL ]]; then
+              echo "    [DEBUG] Raw poll response: ${POLL_RESPONSE}" >&2 || true
+            fi
+
             FINAL_STATUS=$(echo "${POLL_RESPONSE}" | python3 -c "
           import sys, json
           try:
               resp   = json.load(sys.stdin)
+              # Try standard path: data.latestBuilds.data[]
               builds = resp.get('data',{}).get('latestBuilds',{}).get('data',[])
+              # Fallback: maybe top-level is latestBuilds directly
+              if not builds:
+                  builds = resp.get('latestBuilds',{}).get('data',[])
+              # Fallback: maybe result is under data[] directly
+              if not builds and isinstance(resp.get('data'), list):
+                  builds = resp['data']
               target = str(${BUILD_ID})
               # Match by id (int or string comparison)
               build  = next((b for b in builds if str(b.get('id','')) == target), None)
               if build:
                   print(str(build.get('status','')).lower())
               else:
-                  # Debug: print first 3 IDs to help diagnose mismatch
+                  # Debug: print structure and first 3 IDs
+                  top_keys = list(resp.keys())
                   ids = [str(b.get('id','')) for b in builds[:3]]
                   import sys as _sys
-                  print(f'unknown(ids={ids})', file=_sys.stderr)
+                  print(f'unknown(top_keys={top_keys}, ids={ids})', file=_sys.stderr)
                   print('unknown')
           except Exception as e:
-              print('pollerror', file=sys.stderr)
+              import sys as _sys
+              print(f'pollerror: {e}', file=_sys.stderr)
               print('pollerror')
           " 2>/tmp/crt-poll-err.txt || echo "pollerror")
 
