@@ -86,6 +86,11 @@ env:
   COVERAGE_THRESHOLD: ${{ vars.COVERAGE_THRESHOLD || '85' }}
   SOURCE_DIR: ${{ vars.SOURCE_DIR || 'force-app/main/default' }}
   FCLI_BOOTSTRAP_VERSION: v3.16.0
+  # SCA_ENFORCEMENT_MODE controls how scanner violations are handled:
+  #   enforce  (default) — expired waivers FAIL the pipeline; violations are warnings
+  #   warn     — nothing fails; all violations and expired waivers are warnings only
+  #   off      — SCA scanner steps are skipped entirely (bypass mode for initial project phase)
+  SCA_ENFORCEMENT_MODE: ${{ vars.SCA_ENFORCEMENT_MODE || 'enforce' }}
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
@@ -604,11 +609,11 @@ jobs:
           fi
 
       - name: Install Salesforce Code Analyzer
-        if: steps.delta.outputs.has_delta == 'true'
+        if: steps.delta.outputs.has_delta == 'true' && vars.SCA_ENFORCEMENT_MODE != 'off'
         run: echo y | sf plugins install @salesforce/sfdx-scanner || npm install -g @salesforce/sfdx-scanner
 
       - name: Detect waiver file tampering
-        if: steps.delta.outputs.has_delta == 'true'
+        if: steps.delta.outputs.has_delta == 'true' && vars.SCA_ENFORCEMENT_MODE != 'off'
         run: |
           set -euo pipefail
           # Warn if developer modified the waiver CSV in their PR branch.
@@ -623,7 +628,7 @@ jobs:
 
       - name: Fetch SCA waivers from main branch
         id: fetch-waivers
-        if: steps.delta.outputs.has_delta == 'true'
+        if: steps.delta.outputs.has_delta == 'true' && vars.SCA_ENFORCEMENT_MODE != 'off'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -741,6 +746,7 @@ jobs:
 
       - name: Detect changed Salesforce files for SCA
         id: sca-targets
+        if: vars.SCA_ENFORCEMENT_MODE != 'off'
         run: |
           set -euo pipefail
 
@@ -777,7 +783,7 @@ jobs:
           echo "has_targets=true"   >> "$GITHUB_OUTPUT"
 
       - name: Salesforce Code Analyzer
-        if: steps.sca-targets.outputs.has_targets == 'true'
+        if: steps.sca-targets.outputs.has_targets == 'true' && vars.SCA_ENFORCEMENT_MODE != 'off'
         continue-on-error: true
         run: |
           sf scanner run \
@@ -788,7 +794,9 @@ jobs:
 
       - name: Check scanner results against waivers
         id: waiver-check
-        if: steps.sca-targets.outputs.has_targets == 'true'
+        if: steps.sca-targets.outputs.has_targets == 'true' && vars.SCA_ENFORCEMENT_MODE != 'off'
+        env:
+          SCA_ENFORCEMENT_MODE: ${{ vars.SCA_ENFORCEMENT_MODE || 'enforce' }}
         run: |
           set -euo pipefail
           REPORT_FILE="sfdx-report.csv"
@@ -808,6 +816,13 @@ jobs:
 
           TODAY          = date.today()
           WARN_DAYS      = 30          # Warn when waiver expires within this many days
+          ENFORCEMENT    = os.environ.get("SCA_ENFORCEMENT_MODE", "enforce").lower().strip()
+
+          if ENFORCEMENT == "warn":
+              print("⚠️  SCA_ENFORCEMENT_MODE=warn — all violations are informational only. Nothing will fail.")
+          elif ENFORCEMENT == "off":
+              print("ℹ️  SCA_ENFORCEMENT_MODE=off — SCA checks skipped.")
+              sys.exit(0)
           FETCHED_CSV    = "fetched-waivers.csv"
           REPORT_FILE    = "sfdx-report.csv"
           RESULTS_CSV    = "sca-governance-report.csv"
@@ -971,13 +986,16 @@ jobs:
               out.write(f"violation_count={violation_count}\n")
               out.write(f"near_expiry_count={near_expiry}\n")
 
-          # Fail the step if any waiver has expired
+          # Fail the step if any waiver has expired (enforce mode only)
           if expired_count > 0:
-              print(f"\n❌ PIPELINE FAILED: {expired_count} expired waiver(s).")
-              print("   Fix violation(s) OR renew waivers in main branch (.github/sf-scanner-waivers.csv).")
-              sys.exit(1)
+              if ENFORCEMENT == "warn":
+                  print(f"\n⚠️  WARN MODE: {expired_count} expired waiver(s) — would fail in enforce mode.")
+              else:
+                  print(f"\n❌ PIPELINE FAILED: {expired_count} expired waiver(s).")
+                  print("   Fix violation(s) OR renew waivers in main branch (.github/sf-scanner-waivers.csv).")
+                  sys.exit(1)
 
-          print("\n✅ All active waivers valid. No expired waivers.")
+          print(f"\n✅ All active waivers valid. No expired waivers. (mode={ENFORCEMENT})")
           PYEOF
 
       - name: Post SCA governance report as PR comment

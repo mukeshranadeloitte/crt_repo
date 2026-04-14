@@ -19,7 +19,7 @@ Every Salesforce project using this pipeline pattern should have these files:
 .github/
   workflows/
     e2e-uat-pipeline.yml          ← Main CI/CD workflow (all jobs)
-  sf-scanner-waivers.json         ← Salesforce Code Analyzer rule waivers
+  sf-scanner-waivers.csv          ← Salesforce Code Analyzer rule waivers (main branch only)
   sca-waivers.json                ← npm dependency vulnerability waivers
 docs/
   pipeline-overview.md            ← Architecture diagram + job summaries
@@ -46,7 +46,7 @@ on:
     paths:
       - force-app/**
       - .github/workflows/e2e-uat-pipeline.yml
-      - .github/sf-scanner-waivers.json
+      - .github/sf-scanner-waivers.csv
   pull_request_review:
     types: [submitted]
   workflow_dispatch:
@@ -67,6 +67,10 @@ env:
   COVERAGE_THRESHOLD:    ${{ vars.COVERAGE_THRESHOLD    || '85' }}
   SOURCE_DIR:            ${{ vars.SOURCE_DIR            || 'force-app/main/default' }}
   FCLI_BOOTSTRAP_VERSION: v3.16.0
+  # enforce (default): expired waivers FAIL the pipeline
+  # warn: nothing fails; all violations/expired waivers are warnings only
+  # off: all SCA scanner steps are skipped entirely (bypass mode)
+  SCA_ENFORCEMENT_MODE:  ${{ vars.SCA_ENFORCEMENT_MODE  || 'enforce' }}
 ```
 
 ### Job Dependency Map
@@ -131,13 +135,21 @@ workflow_dispatch (action=rollback) ──────────────�
   9. Set `has_delta` output: `true` if package or destructive has members
   10. **[if has_delta]** `sf project deploy validate --async` → poll every 15s for live progress
   11. **[if has_delta]** Check per-class Apex coverage (threshold: `$COVERAGE_THRESHOLD`)
-  12. **[if has_delta]** Install `@salesforce/sfdx-scanner`
-  13. **[if has_delta]** Detect changed `.cls/.trigger/.js/.html/.css` files for targeted SCA
-  14. **[if has_targets]** `sf scanner run --target <changed-files>` → `sfdx-report.csv`
-  15. **[if has_targets]** Check against `.github/sf-scanner-waivers.json` → `sfdx-waiver-results.csv`
-  16. Upload `sfdx-scanner-reports` artifact
+  12. **[if has_delta && SCA_ENFORCEMENT_MODE != 'off']** Install `@salesforce/sfdx-scanner`
+  13. **[if has_delta && SCA_ENFORCEMENT_MODE != 'off']** Detect waiver file tampering — warns if `.github/sf-scanner-waivers.csv` was modified in this PR (ignored; pipeline always reads from main)
+  14. **[if has_delta && SCA_ENFORCEMENT_MODE != 'off']** Fetch SCA waivers from main branch via GitHub API; fallback chain: default branch → base_ref → head_ref
+  15. **[if SCA_ENFORCEMENT_MODE != 'off']** Detect changed `.cls/.trigger/.js/.html/.css` files for targeted SCA
+  16. **[if has_targets && SCA_ENFORCEMENT_MODE != 'off']** `sf scanner run --target <changed-files>` → `sfdx-report.csv` (`continue-on-error: true`)
+  17. **[if has_targets && SCA_ENFORCEMENT_MODE != 'off']** Check against `.github/sf-scanner-waivers.csv` (fetched from main) using Python script with `parse_date()` (DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD):
+      - `WAIVED` ✅ — active waiver, >30 days remaining
+      - `WAIVED_EXPIRING_SOON` ⏰ — ≤30 days to expiry (warning only)
+      - `EXPIRED_WAIVER` ❌ — past expiry → **fails** in `enforce` mode, warns in `warn` mode
+      - `VIOLATION` ⚠️ — no waiver (warning only; does not fail)
+      - Writes `sca-governance-report.csv` (Status, Rule, File, Line, Severity, Description, Expiry, Days_Left, Reason, Approved_By, Approved_Date, Ticket)
+  18. **[if has_targets && pull_request && SCA_ENFORCEMENT_MODE != 'off']** Post SCA governance report as PR comment (deletes previous comment first)
+  19. Upload `sfdx-scanner-reports` artifact (`sfdx-report.csv`, `sca-governance-report.csv`, `fetched-waivers.csv`)
 
-> **Key design:** SCA and deployment steps skip entirely when no Salesforce components changed. Scanner violations never block the job (`continue-on-error: true`).
+> **Key design:** SCA and deployment steps skip entirely when no Salesforce components changed. Scanner violations never block the job (`continue-on-error: true`). All SCA steps are gated on `SCA_ENFORCEMENT_MODE != 'off'`.
 
 ### Job 3 — `sca-sast-stage`: SCA/SAST Stage
 - **Needs:** `salesforce-validation`
@@ -172,21 +184,25 @@ workflow_dispatch (action=rollback) ──────────────�
 - **Needs:** `approval-merge-gate`
 - **Permissions:** `contents: write`
 - Steps:
-  1. `sf project deploy start --async` → poll every 15s for live progress table
-  2. Show component breakdown: ➕ CREATED / ✏️ UPDATED / 🗑️ DELETED per component
-  3. Show per-class Apex coverage table
-  4. Build deployment package: `package.xml` + `destructiveChanges.xml` + `components.zip` + `deployment-info.json`
-  5. Upload artifact (90-day retention)
-  6. Commit package to `pr_packages` branch (auto-created orphan on first run)
-  7. Update `DELTA_FROM_COMMIT` via GitHub API (`PATCH /actions/variables/DELTA_FROM_COMMIT`)
+  1. Build delta package (`id: delta_pkg`): uses `git rev-parse HEAD^1` (UAT branch tip before this PR merged) as FROM for `sfdx-git-delta`. Falls back to `DELTA_FROM_COMMIT` only if `HEAD^1` unavailable (shallow clone). Exports `merge_base` output.
+  2. `sf project deploy start --async` → poll every 15s for live progress table
+  3. Show component breakdown: ➕ CREATED / ✏️ UPDATED / 🗑️ DELETED per component
+  4. Show per-class Apex coverage table
+  5. Build deployment package: `package.xml` + `destructiveChanges.xml` + `components.zip` + `deployment-info.json`
+  6. Upload artifact (90-day retention)
+  7. Commit package to `pr_packages` branch (auto-created orphan on first run)
+  8. Update `DELTA_FROM_COMMIT` via GitHub API (`PATCH /actions/variables/DELTA_FROM_COMMIT`) — saved for rollback reference and as fallback for next delta
 
 ### Job 10 — `trigger-crt-tests`: Trigger CRT Smoke Tests
 - **Needs:** `deploy-after-merge`
 - **API:** `POST https://graphql.eu-robotic.copado.com/v1`
 - **Auth:** `X-Authorization: ${CRT_API_TOKEN}` header
-- **Mutation:** `createBuild(projectId: <id>, jobId: <id>)`
-- **Polls:** `latestBuilds(projectId: <id>, resultSize: 10)` every 30s for status
-- Posts result PR comment + GitHub Step Summary with CRT dashboard link
+- **Step `id: crt`:** Triggers build via `createBuild(projectId, jobId)` mutation, then polls `latestBuilds(projectId, resultSize: 50)` every 30s until terminal status
+- **CRT statuses are lowercase:** `executing`, `passed`, `failed`, `error`, `cancelled`, `skipped`; terminal check uses `is_terminal()` function
+- **Exports:** `build_id` and `crt_status` outputs
+- **Step `id: pr_meta`** (`if: always()`): fetches PR number, raiser (PR author), and last approver via GitHub API
+- **Step `Print Job Summary`** (`if: always() && has_pr == 'true'`): box with PR#, Run#, PR Raiser, PR Approver, Test Build ID, Test Result
+- Posts result PR comment + GitHub Step Summary (final CRT status icon + Build ID) with CRT dashboard link
 
 ### Job 11 — `rollback`: Rollback Deployment
 - **Trigger:** `workflow_dispatch` with `action=rollback`
@@ -228,29 +244,44 @@ On failure, shows: components processed before failure, component failures with 
 
 ## Waiver Files
 
-### `.github/sf-scanner-waivers.json` — SF Code Analyzer Waivers
+### `.github/sf-scanner-waivers.csv` — SF Code Analyzer Waivers
 
-```json
-{
-  "rule":        "ApexDoc",
-  "file":        "MyClass.cls",
-  "description": "Missing ApexDoc on all public methods",
-  "expiry":      "2026-05-01",
-  "reason":      "Refactoring in progress. Tracked in PROJ-123.",
-  "approved_by": "tech-lead-username",
-  "ticket":      "PROJ-123"
-}
+> **Main branch only.** The pipeline always fetches from the default/main branch via GitHub API. PR branch copies are ignored. Only DevOps/Tech Lead can update waivers by merging into main.
+
+```csv
+rule,file_pattern,message_contains,severity_threshold,expiry,reason,approved_by,approved_date,ticket,status
+ApexDoc,MyClass.cls,,3,10-05-2026,Refactoring in progress. Tracked in PROJ-123.,jane-techlead,10-04-2026,PROJ-123,ACTIVE
 ```
 
-**Matching:** `rule` and `file` are substring-matched against scanner CSV output.
-**Status values:** `WAIVED` (active), `VIOLATION` (no waiver), `EXPIRED_WAIVER` (past expiry date).
-**Results CSV:** `sfdx-waiver-results.csv` with columns: Status/Rule/File/Line/Severity/Description/Expiry/Reason/Approved_By/Ticket.
+| Column | Required | Description |
+|--------|----------|-------------|
+| `rule` | ✅ | Rule name substring match (e.g. `ApexDoc`) |
+| `file_pattern` | ✅ | Filename substring match (e.g. `MyClass.cls`) |
+| `message_contains` | ⬜ | Optional violation message substring to narrow match |
+| `severity_threshold` | ⬜ | Only waive at this severity or above (blank = any) |
+| `expiry` | ✅ | DD-MM-YYYY (preferred); also accepts DD/MM/YYYY and YYYY-MM-DD |
+| `reason` | ✅ | Business justification with Jira reference |
+| `approved_by` | ✅ | GitHub username of approver |
+| `approved_date` | ✅ | Approval date |
+| `ticket` | ✅ | Jira/GitHub issue ID |
+| `status` | ✅ | `ACTIVE` or `REVOKED` (keep revoked rows for audit trail — never delete) |
+
+Comment rows starting with `#` are ignored.
+
+**Status values:**
+- `WAIVED` ✅ — active waiver, >30 days remaining
+- `WAIVED_EXPIRING_SOON` ⏰ — ≤30 days to expiry (warning, does not fail)
+- `EXPIRED_WAIVER` ❌ — past expiry; pipeline **fails** in `enforce` mode, warns in `warn` mode
+- `VIOLATION` ⚠️ — no waiver found; warning only, does not fail
+
+**Results CSV:** `sca-governance-report.csv` with columns: Status, Rule, File, Line, Severity, Description, Expiry, Days_Left, Reason, Approved_By, Approved_Date, Ticket.
 
 **Governance:**
-1. Developer adds entry to their feature branch
-2. Tech Lead reviews PR and approves (their username → `approved_by`)
-3. Security team approval for critical violations
-4. Entry removed once violation is fixed
+1. Developer identifies violation → checks `sca-governance-report.csv` for suggested CSV row
+2. Raises PR **against `main`** adding waiver row to `.github/sf-scanner-waivers.csv`
+3. Tech Lead reviews + approves (their username → `approved_by`), merges to main
+4. Next PR run fetches updated CSV from main and marks violation as `WAIVED`
+5. Once fixed: update `status` to `REVOKED` (keep row for audit trail)
 
 **Expiry policy:** Max 30 days (low/medium), 14 days (high), 7 days (critical).
 
@@ -297,7 +328,8 @@ On failure, shows: components processed before failure, component failures with 
 | `COVERAGE_THRESHOLD` | `85` | Job 2 | Apex test coverage % threshold |
 | `SOURCE_DIR` | `force-app/main/default` | Jobs 2, 9 | Apex source directory |
 | `SFDX_AUTH_SECRET_NAME` | `CRT_UAT_AUTHURL` | Jobs 2, 4 | Secret name holding SFDX auth URL |
-| `DELTA_FROM_COMMIT` | *(required)* | Jobs 2, 9 | Baseline SHA for `sfdx-git-delta`. Auto-updated after each deploy. |
+| `DELTA_FROM_COMMIT` | *(required)* | Jobs 2, 9 | Baseline SHA for `sfdx-git-delta`. Auto-updated after each deploy. Used as shallow-clone fallback in Job 9. |
+| `SCA_ENFORCEMENT_MODE` | `enforce` | Jobs 2, 4 | `enforce` = expired waivers fail pipeline; `warn` = nothing fails; `off` = all SCA steps skipped entirely |
 | `CRT_JOB_ID` | `115686` | Job 10 | CRT job ID to trigger |
 | `CRT_PROJECT_ID` | `73283` | Job 10 | CRT project ID |
 | `CRT_ORG_ID` | `43532` | Job 10 | CRT org ID |
@@ -365,6 +397,8 @@ git show origin/pr_packages -- deploy-pr42-.../deployment-info.json
 - ALWAYS update `docs/` when changing pipeline behaviour
 - NEVER pass `--test-level NoTestRun` to `sf project deploy validate` — omit `--test-level` when no Apex changed
 - NEVER combine `--async` and `--wait` on the same deploy command
+- ALWAYS document `SCA_ENFORCEMENT_MODE` in any new doc or config. Set to `off` to bypass all SCA steps (initial project phase), `warn` for informational-only, `enforce` (default) to fail on expired waivers.
+- NEVER delete rows from `.github/sf-scanner-waivers.csv` — set `status=REVOKED` to retire a waiver
 
 ## Approach
 1. Read the current workflow and relevant docs before making changes
