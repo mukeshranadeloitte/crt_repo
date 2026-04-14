@@ -2212,28 +2212,44 @@ jobs:
           echo "──────────┼──────────────────────"
 
           # ── Poll until terminal status ────────────────────────────────────────
-          # CRT terminal statuses: Passed, Failed, Error, Cancelled, Skipped
-          TERMINAL="Passed Failed Error Cancelled Skipped"
+          # CRT status values are lowercase: executing, queued, passed, failed, error, cancelled, skipped
+          # Normalise to lowercase for comparison throughout
           ELAPSED=0
           POLL_INTERVAL=30
           MAX_WAIT=3600
-          FINAL_STATUS="${INIT_STATUS}"
+          FINAL_STATUS=$(echo "${INIT_STATUS}" | tr '[:upper:]' '[:lower:]')
           PREV_STATUS=""
 
+          is_terminal() {
+            case "$1" in
+              passed|failed|error|cancelled|canceled|skipped|aborted) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          status_icon() {
+            case "$1" in
+              passed)              echo "✅" ;;
+              failed|error)        echo "❌" ;;
+              cancelled|canceled|aborted) echo "⛔" ;;
+              executing|running)   echo "🔄" ;;
+              queued|pending)      echo "⏳" ;;
+              *)                   echo "❓" ;;
+            esac
+          }
+
           while [[ $ELAPSED -lt $MAX_WAIT ]]; do
-            # Only print if status changed or on first iteration
+            # Print row when status changes or on first iteration
             if [[ "${FINAL_STATUS}" != "${PREV_STATUS}" ]]; then
-              printf "  %6ds │ %s\n" "${ELAPSED}" "${FINAL_STATUS}"
+              ICON=$(status_icon "${FINAL_STATUS}")
+              printf "  %6ds │ %s %s\n" "${ELAPSED}" "${ICON}" "${FINAL_STATUS}"
               PREV_STATUS="${FINAL_STATUS}"
             fi
 
-            # Check terminal
-            for T in $TERMINAL; do
-              if [[ "${FINAL_STATUS}" == "${T}" ]]; then
-                echo "──────────┴──────────────────────"
-                break 2
-              fi
-            done
+            if is_terminal "${FINAL_STATUS}"; then
+              echo "──────────┴──────────────────────"
+              break
+            fi
 
             sleep ${POLL_INTERVAL}
             ELAPSED=$((ELAPSED + POLL_INTERVAL))
@@ -2242,18 +2258,35 @@ jobs:
             POLL_RESPONSE=$(curl -s \
               --header "X-Authorization: ${CRT_API_TOKEN}" \
               --header "Content-Type: application/json" \
-              --json "{\"query\":\"{ latestBuilds(projectId: ${CRT_PROJECT_ID}, resultSize: 20) { data { id status buildNumber startTime endTime } } }\"}" \
+              --json "{\"query\":\"{ latestBuilds(projectId: ${CRT_PROJECT_ID}, resultSize: 50) { data { id status buildNumber startTime endTime } } }\"}" \
               https://graphql.eu-robotic.copado.com/v1)
 
             FINAL_STATUS=$(echo "${POLL_RESPONSE}" | python3 -c "
           import sys, json
           try:
-              builds = json.load(sys.stdin).get('data',{}).get('latestBuilds',{}).get('data',[])
-              build  = next((b for b in builds if str(b.get('id','')) == '${BUILD_ID}'), None)
-              print(build['status'] if build else 'Unknown')
+              resp   = json.load(sys.stdin)
+              builds = resp.get('data',{}).get('latestBuilds',{}).get('data',[])
+              target = str(${BUILD_ID})
+              # Match by id (int or string comparison)
+              build  = next((b for b in builds if str(b.get('id','')) == target), None)
+              if build:
+                  print(str(build.get('status','')).lower())
+              else:
+                  # Debug: print first 3 IDs to help diagnose mismatch
+                  ids = [str(b.get('id','')) for b in builds[:3]]
+                  import sys as _sys
+                  print(f'unknown(ids={ids})', file=_sys.stderr)
+                  print('unknown')
           except Exception as e:
-              print('PollError')
-          " 2>/dev/null || echo "PollError")
+              print('pollerror', file=sys.stderr)
+              print('pollerror')
+          " 2>/tmp/crt-poll-err.txt || echo "pollerror")
+
+            # Surface debug output if we got unknown/pollerror
+            if [[ "${FINAL_STATUS}" == unknown* || "${FINAL_STATUS}" == "pollerror" ]]; then
+              ERR=$(cat /tmp/crt-poll-err.txt 2>/dev/null || true)
+              [[ -n "$ERR" ]] && echo "    ⚠ poll debug: ${ERR}" || true
+            fi
           done
 
           if [[ $ELAPSED -ge $MAX_WAIT ]]; then
@@ -2262,7 +2295,7 @@ jobs:
           fi
 
           echo ""
-          if [[ "${FINAL_STATUS}" == "Passed" ]]; then
+          if [[ "${FINAL_STATUS}" == "passed" ]]; then
             echo "✅ CRT tests PASSED (Build ID: ${BUILD_ID})"
           else
             echo "❌ CRT tests ${FINAL_STATUS} (Build ID: ${BUILD_ID})"
@@ -2272,7 +2305,7 @@ jobs:
           echo "crt_status=${FINAL_STATUS}"      >> "$GITHUB_OUTPUT"
 
           # Fail the job if CRT did not pass
-          if [[ "${FINAL_STATUS}" != "Passed" && "${FINAL_STATUS}" != "Timeout" ]]; then
+          if [[ "${FINAL_STATUS}" != "passed" && "${FINAL_STATUS}" != "timeout" ]]; then
             exit 1
           fi
 
@@ -2352,12 +2385,12 @@ jobs:
         run: |
           STATUS_ICON="❓"
           case "${CRT_STATUS}" in
-            Passed)    STATUS_ICON="✅" ;;
-            Failed)    STATUS_ICON="❌" ;;
-            Error)     STATUS_ICON="🔴" ;;
-            Cancelled) STATUS_ICON="⛔" ;;
-            Timeout)   STATUS_ICON="⏱️" ;;
-            *)         STATUS_ICON="⏳" ;;
+            passed)             STATUS_ICON="✅" ;;
+            failed)             STATUS_ICON="❌" ;;
+            error)              STATUS_ICON="🔴" ;;
+            cancelled|canceled) STATUS_ICON="⛔" ;;
+            timeout)            STATUS_ICON="⏱️" ;;
+            *)                  STATUS_ICON="⏳" ;;
           esac
           {
             echo "## 🧪 CRT Test Execution Summary"
