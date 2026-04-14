@@ -39,6 +39,8 @@ public with sharing class AccountUtilityService {
         return accountsToUpdate.size();
     }
 
+
+    
     public static Map<Id, Integer> getContactCountByAccount(Set<Id> accountIds) {
         Map<Id, Integer> contactCountByAccount = new Map<Id, Integer>();
 

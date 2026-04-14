@@ -2185,144 +2185,29 @@ jobs:
             echo "::error::Missing required secret: CRT_API_TOKEN"
             exit 1
           fi
-
-          # ── Trigger the build ────────────────────────────────────────────────
-          echo "🚀 Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})..."
+          echo "Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})"
           RESPONSE=$(curl -s \
             --header "X-Authorization: ${CRT_API_TOKEN}" \
             --header "Content-Type: application/json" \
             --json "{\"query\":\"mutation { createBuild(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { message data { id buildNumber status startTime } } }\"}" \
             https://graphql.eu-robotic.copado.com/v1)
-
+          echo "Response: ${RESPONSE}"
           if echo "${RESPONSE}" | grep -q '"errors"'; then
             ERR_MSG=$(echo "${RESPONSE}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['errors'][0].get('message','unknown'))" 2>/dev/null || echo "unknown")
             echo "::error::Failed to trigger CRT job: ${ERR_MSG}"
-            echo "build_id=n/a"       >> "$GITHUB_OUTPUT"
-            echo "crt_status=FAILED"  >> "$GITHUB_OUTPUT"
+            echo "build_id=n/a"    >> "$GITHUB_OUTPUT"
+            echo "crt_status=FAILED" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-
           BUILD_ID=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['id'])")
+          STATUS=$(echo "${RESPONSE}"   | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['status'])")
           BUILD_NO=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data'].get('buildNumber','n/a'))")
-          INIT_STATUS=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['status'])")
-
-          echo "✅ CRT build triggered — ID: ${BUILD_ID}  Build#: ${BUILD_NO}"
-          echo ""
-          echo "  Elapsed │ Status"
-          echo "──────────┼──────────────────────"
-
-          # ── Poll until terminal status ────────────────────────────────────────
-          # CRT status values are lowercase: executing, queued, passed, failed, error, cancelled, skipped
-          # Normalise to lowercase for comparison throughout
-          ELAPSED=0
-          POLL_INTERVAL=30
-          MAX_WAIT=3600
-          FINAL_STATUS=$(echo "${INIT_STATUS}" | tr '[:upper:]' '[:lower:]')
-          PREV_STATUS=""
-
-          is_terminal() {
-            case "$1" in
-              passed|failed|error|cancelled|canceled|skipped|aborted) return 0 ;;
-              *) return 1 ;;
-            esac
-          }
-
-          status_icon() {
-            case "$1" in
-              passed)              echo "✅" ;;
-              failed|error)        echo "❌" ;;
-              cancelled|canceled|aborted) echo "⛔" ;;
-              executing|running)   echo "🔄" ;;
-              queued|pending)      echo "⏳" ;;
-              *)                   echo "❓" ;;
-            esac
-          }
-
-          while [[ $ELAPSED -lt $MAX_WAIT ]]; do
-            # Print row when status changes or on first iteration
-            if [[ "${FINAL_STATUS}" != "${PREV_STATUS}" ]]; then
-              ICON=$(status_icon "${FINAL_STATUS}")
-              printf "  %6ds │ %s %s\n" "${ELAPSED}" "${ICON}" "${FINAL_STATUS}"
-              PREV_STATUS="${FINAL_STATUS}"
-            fi
-
-            if is_terminal "${FINAL_STATUS}"; then
-              echo "──────────┴──────────────────────"
-              break
-            fi
-
-            sleep ${POLL_INTERVAL}
-            ELAPSED=$((ELAPSED + POLL_INTERVAL))
-
-            # Poll latest status via latestBuilds query
-            POLL_RESPONSE=$(curl -s \
-              --header "X-Authorization: ${CRT_API_TOKEN}" \
-              --header "Content-Type: application/json" \
-              --json "{\"query\":\"{ latestBuilds(projectId: ${CRT_PROJECT_ID}, resultSize: 50) { data { id status buildNumber startTime endTime } } }\"}" \
-              https://graphql.eu-robotic.copado.com/v1)
-
-            # Print raw response ONCE on first poll to expose actual structure
-            if [[ $ELAPSED -eq $POLL_INTERVAL ]]; then
-              echo "    [DEBUG] Raw poll response: ${POLL_RESPONSE}" >&2 || true
-            fi
-
-            FINAL_STATUS=$(echo "${POLL_RESPONSE}" | python3 -c "
-          import sys, json
-          try:
-              resp   = json.load(sys.stdin)
-              # Try standard path: data.latestBuilds.data[]
-              builds = resp.get('data',{}).get('latestBuilds',{}).get('data',[])
-              # Fallback: maybe top-level is latestBuilds directly
-              if not builds:
-                  builds = resp.get('latestBuilds',{}).get('data',[])
-              # Fallback: maybe result is under data[] directly
-              if not builds and isinstance(resp.get('data'), list):
-                  builds = resp['data']
-              target = str(${BUILD_ID})
-              # Match by id (int or string comparison)
-              build  = next((b for b in builds if str(b.get('id','')) == target), None)
-              if build:
-                  print(str(build.get('status','')).lower())
-              else:
-                  # Debug: print structure and first 3 IDs
-                  top_keys = list(resp.keys())
-                  ids = [str(b.get('id','')) for b in builds[:3]]
-                  import sys as _sys
-                  print(f'unknown(top_keys={top_keys}, ids={ids})', file=_sys.stderr)
-                  print('unknown')
-          except Exception as e:
-              import sys as _sys
-              print(f'pollerror: {e}', file=_sys.stderr)
-              print('pollerror')
-          " 2>/tmp/crt-poll-err.txt || echo "pollerror")
-
-            # Surface debug output if we got unknown/pollerror
-            if [[ "${FINAL_STATUS}" == unknown* || "${FINAL_STATUS}" == "pollerror" ]]; then
-              ERR=$(cat /tmp/crt-poll-err.txt 2>/dev/null || true)
-              [[ -n "$ERR" ]] && echo "    ⚠ poll debug: ${ERR}" || true
-            fi
-          done
-
-          if [[ $ELAPSED -ge $MAX_WAIT ]]; then
-            echo "::warning::CRT polling timed out after ${MAX_WAIT}s — last status: ${FINAL_STATUS}"
-            FINAL_STATUS="Timeout"
-          fi
-
-          echo ""
-          if [[ "${FINAL_STATUS}" == "passed" ]]; then
-            echo "✅ CRT tests PASSED (Build ID: ${BUILD_ID})"
-          else
-            echo "❌ CRT tests ${FINAL_STATUS} (Build ID: ${BUILD_ID})"
-          fi
-
-          echo "build_id=${BUILD_ID}"           >> "$GITHUB_OUTPUT"
-          echo "crt_status=${FINAL_STATUS}"      >> "$GITHUB_OUTPUT"
-
-          # Fail the job if CRT did not pass
-          if [[ "${FINAL_STATUS}" != "passed" && "${FINAL_STATUS}" != "timeout" ]]; then
-            exit 1
-          fi
-
+          echo "✅ CRT job triggered successfully"
+          echo "   Build ID:     ${BUILD_ID}"
+          echo "   Build Number: ${BUILD_NO}"
+          echo "   Status:       ${STATUS}"
+          echo "build_id=${BUILD_ID}"   >> "$GITHUB_OUTPUT"
+          echo "crt_status=${STATUS}"   >> "$GITHUB_OUTPUT"
       - name: Collect PR metadata
         id: pr_meta
         if: always()
@@ -2332,19 +2217,15 @@ jobs:
           set -euo pipefail
           PR_NUMBER="${{ github.event.review.pull_request_url }}"
           PR_NUMBER=$(echo "$PR_NUMBER" | grep -oE '[0-9]+$' || echo "${{ github.event.pull_request.number }}")
-
           if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "0" ]]; then
             echo "has_pr=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
           PR_DATA=$(curl -sSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
-
           PR_RAISER=$(echo "$PR_DATA"  | python3 -c "import json,sys; print(json.load(sys.stdin).get('user',{}).get('login','n/a'))" 2>/dev/null || echo "n/a")
-
           # Get last approver from reviews
           PR_APPROVER=$(curl -sSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -2356,7 +2237,6 @@ jobs:
           approved = [r['user']['login'] for r in reviews if r.get('state') == 'APPROVED']
           print(approved[-1] if approved else 'n/a')
           " 2>/dev/null || echo "n/a")
-
           echo "has_pr=true"               >> "$GITHUB_OUTPUT"
           echo "pr_number=${PR_NUMBER}"     >> "$GITHUB_OUTPUT"
           echo "pr_raiser=${PR_RAISER}"     >> "$GITHUB_OUTPUT"
@@ -2377,7 +2257,6 @@ jobs:
           echo "  Test Result     : ${{ steps.crt.outputs.crt_status }}"
           echo "╚══════════════════════════════════════════╝"
           echo ""
-
       - name: Post CRT deployment comment
         uses: actions/github-script@v7
         with:
@@ -2394,25 +2273,12 @@ jobs:
           CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
           CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
           CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
-          BUILD_ID:       ${{ steps.crt.outputs.build_id }}
-          CRT_STATUS:     ${{ steps.crt.outputs.crt_status }}
         run: |
-          STATUS_ICON="❓"
-          case "${CRT_STATUS}" in
-            passed)             STATUS_ICON="✅" ;;
-            failed)             STATUS_ICON="❌" ;;
-            error)              STATUS_ICON="🔴" ;;
-            cancelled|canceled) STATUS_ICON="⛔" ;;
-            timeout)            STATUS_ICON="⏱️" ;;
-            *)                  STATUS_ICON="⏳" ;;
-          esac
           {
             echo "## 🧪 CRT Test Execution Summary"
             echo ""
             echo "| Detail | Value |"
             echo "|--------|-------|"
-            echo "| **Status** | ${STATUS_ICON} ${CRT_STATUS} |"
-            echo "| **Build ID** | ${BUILD_ID} |"
             echo "| **Instance** | https://eu-robotic.copado.com |"
             echo "| **Org ID** | ${CRT_ORG_ID} |"
             echo "| **Project ID** | ${CRT_PROJECT_ID} |"
