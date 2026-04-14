@@ -16,3 +16,12 @@ UserCreation
     TypeText                    Username                    mukeshrana1909.8b565d512db3@agentforce.com             delay=1
     TypeSecret                  Password                    Salesforce@032026
     ClickText                   Log In
+
+    LaunchApp    Contacts
+    ClickText    New                        partial_match=False
+    UseModal    On
+    PickList    Salutation    Mr.
+    TypeText    First Name    Test 1
+    TypeText    Last Name    User
+    ClickText    Save    partial_match=False
+    UseModal    Off
