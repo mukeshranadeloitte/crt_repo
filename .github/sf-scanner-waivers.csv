@@ -29,3 +29,4 @@ ApexDoc,DeploySmokeCheck.cls,,3,15-04-2026,Missing ApexDoc on public methods - c
 ApexCRUDViolation,AccountUtilityService.cls,,3,19-04-2026,Missing ApexDoc on public methods - comments will be added by April 17 2026. Tracked in PROJ-003.,chorevathi-deloitte,07-03-2026,PROJ-003,ACTIVE
 IfStmtsMustUseBraces,CoverageDemoService.cls,,3,2026-05-14,Violation waived,mukeshranadeloitte,2026-04-14,JIRA-0004,ACTIVE
 ApexAssertionsShouldIncludeMessage,CoverageDemoServiceTest.cls,,3,2026-05-14,Violation waived,mukeshranadeloitte,2026-04-14,JIRA-005,ACTIVE
+ApexAssertionsShouldIncludeMessage,SmokeTestPingResourceTest.cls,,3,2026-05-14,Temp Waiver,chorevathi-deloitte,2026-04-14,JIRA-006,ACTIVE
