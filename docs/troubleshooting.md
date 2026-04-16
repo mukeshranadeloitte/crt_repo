@@ -122,7 +122,7 @@ deploy_cmd+=(--test-level AllLocalTests)
 
 **Cause:** Invalid or expired `CRT_PAT` token, or wrong auth header format.
 
-**Fix:** Regenerate the External Personal Access Token in Copado EU Robotic and update the `CRT_PAT` secret.
+**Fix:** Regenerate the External Personal Access Token in Copado EU Robotic and update the `CRT_API_TOKEN` secret.
 
 ### `CRT API call failed with HTTP 500 — Could not fetch tokens for access key`
 
@@ -131,7 +131,7 @@ deploy_cmd+=(--test-level AllLocalTests)
 **Fix:**
 1. Confirm you are using the **EU** instance token (eu-robotic.copado.com)
 2. Regenerate the token from the correct Copado org
-3. Update the `CRT_PAT` secret
+3. Update the `CRT_API_TOKEN` secret
 
 ### `2xx but response is not JSON`
 

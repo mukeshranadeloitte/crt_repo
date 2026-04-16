@@ -135,14 +135,82 @@ jobs:
   salesforce-validation:
     name: Salesforce PR validation
     if: ${{ github.event_name == 'pull_request' }}
+    needs: [setup]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     outputs:
       has_delta: ${{ steps.delta.outputs.has_delta }}
     steps:
+      - name: Request PR reviewers and notify
+        # Run on every PR event (open, reopen, push/sync, ready_for_review)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          REVIEWERS=("ss10del" "chorevathi-deloitte")
+          REPO="${{ github.repository }}"
+
+          # Filter out the PR author (cannot request review from yourself)
+          ELIGIBLE=()
+          for r in "${REVIEWERS[@]}"; do
+            if [[ "$r" != "$PR_AUTHOR" ]]; then
+              ELIGIBLE+=("$r")
+            fi
+          done
+
+          if [[ "${#ELIGIBLE[@]}" -eq 0 ]]; then
+            echo "All designated reviewers are the PR author — skipping reviewer request."
+            exit 0
+          fi
+
+          # Build JSON array of eligible reviewers
+          REVIEWERS_JSON=$(printf '%s\n' "${ELIGIBLE[@]}" | jq -R . | jq -s .)
+
+          echo "Requesting review from: ${ELIGIBLE[*]}"
+          HTTP=$(curl -sSL -w "%{http_code}" -o /tmp/reviewer-response.json \
+            -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
+            -d "{\"reviewers\": ${REVIEWERS_JSON}}")
+
+          if [[ "$HTTP" == "201" ]]; then
+            echo "✅ Reviewer request sent to: ${ELIGIBLE[*]}"
+          else
+            echo "::warning::Failed to request reviewers (HTTP $HTTP):"
+            cat /tmp/reviewer-response.json || true
+          fi
+
+          # Post a review request notification comment
+          REVIEWER_MENTIONS=$(printf '@%s ' "${ELIGIBLE[@]}" | xargs)
+          COMMENT_BODY="👋 ${REVIEWER_MENTIONS} — your review is requested on this PR.
+
+          **PR:** #${PR_NUMBER} — ${{ github.event.pull_request.title }}
+          **Author:** @${PR_AUTHOR}
+          **Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`
+          **Pipeline:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          > ⏳ Automated checks are running. Please review once all checks pass."
+
+          python3 -c "
+          import json
+          body = open('/dev/stdin').read()
+          print(json.dumps({'body': body}))
+          " <<< "$COMMENT_BODY" | curl -sSL -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" > /dev/null
+
+          echo "✅ Review notification comment posted."
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -1061,8 +1129,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   sca-sast-stage:
     name: SCA/SAST Stage
-    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.salesforce-validation.outputs.has_delta == 'true' }}
-    needs: [salesforce-validation]
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+    needs: [setup]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1314,8 +1382,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   checkmarx-sast:
     name: CheckMarx AST Scan
-    if: ${{ github.event_name != 'pull_request_review' && needs.setup.outputs.run-checkmarx == 'true' && needs.sca-sast-stage.result == 'success' }}
-    needs: [setup, sca-sast-stage]
+    if: ${{ github.event_name != 'pull_request_review' && needs.setup.outputs.run-checkmarx == 'true' }}
+    needs: [setup]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1358,8 +1426,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   fortify-sast-dast:
     name: Fortify on Demand Scan
-    if: ${{ github.event_name != 'pull_request_review' && needs.setup.outputs.run-fortify == 'true' && needs.sca-sast-stage.result == 'success' }}
-    needs: [setup, sca-sast-stage]
+    if: ${{ github.event_name != 'pull_request_review' && needs.setup.outputs.run-fortify == 'true' }}
+    needs: [setup]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1498,23 +1566,7 @@ jobs:
           category: fortify-dast
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 7 — Manual Agent Validation (ReleaseGate environment)
-  # Human approval gate after automated governance + SCA pass.
-  # ─────────────────────────────────────────────────────────────────────────────
-  manual-validation:
-    name: Manual Agent Validation (ReleaseGate)
-    if: ${{ github.event_name == 'pull_request' && needs.salesforce-validation.outputs.has_delta == 'true' }}
-    needs: [automated-governance, sca-sast-stage]
-    runs-on: ubuntu-latest
-    environment:
-      name: ReleaseGate
-      url: ${{ github.server_url }}/${{ github.repository }}/blob/main/docs/manual_runbook.md
-    steps:
-      - name: Log approval
-        run: echo "Manual validation complete. Releasing robots."
-
-  # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 8 — Approval + Merge Gate
+  # JOB 7 — Approval + Merge Gate
   # Triggers on PR review approval. Verifies approval is for the latest SHA,
   # checks all required jobs passed (ANY success, not most-recent), then merges.
   # ─────────────────────────────────────────────────────────────────────────────
@@ -2260,6 +2312,45 @@ jobs:
           echo "pr_raiser=${PR_RAISER}"     >> "$GITHUB_OUTPUT"
           echo "pr_approver=${PR_APPROVER}" >> "$GITHUB_OUTPUT"
           echo "run_number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+          # ── Poll build status ──────────────────────────────────────────────
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          FINAL_STATUS="TIMED OUT"
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 30
+
+            STATUS_RESP=$(curl -s \
+              --header "X-Authorization: $TOKEN" \
+              --header "Content-Type: application/json" \
+              --data "$(jq -n --arg q "{ builds(projectId: $PROJECT_ID, jobId: $JOB_ID) { data { id status } } }" '{query: $q}')" \
+              https://graphql.eu-robotic.copado.com/v1)
+
+            STATUS=$(echo "$STATUS_RESP" | jq -r \
+              --argjson bid "$BUILD_ID" \
+              '.data.builds.data // [] | map(select(.id == $bid)) | .[0].status // "UNKNOWN"' \
+              | tr '[:upper:]' '[:lower:]')
+
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS — Status: $STATUS"
+
+            if [ "$STATUS" = "succeeded" ] || [ "$STATUS" = "passed" ] || [ "$STATUS" = "success" ] || [ "$STATUS" = "completed" ]; then
+              FINAL_STATUS="PASSED"
+              break
+            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "error" ] || [ "$STATUS" = "aborted" ]; then
+              FINAL_STATUS="FAILED ($STATUS)"
+              break
+            elif [ "$STATUS" = "executing" ] || [ "$STATUS" = "running" ] || [ "$STATUS" = "pending" ] || [ "$STATUS" = "queued" ]; then
+              echo "Still running..."
+            else
+              echo "Unrecognised status: $STATUS"
+            fi
+          done
+
+          echo "crt_status=$FINAL_STATUS" >> $GITHUB_OUTPUT
+          echo "Final CRT result: $FINAL_STATUS"
+
       - name: Print Job Summary
         if: always() && steps.pr_meta.outputs.has_pr == 'true'
         run: |

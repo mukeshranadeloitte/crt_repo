@@ -1,0 +1,184 @@
+name: Test Result Check and Display
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - my-uat
+
+jobs:
+  trigger-test:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      contents: read
+
+    steps:
+
+      # ── STEP 1 ─ Checkout repository ──────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── STEP 2 ─ Find merged PR by merge_commit_sha ───────────────────────
+      - name: Collect PR Metadata
+        id: pr_meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          COMMIT_SHA="${{ github.sha }}"
+          TARGET_BRANCH="${{ github.ref_name }}"
+
+          echo "🔍 Looking for a merged PR whose merge_commit_sha = $COMMIT_SHA"
+
+          PR_DATA=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/pulls?state=closed&base=$TARGET_BRANCH&per_page=20")
+
+          PR_NUMBER=$(echo "$PR_DATA" | jq -r \
+            --arg sha "$COMMIT_SHA" \
+            '.[] | select(.merged_at != null and .merge_commit_sha == $sha) | .number' \
+            | head -1)
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No merged PR found — treating as direct push. Skipping CRT."
+            echo "has_pr=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found PR #$PR_NUMBER merged via commit $COMMIT_SHA"
+          echo "has_pr=true"          >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "run_number=${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+          MATCHED_PR=$(echo "$PR_DATA" | jq \
+            --arg sha "$COMMIT_SHA" \
+            '.[] | select(.merged_at != null and .merge_commit_sha == $sha)')
+
+          PR_RAISER=$(echo "$MATCHED_PR" | jq -r '.user.login // "unknown"')
+          echo "pr_raiser=$PR_RAISER" >> $GITHUB_OUTPUT
+
+          APPROVER=$(curl -sf \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            | jq -r '[.[] | select(.state=="APPROVED")] | last | .user.login // "No approver found"')
+          echo "pr_approver=$APPROVER" >> $GITHUB_OUTPUT
+
+      # ── STEP 3 ─ Trigger CRT job via GraphQL ──────────────────────────────
+      - name: Trigger and Poll CRT Job
+        id: crt
+        if: steps.pr_meta.outputs.has_pr == 'true'
+        run: |
+          echo "build_id=N/A"       >> $GITHUB_OUTPUT
+          echo "build_num=N/A"      >> $GITHUB_OUTPUT
+          echo "crt_status=NOT RUN" >> $GITHUB_OUTPUT
+
+          PROJECT_ID="${{ secrets.CRT_PROJECT_ID }}"
+          JOB_ID="${{ secrets.CRT_TEST_JOB_ID }}"
+          TOKEN="${{ secrets.CRT_API_TOKEN }}"
+
+          echo "PROJECT_ID=$PROJECT_ID"
+          echo "JOB_ID=$JOB_ID"
+
+          if [ -z "$PROJECT_ID" ] || [ -z "$JOB_ID" ] || [ -z "$TOKEN" ]; then
+            echo "Missing required secrets"
+            echo "crt_status=CONFIG ERROR" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          if ! [[ "$PROJECT_ID" =~ ^[0-9]+$ ]]; then
+            echo "PROJECT_ID must be numeric"
+            exit 1
+          fi
+
+          if ! [[ "$JOB_ID" =~ ^[0-9]+$ ]]; then
+            echo "JOB_ID must be numeric"
+            exit 1
+          fi
+
+          echo "--- Triggering CRT build ---"
+
+          QUERY="mutation { createBuild(projectId: $PROJECT_ID, jobId: $JOB_ID) { message data { id buildNumber status startTime } } }"
+          PAYLOAD=$(jq -n --arg q "$QUERY" '{query: $q}')
+
+          echo "----- GraphQL Query -----"
+          echo "$QUERY"
+          echo "-------------------------"
+
+          RESPONSE=$(curl -s \
+            --header "X-Authorization: $TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "$PAYLOAD" \
+            https://graphql.eu-robotic.copado.com/v1)
+
+          echo "Trigger response: $RESPONSE"
+
+          if echo "$RESPONSE" | jq -e '.errors' > /dev/null; then
+            echo "GraphQL returned errors"
+            echo "crt_status=TRIGGER FAILED" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          BUILD_ID=$(echo "$RESPONSE"  | jq -r '.data.createBuild.data.id')
+          BUILD_NUM=$(echo "$RESPONSE" | jq -r '.data.createBuild.data.buildNumber // "N/A"')
+          INIT_STATUS=$(echo "$RESPONSE" | jq -r '.data.createBuild.data.status')
+
+          echo "✅ Build triggered — ID: $BUILD_ID | #$BUILD_NUM | Status: $INIT_STATUS"
+          echo "build_id=$BUILD_ID"   >> $GITHUB_OUTPUT
+          echo "build_num=$BUILD_NUM" >> $GITHUB_OUTPUT
+
+          # ── Poll build status ──────────────────────────────────────────────
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          FINAL_STATUS="TIMED OUT"
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 30
+
+            STATUS_RESP=$(curl -s \
+              --header "X-Authorization: $TOKEN" \
+              --header "Content-Type: application/json" \
+              --data "$(jq -n --arg q "{ builds(projectId: $PROJECT_ID, jobId: $JOB_ID) { data { id status } } }" '{query: $q}')" \
+              https://graphql.eu-robotic.copado.com/v1)
+
+            STATUS=$(echo "$STATUS_RESP" | jq -r \
+              --argjson bid "$BUILD_ID" \
+              '.data.builds.data // [] | map(select(.id == $bid)) | .[0].status // "UNKNOWN"' \
+              | tr '[:upper:]' '[:lower:]')
+
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS — Status: $STATUS"
+
+            if [ "$STATUS" = "succeeded" ] || [ "$STATUS" = "passed" ] || [ "$STATUS" = "success" ] || [ "$STATUS" = "completed" ]; then
+              FINAL_STATUS="PASSED"
+              break
+            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "error" ] || [ "$STATUS" = "aborted" ]; then
+              FINAL_STATUS="FAILED ($STATUS)"
+              break
+            elif [ "$STATUS" = "executing" ] || [ "$STATUS" = "running" ] || [ "$STATUS" = "pending" ] || [ "$STATUS" = "queued" ]; then
+              echo "Still running..."
+            else
+              echo "Unrecognised status: $STATUS"
+            fi
+          done
+
+          echo "crt_status=$FINAL_STATUS" >> $GITHUB_OUTPUT
+          echo "Final CRT result: $FINAL_STATUS"
+
+      # ── STEP 4 ─ Print summary ─────────────────────────────────────────────
+      - name: Print Job Summary
+        if: always() && steps.pr_meta.outputs.has_pr == 'true'
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║        CRT Job Execution Summary         ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "  PR Number       : #${{ steps.pr_meta.outputs.pr_number }}"
+          echo "  Workflow Run #  : ${{ steps.pr_meta.outputs.run_number }}"
+          echo "  PR Raiser       : ${{ steps.pr_meta.outputs.pr_raiser }}"
+          echo "  PR Approver     : ${{ steps.pr_meta.outputs.pr_approver }}"
+          echo "  Test Build ID   : ${{ steps.crt.outputs.build_id }}"
+          echo "  Test Result     : ${{ steps.crt.outputs.crt_status }}"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""

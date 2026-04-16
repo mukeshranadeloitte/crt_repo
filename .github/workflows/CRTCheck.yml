@@ -1,0 +1,34 @@
+name: Trigger Copado Robotic Testing Job
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  trigger-crt-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger CRT Job
+        run: |
+          RESPONSE=$(curl -s \
+            --header "X-Authorization: ${{ secrets.CRT_API_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --json "{\"query\":\"mutation { createBuild(projectId: ${{ secrets.CRT_PROJECT_ID }}, jobId: ${{ secrets.CRT_JOB_ID }}) { message data { id buildNumber status startTime } } }\"}" \
+            https://graphql.eu-robotic.copado.com/v1)
+
+          echo "Response: $RESPONSE"
+
+          if echo "$RESPONSE" | grep -q '"errors"'; then
+            echo "❌ Failed to trigger CRT job"
+            exit 1
+          fi
+
+          BUILD_ID=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['id'])")
+          STATUS=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['status'])")
+
+          echo "✅ CRT Job triggered successfully!"
+          echo "Build ID: $BUILD_ID"
+          echo "Status: $STATUS"

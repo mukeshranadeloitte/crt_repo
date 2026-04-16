@@ -93,20 +93,7 @@ Set these under **Settings → Secrets and variables → Actions → Variables**
 
 ---
 
-## 3. GitHub Environment: ReleaseGate
-
-The `manual-validation` job (Job 7) requires a GitHub **Environment** named `ReleaseGate` to be configured.
-
-1. Go to **Settings → Environments → New environment**
-2. Name it exactly: `ReleaseGate`
-3. Add required reviewers (the people who must approve before deployment)
-4. Optionally set a wait timer
-
-The environment URL points to [manual_runbook.md](./manual_runbook.md).
-
----
-
-## 4. Branch Protection Rules
+## 3. Branch Protection Rules
 
 For the merge gate to work correctly, configure branch protection on `uat`:
 
@@ -124,7 +111,7 @@ For the merge gate to work correctly, configure branch protection on `uat`:
 
 ---
 
-## 5. `pr_packages` Branch — Deployment Package History
+## 4. `pr_packages` Branch — Deployment Package History
 
 After every successful deployment, the pipeline automatically commits a deployment package to the `pr_packages` branch. This branch serves as a permanent audit log of everything deployed.
 
@@ -158,7 +145,7 @@ git show origin/pr_packages -- deploy-pr42-a1b2c3d4e5-20260409T143000Z/deploymen
 
 ---
 
-## 6. DELTA_FROM_COMMIT — Automatic Update
+## 5. DELTA_FROM_COMMIT — Automatic Update
 
 After every successful deployment, the pipeline **automatically updates** `DELTA_FROM_COMMIT` to the deployed commit SHA using the GitHub API via `GH_PAT`.
 
@@ -171,7 +158,7 @@ The deploy job (`deploy-after-merge`) computes its delta FROM using `git rev-par
 
 ---
 
-## 7. Quick Start Checklist
+## 6. Quick Start Checklist
 
 ```
 [ ] Secret CRT_UAT_AUTHURL set to valid SFDX auth URL
@@ -181,7 +168,6 @@ The deploy job (`deploy-after-merge`) computes its delta FROM using `git rev-par
 [ ] Variable ORG_ALIAS set (default: uat)
 [ ] Variable COVERAGE_THRESHOLD set (default: 85)
 [ ] Variable SCA_ENFORCEMENT_MODE set (default: enforce; use off for initial project phase)
-[ ] Environment ReleaseGate created with required reviewers
 [ ] Branch protection configured on uat branch
 [ ] SF scanner waiver file: .github/sf-scanner-waivers.csv committed to main branch
 [ ] (Optional) CheckMarx secrets configured: CX_BASE_URI, CX_TENANT, CX_CLIENT_ID, CX_CLIENT_SECRET
@@ -192,7 +178,7 @@ The deploy job (`deploy-after-merge`) computes its delta FROM using `git rev-par
 
 ---
 
-## 8. No-Delta Behaviour (skip logic)
+## 7. No-Delta Behaviour (skip logic)
 
 When a PR contains no Salesforce component changes (e.g. only workflow YAML or docs changed), the pipeline **automatically skips** expensive steps:
 
@@ -205,7 +191,7 @@ When a PR contains no Salesforce component changes (e.g. only workflow YAML or d
 | `sca-sast-stage` job (npm audit) | `has_delta == false` |
 | `automated-governance` job | `has_delta == false` |
 | `manual-validation` / ReleaseGate | `has_delta == false` |
-| CheckMarx / Fortify jobs | `has_delta == false` (via sca-sast-stage dependency) |
+| CheckMarx / Fortify jobs | Skipped when `CX_CLIENT_SECRET` / `FOD_CLIENT_SECRET` not set (they run from `setup` in parallel, independent of `has_delta`) |
 
 The `has_delta` flag is set by the `Compute Apex delta and infer tests` step in Job 2. It is `true` when either `package/package.xml` or `destructiveChanges/destructiveChanges.xml` contains members.
 

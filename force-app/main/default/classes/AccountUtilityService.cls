@@ -18,6 +18,8 @@ public with sharing class AccountUtilityService {
             return 0;
         }
         
+
+        
         List<Account> accountsToUpdate = [
             SELECT Id, Description
             FROM Account

@@ -74,4 +74,3 @@ private class CoverageDemoServiceTest {
         System.assertEquals(19, CoverageDemoService.computeRiskScore(mediumRisk));
     }
 }
-
