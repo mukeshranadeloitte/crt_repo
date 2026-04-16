@@ -2299,7 +2299,7 @@ jobs:
           echo "crt_status=$FINAL_STATUS" >> $GITHUB_OUTPUT
           echo "Final CRT result: $FINAL_STATUS"
 
-          - name: Print Job Summary
+      - name: Print Job Summary
         if: always() && steps.pr_meta.outputs.has_pr == 'true'
         run: |
           echo ""
