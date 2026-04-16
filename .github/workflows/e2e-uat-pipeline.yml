@@ -2260,7 +2260,46 @@ jobs:
           echo "pr_raiser=${PR_RAISER}"     >> "$GITHUB_OUTPUT"
           echo "pr_approver=${PR_APPROVER}" >> "$GITHUB_OUTPUT"
           echo "run_number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-      - name: Print Job Summary
+
+          # ── Poll build status ──────────────────────────────────────────────
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          FINAL_STATUS="TIMED OUT"
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 30
+
+            STATUS_RESP=$(curl -s \
+              --header "X-Authorization: $TOKEN" \
+              --header "Content-Type: application/json" \
+              --data "$(jq -n --arg q "{ builds(projectId: $PROJECT_ID, jobId: $JOB_ID) { data { id status } } }" '{query: $q}')" \
+              https://graphql.eu-robotic.copado.com/v1)
+
+            STATUS=$(echo "$STATUS_RESP" | jq -r \
+              --argjson bid "$BUILD_ID" \
+              '.data.builds.data // [] | map(select(.id == $bid)) | .[0].status // "UNKNOWN"' \
+              | tr '[:upper:]' '[:lower:]')
+
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS — Status: $STATUS"
+
+            if [ "$STATUS" = "succeeded" ] || [ "$STATUS" = "passed" ] || [ "$STATUS" = "success" ] || [ "$STATUS" = "completed" ]; then
+              FINAL_STATUS="PASSED"
+              break
+            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "error" ] || [ "$STATUS" = "aborted" ]; then
+              FINAL_STATUS="FAILED ($STATUS)"
+              break
+            elif [ "$STATUS" = "executing" ] || [ "$STATUS" = "running" ] || [ "$STATUS" = "pending" ] || [ "$STATUS" = "queued" ]; then
+              echo "Still running..."
+            else
+              echo "Unrecognised status: $STATUS"
+            fi
+          done
+
+          echo "crt_status=$FINAL_STATUS" >> $GITHUB_OUTPUT
+          echo "Final CRT result: $FINAL_STATUS"
+
+          - name: Print Job Summary
         if: always() && steps.pr_meta.outputs.has_pr == 'true'
         run: |
           echo ""
