@@ -76,7 +76,7 @@ flowchart TD
         HARD_GATES["🟢 automated-governance
         1. Authenticate UAT org
         2. Run ALL Apex tests with coverage
-        3. Enforce >= 75% coverage threshold
+        3. Enforce >= COVERAGE_THRESHOLD% (default 85%)
         4. Check for destructive changes XML
         5. Post PR warning if destructive changes found
         6. Run Salesforce Code Analyzer on changed files"]
@@ -90,20 +90,11 @@ flowchart TD
 
     FAN_IN(("All pass?"))
     FAN_IN -->|"❌ Any job failed"| PIPELINE_FAIL(["❌ Pipeline fails\nNo merge or deploy"])
-    FAN_IN -->|"✅ All pass"| MANUAL_VAL
-
-    subgraph JOB7["JOB 7 — Manual Agent Validation (ReleaseGate)"]
-        MANUAL_VAL["👤 manual-validation
-        Pauses at ReleaseGate environment
-        Waits for human approval in GitHub UI
-        Configure reviewers: Settings → Environments → ReleaseGate"]
-    end
-
-    MANUAL_VAL -->|"✅ Approved"| REVIEW_TRIGGER(["👍 Reviewer approves PR\npull_request_review event"])
+    FAN_IN -->|"✅ All pass"| REVIEW_TRIGGER(["👍 Reviewer approves PR\npull_request_review event"])
 
     REVIEW_TRIGGER --> MERGE_GATE
 
-    subgraph JOB8["JOB 8 — Approval + Merge Gate"]
+    subgraph JOB7["JOB 7 — Approval + Merge Gate"]
         MERGE_GATE["🔒 approval-merge-gate
         1. Verify approval is for latest commit SHA (not stale)
         2. Confirm all required checks passed on this SHA
@@ -113,7 +104,7 @@ flowchart TD
 
     MERGE_GATE -->|"✅ Merged"| DEPLOY
 
-    subgraph JOB9["JOB 9 — Deploy After Merge"]
+    subgraph JOB8["JOB 8 — Deploy After Merge"]
         DEPLOY["🚀 deploy-after-merge
         1. Checkout merge commit
         2. Rebuild delta (HEAD^1 → HEAD)
@@ -128,7 +119,7 @@ flowchart TD
 
     DEPLOY -->|"✅ Deployed"| CRT
 
-    subgraph JOB10["JOB 10 — CRT Smoke Tests"]
+    subgraph JOB9["JOB 9 — CRT Smoke Tests"]
         CRT["🤖 trigger-crt-tests
         1. Trigger Copado Robotic Testing job via GraphQL API
         2. Poll build status every 30s until pass/fail/timeout
@@ -139,7 +130,7 @@ flowchart TD
 
     ROLLBACK_TRIGGER(["🔧 workflow_dispatch\naction = rollback"]) --> ROLLBACK
 
-    subgraph JOB11["JOB 11 — Rollback"]
+    subgraph JOB10["JOB 10 — Rollback"]
         ROLLBACK["🔄 rollback
         1. Validate rollback_commit_sha provided
         2. Build forward delta (what was deployed by the PR)
@@ -208,15 +199,14 @@ flowchart LR
 |---|----------|--------------|------------|---------------|
 | 1 | Evaluate Scanner Availability | PR, dispatch | — | Not pull_request_review |
 | 2 | Salesforce PR Validation | PR | setup | pull_request event |
-| 3 | SCA/SAST Stage | PR, dispatch | setup | pull_request or workflow_dispatch |
+| 3 | SCA/SAST Stage | PR, dispatch | setup | pull_request or workflow_dispatch (parallel with Job 2) |
 | 4 | Automated Hard Gates | PR | salesforce-validation | pull_request + has_delta=true |
-| 5 | CheckMarx AST Scan | PR, dispatch | setup | run-checkmarx=true (CX secret present) |
-| 6 | Fortify FoD Scan | PR, dispatch | setup | run-fortify=true (FOD secret present) |
-| 7 | Manual Agent Validation | PR | Jobs 2,3,4,5,6 (all) | All pass + has_delta=true |
-| 8 | Approval + Merge Gate | PR review | — | pull_request_review + approved |
-| 9 | Deploy After Merge | PR review | approval-merge-gate | merged=true |
-| 10 | Trigger CRT Tests | PR review | deploy-after-merge | deploy result=success |
-| 11 | Rollback | dispatch | — | action=rollback |
+| 5 | CheckMarx AST Scan | PR, dispatch | setup | run-checkmarx=true (CX secret present, parallel) |
+| 6 | Fortify FoD Scan | PR, dispatch | setup | run-fortify=true (FOD secret present, parallel) |
+| 7 | Approval + Merge Gate | PR review | — | pull_request_review + approved |
+| 8 | Deploy After Merge | PR review | approval-merge-gate | merged=true |
+| 9 | Trigger CRT Tests | PR review | deploy-after-merge | deploy result=success |
+| 10 | Rollback | dispatch | — | action=rollback |
 
 ---
 

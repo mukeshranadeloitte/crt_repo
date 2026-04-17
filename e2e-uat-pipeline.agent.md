@@ -79,35 +79,32 @@ env:
 pull_request ──────────────────────────────────────────────────
 │
 ├─► [1] setup              (outputs: run-checkmarx, run-fortify)
+│         │
+│    ┌────┼──────────────────────────────────────┐
+│    ▼    ▼                    ▼                  ▼
+│  [2] salesforce   [3] sca-sast-stage  [5] checkmarx-sast
+│      -validation  (npm audit)         [6] fortify-sast-dast
+│         │  [if has_delta]
+│         ▼
+│    [4] automated-governance
 │
-└─► [2] salesforce-validation  (outputs: has_delta)
-          │  [skips if no delta]
-          ├──────────────────────────────────────────────────
-          ▼  [only if has_delta == true]
-    ┌─────────────────────────────────────┐
-    │ [3] sca-sast-stage (npm audit)      │
-    │ [4] automated-governance            │
-    └──────────┬──────────────────────────┘
-               ▼
-        [5] checkmarx-sast  [6] fortify-sast-dast
-               ▼
-        [7] manual-validation (ReleaseGate)
+│ (All of 2,3,4,5,6 must pass — reviewer then approves PR)
 
 pull_request_review (APPROVED) ────────────────────────────────
 │
-├─► [8] approval-merge-gate
+├─► [7] approval-merge-gate
 │         │
 │         ▼
-│   [9] deploy-after-merge
+│   [8] deploy-after-merge
 │         │ ─ build deployment package → pr_packages branch
 │         │ ─ update DELTA_FROM_COMMIT via GH_PAT
 │         │
 │         ▼
-│   [10] trigger-crt-tests
+│   [9] trigger-crt-tests
 
 workflow_dispatch (action=rollback) ───────────────────────────
 │
-└─► [11] rollback  (inverts last deployment delta)
+└─► [10] rollback  (inverts last deployment delta)
 ```
 
 ---
@@ -152,35 +149,30 @@ workflow_dispatch (action=rollback) ──────────────�
 > **Key design:** SCA and deployment steps skip entirely when no Salesforce components changed. Scanner violations never block the job (`continue-on-error: true`). All SCA steps are gated on `SCA_ENFORCEMENT_MODE != 'off'`.
 
 ### Job 3 — `sca-sast-stage`: SCA/SAST Stage
-- **Needs:** `salesforce-validation`
-- **Condition:** `has_delta == true`
+- **Needs:** `setup` (runs in **parallel** with Job 2)
+- **Condition:** `pull_request` or `workflow_dispatch`
 - **Steps:** npm audit → check `.github/sca-waivers.json` → FAIL on unwaived vulnerabilities
 
 ### Job 4 — `automated-governance`: Automated Hard Gates
 - **Needs:** `salesforce-validation`
 - **Condition:** `has_delta == true`
-- **Steps:** checkout → install CLI → auth → Apex tests with coverage → enforce 75% minimum → check/warn destructive changes → targeted SCA scan
+- **Steps:** checkout → install CLI → auth → Apex tests with coverage → enforce `$COVERAGE_THRESHOLD` minimum (default 85%) → check/warn destructive changes → targeted SCA scan
 
 ### Job 5 — `checkmarx-sast`: CheckMarx AST Scan
-- **Needs:** `setup`, `sca-sast-stage`
+- **Needs:** `setup` (runs in **parallel** with Jobs 2 & 3)
 - **Condition:** `needs.setup.outputs.run-checkmarx == 'true'`
 - **Secrets:** `CX_BASE_URI`, `CX_TENANT`, `CX_CLIENT_ID`, `CX_CLIENT_SECRET`
 
 ### Job 6 — `fortify-sast-dast`: Fortify SAST + optional DAST
-- **Needs:** `setup`, `sca-sast-stage`
+- **Needs:** `setup` (runs in **parallel** with Jobs 2, 3 & 5)
 - **Condition:** `needs.setup.outputs.run-fortify == 'true'`
 - **Secrets/Vars:** `FOD_URL`, `FOD_CLIENT_ID`, `FOD_CLIENT_SECRET`, `FOD_APP_NAME`, `FOD_RELEASE_NAME`
 
-### Job 7 — `manual-validation`: ReleaseGate (Manual Approval)
-- **Needs:** `automated-governance`, `sca-sast-stage`
-- **Condition:** `has_delta == true`
-- **Environment:** `ReleaseGate` (configured reviewers must approve)
-
-### Job 8 — `approval-merge-gate`: Approval + Merge Gate
+### Job 7 — `approval-merge-gate`: Approval + Merge Gate
 - **Runs on:** `pull_request_review` (state=approved)
 - Verifies approval freshness, merges PR, outputs `merge_commit_sha`
 
-### Job 9 — `deploy-after-merge`: Deploy to UAT
+### Job 8 — `deploy-after-merge`: Deploy to UAT
 - **Needs:** `approval-merge-gate`
 - **Permissions:** `contents: write`
 - Steps:
@@ -193,7 +185,7 @@ workflow_dispatch (action=rollback) ──────────────�
   7. Commit package to `pr_packages` branch (auto-created orphan on first run)
   8. Update `DELTA_FROM_COMMIT` via GitHub API (`PATCH /actions/variables/DELTA_FROM_COMMIT`) — saved for rollback reference and as fallback for next delta
 
-### Job 10 — `trigger-crt-tests`: Trigger CRT Smoke Tests
+### Job 9 — `trigger-crt-tests`: Trigger CRT Smoke Tests
 - **Needs:** `deploy-after-merge`
 - **API:** `POST https://graphql.eu-robotic.copado.com/v1`
 - **Auth:** `X-Authorization: ${CRT_API_TOKEN}` header
@@ -204,7 +196,7 @@ workflow_dispatch (action=rollback) ──────────────�
 - **Step `Print Job Summary`** (`if: always() && has_pr == 'true'`): box with PR#, Run#, PR Raiser, PR Approver, Test Build ID, Test Result
 - Posts result PR comment + GitHub Step Summary (final CRT status icon + Build ID) with CRT dashboard link
 
-### Job 11 — `rollback`: Rollback Deployment
+### Job 10 — `rollback`: Rollback Deployment
 - **Trigger:** `workflow_dispatch` with `action=rollback`
 - **Input:** `rollback_commit_sha` — the SHA to revert TO
 - **Logic:**

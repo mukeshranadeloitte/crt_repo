@@ -60,8 +60,8 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
 - **Key:** All SCA steps are gated on `vars.SCA_ENFORCEMENT_MODE != 'off'`. In `warn` mode, nothing fails.
 
 **Job 3 — `sca-sast-stage`**: SCA/SAST Stage (npm audit)
-- `needs: [salesforce-validation]`
-- **Condition:** `needs.salesforce-validation.outputs.has_delta == 'true'`
+- `needs: [setup]` (runs in **parallel** with Jobs 2, 5, 6)
+- **Condition:** `pull_request` or `workflow_dispatch`
 - Runs `npm audit --json`, checks against `.github/sca-waivers.json`, fails on unwaived/expired violations
 
 **Job 4 — `automated-governance`**: Automated Hard Gates
@@ -70,21 +70,16 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
 - Full Apex test suite with coverage (75% minimum), destructive changes check + PR comment, targeted SCA
 
 **Job 5 — `checkmarx-sast`**: CheckMarx AST Scan
-- `needs: [setup, sca-sast-stage]`, conditional on `run-checkmarx == 'true'`
+- `needs: [setup]` (runs in **parallel** with Jobs 2, 3, 6), conditional on `run-checkmarx == 'true'`
 
 **Job 6 — `fortify-sast-dast`**: Fortify SAST + optional DAST
-- `needs: [setup, sca-sast-stage]`, conditional on `run-fortify == 'true'`
+- `needs: [setup]` (runs in **parallel** with Jobs 2, 3, 5), conditional on `run-fortify == 'true'`
 
-**Job 7 — `manual-validation`**: Manual ReleaseGate Approval
-- `needs: [automated-governance, sca-sast-stage]`
-- **Condition:** `needs.salesforce-validation.outputs.has_delta == 'true'`
-- Uses GitHub environment `ReleaseGate` with required reviewers
-
-**Job 8 — `approval-merge-gate`**: Approval + Merge Gate
+**Job 7 — `approval-merge-gate`**: Approval + Merge Gate
 - Triggers on `pull_request_review` (state=approved)
 - Verifies approval freshness, merges PR, outputs `merge_commit_sha`
 
-**Job 9 — `deploy-after-merge`**: Deploy to UAT
+**Job 8 — `deploy-after-merge`**: Deploy to UAT
 - `needs: [approval-merge-gate]`, `permissions: contents: write`
 - Steps:
   1. Build delta package: `id: delta_pkg` — uses `git rev-parse HEAD^1` (merge parent = UAT branch tip before PR merged) as FROM for `sfdx-git-delta`. Exports `merge_base` output. Falls back to `DELTA_FROM_COMMIT` only if `HEAD^1` is unavailable (shallow clone).
@@ -94,7 +89,7 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
   5. Commit package folder to `pr_packages` orphan branch
   6. Update `DELTA_FROM_COMMIT` via GitHub API (saved for rollback reference + fallback): `curl -L -X PATCH -H "Authorization: Bearer ${GH_PAT}" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/{repo}/actions/variables/DELTA_FROM_COMMIT -d '{"name":"DELTA_FROM_COMMIT","value":"<sha>"}'`
 
-**Job 10 — `trigger-crt-tests`**: CRT Smoke Tests
+**Job 9 — `trigger-crt-tests`**: CRT Smoke Tests
 - `needs: [deploy-after-merge]`
 - GraphQL API: `POST https://graphql.eu-robotic.copado.com/v1` with `X-Authorization: ${CRT_API_TOKEN}`
 - Mutation: `createBuild(projectId: <id>, jobId: <id>)` — triggers the build
@@ -117,7 +112,7 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
   ```
 - Posts result PR comment + GitHub Step Summary (with final CRT status icon + Build ID) with CRT dashboard link
 
-**Job 11 — `rollback`**: Rollback Deployment
+**Job 10 — `rollback`**: Rollback Deployment
 - Triggers on `workflow_dispatch` with `action=rollback`
 - Input: `rollback_commit_sha` — the SHA to revert TO
 - Uses `sfdx-git-delta` in reverse: new metadata treated as destructive
@@ -190,7 +185,6 @@ JSON array for npm audit waivers:
 ### `docs/pipeline-setup.md`
 - All required secrets (with descriptions + how to create GH_PAT)
 - All required variables (with defaults)
-- GitHub environment `ReleaseGate` setup
 - Branch protection rules
 - `pr_packages` branch description
 - DELTA_FROM_COMMIT auto-update explanation
