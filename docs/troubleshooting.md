@@ -30,9 +30,9 @@ Common errors encountered in the UAT End-to-End pipeline and how to resolve them
 
 ### `Deploy validation failed — CoverageDemoService - Test coverage 35%, at least 75% required`
 
-**Cause:** The Salesforce platform enforces a minimum 75% test coverage per deployed Apex class. This is a platform-level requirement, not just a workflow setting.
+**Cause:** The Salesforce platform enforces a minimum test coverage per deployed Apex class. The workflow also enforces `COVERAGE_THRESHOLD` (default: **85%**) — both platform minimum and your threshold must be met.
 
-**Fix — Option A (preferred):** Add or improve tests for `CoverageDemoService` until coverage reaches ≥ 75%.
+**Fix — Option A (preferred):** Add or improve tests for `CoverageDemoService` until coverage reaches ≥ `COVERAGE_THRESHOLD` (default 85%).
 
 **Fix — Option B (temporary):** Change test level to `AllLocalTests` in the validate step. This runs all tests in the org, which typically satisfies aggregate coverage. Update the workflow's deploy step:
 ```yaml
@@ -120,7 +120,7 @@ deploy_cmd+=(--test-level AllLocalTests)
 
 ### `CRT API call failed with HTTP 401`
 
-**Cause:** Invalid or expired `CRT_PAT` token, or wrong auth header format.
+**Cause:** Invalid or expired `CRT_API_TOKEN` token, or wrong auth header format. The CRT API uses `X-Authorization: <token>` (not `Bearer`).
 
 **Fix:** Regenerate the External Personal Access Token in Copado EU Robotic and update the `CRT_API_TOKEN` secret.
 
@@ -159,6 +159,14 @@ deploy_cmd+=(--test-level AllLocalTests)
 1. Run `npm audit` locally and review the findings
 2. Update the vulnerable package: `npm update <package>`
 3. If the vulnerability is a false positive or has no fix, add an `.npmrc` audit exception or use `npm audit --omit=dev` if the vulnerability is only in dev dependencies
+
+---
+
+### `npm error ENOENT` — no such file or directory (package.json)
+
+**Cause:** The project has no `package.json`. This happens when using the pipeline in a Salesforce project that was not originally set up as a Node.js project.
+
+**Resolution:** The pipeline **automatically creates** a standard Salesforce `package.json` (with eslint, prettier, sfdx-lwc-jest, husky, lint-staged) if one doesn't exist before running `npm install`. No action required — this is built in to Jobs 2, 3, 8, and 10.
 
 ---
 

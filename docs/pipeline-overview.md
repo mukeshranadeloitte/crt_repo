@@ -27,17 +27,17 @@ pull_request (force-app/**)
 
 pull_request_review (APPROVED)
         │
-        └──► [8] approval-merge-gate
+        └──► [7] approval-merge-gate
                         │
                         ▼
-                [9] deploy-after-merge
+                [8] deploy-after-merge
                         │
                         ▼
-                [10] trigger-crt-tests
+                [9] trigger-crt-tests
 
 workflow_dispatch (action=rollback)
         │
-        └──► [11] rollback
+        └──► [10] rollback
 ```
 
 ---

@@ -68,7 +68,7 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
 **Job 4 — `automated-governance`**: Automated Hard Gates
 - `needs: [salesforce-validation]`
 - **Condition:** `needs.salesforce-validation.outputs.has_delta == 'true'`
-- Full Apex test suite with coverage (75% minimum), destructive changes check + PR comment, targeted SCA
+- Full Apex test suite with coverage (`$COVERAGE_THRESHOLD` minimum, default 85%), destructive changes check + PR comment, targeted SCA
 
 **Job 5 — `checkmarx-sast`**: CheckMarx AST Scan
 - `needs: [setup]` (runs in **parallel** with Jobs 2, 3, 6), conditional on `run-checkmarx == 'true'`
@@ -129,12 +129,15 @@ CSV file on **main branch only**. The pipeline always fetches from main via GitH
 rule,file_pattern,message_contains,severity_threshold,expiry,reason,approved_by,approved_date,ticket,status
 ApexDoc,MyClass.cls,,3,10-05-2026,Reason here. Tracked in PROJ-123.,jane-techlead,10-04-2026,PROJ-123,ACTIVE
 *,MyLegacyClass.cls,,3,10-05-2026,Global component waiver — rewrite in progress. Tracked in PROJ-999.,jane-techlead,10-04-2026,PROJ-999,ACTIVE
+ApexDoc,*,,3,10-05-2026,Global rule waiver — ApexDoc deferred for sprint. Tracked in PROJ-998.,jane-techlead,10-04-2026,PROJ-998,ACTIVE
+*,myLWCComponent,,3,10-05-2026,Global LWC component waiver — ESLint refactor in progress. Tracked in PROJ-997.,jane-techlead,10-04-2026,PROJ-997,ACTIVE
+no-unused-vars,/lwc/,,3,10-05-2026,Global rule for all LWC files. Tracked in PROJ-996.,jane-techlead,10-04-2026,PROJ-996,ACTIVE
 ```
 
 | Column | Required | Description |
 |--------|----------|-------------|
 | `rule` | ✅ | Rule name substring match. **Blank or `*` = global component waiver (waives ALL rules for that file/LWC).** |
-| `file_pattern` | ✅ | Filename substring match (e.g. `MyClass.cls` or `myLWC`) |
+| `file_pattern` | ✅ | Filename substring match (e.g. `MyClass.cls`, `myLWC`, `/lwc/`). **Blank or `*` = global rule waiver (waives this rule for ALL files).** |
 | `message_contains` | ⬜ | Optional substring of violation message to narrow match |
 | `severity_threshold` | ⬜ | Only waive at this severity or above (blank = any) |
 | `expiry` | ✅ | DD-MM-YYYY preferred; also accepts DD/MM/YYYY and YYYY-MM-DD |
@@ -207,7 +210,7 @@ JSON array for npm audit waivers:
 - Part 2: npm SCA waivers (schema, governance)
 
 ### `docs/manual_runbook.md`
-- Manual trigger guide, ReleaseGate approval steps
+- PR review and deployment approver guide — PR review approval is the single human gate before deployment (no ReleaseGate)
 - Rollback procedure: find SHA, trigger workflow_dispatch with action=rollback
 - What rollback does (new metadata → destructive, modified → re-deployed, deleted → restored)
 

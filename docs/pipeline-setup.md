@@ -190,7 +190,6 @@ When a PR contains no Salesforce component changes (e.g. only workflow YAML or d
 | Scanner waiver check + CSV report | `has_delta == false` |
 | `sca-sast-stage` job (npm audit) | `has_delta == false` |
 | `automated-governance` job | `has_delta == false` |
-| `manual-validation` / ReleaseGate | `has_delta == false` |
 | CheckMarx / Fortify jobs | Skipped when `CX_CLIENT_SECRET` / `FOD_CLIENT_SECRET` not set (they run from `setup` in parallel, independent of `has_delta`) |
 
 The `has_delta` flag is set by the `Compute Apex delta and infer tests` step in Job 2. It is `true` when either `package/package.xml` or `destructiveChanges/destructiveChanges.xml` contains members.
