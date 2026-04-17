@@ -127,12 +127,13 @@ CSV file on **main branch only**. The pipeline always fetches from main via GitH
 ```
 rule,file_pattern,message_contains,severity_threshold,expiry,reason,approved_by,approved_date,ticket,status
 ApexDoc,MyClass.cls,,3,10-05-2026,Reason here. Tracked in PROJ-123.,jane-techlead,10-04-2026,PROJ-123,ACTIVE
+*,MyLegacyClass.cls,,3,10-05-2026,Global component waiver — rewrite in progress. Tracked in PROJ-999.,jane-techlead,10-04-2026,PROJ-999,ACTIVE
 ```
 
 | Column | Required | Description |
 |--------|----------|-------------|
-| `rule` | ✅ | Rule name substring match |
-| `file_pattern` | ✅ | Filename substring match |
+| `rule` | ✅ | Rule name substring match. **Blank or `*` = global component waiver (waives ALL rules for that file/LWC).** |
+| `file_pattern` | ✅ | Filename substring match (e.g. `MyClass.cls` or `myLWC`) |
 | `message_contains` | ⬜ | Optional substring of violation message to narrow match |
 | `severity_threshold` | ⬜ | Only waive at this severity or above (blank = any) |
 | `expiry` | ✅ | DD-MM-YYYY preferred; also accepts DD/MM/YYYY and YYYY-MM-DD |
@@ -143,6 +144,7 @@ ApexDoc,MyClass.cls,,3,10-05-2026,Reason here. Tracked in PROJ-123.,jane-techlea
 | `status` | ✅ | `ACTIVE` or `REVOKED` (keep revoked rows for audit trail — never delete) |
 
 Comment rows starting with `#` are ignored.
+**Component-level global waiver:** set `rule` to blank or `*` — pipeline logs `✅ GLOBAL COMPONENT WAIVER` for every violation in that file. Same expiry enforcement applies.
 Status values: `WAIVED` (active, >30d), `WAIVED_EXPIRING_SOON` (≤30d), `VIOLATION` (no waiver), `EXPIRED_WAIVER` (past expiry — fails pipeline in enforce mode).
 Results written to `sca-governance-report.csv` (includes Days_Left, Approved_Date columns).
 

@@ -944,16 +944,23 @@ jobs:
 
                   print(f"  Checking violation: rule='{rule}' file='{os.path.basename(file_path)}'")
 
-                  # Match against waivers: rule substring + file_pattern substring + optional message
+                  # Match against waivers.
+                  # Matching logic:
+                  #   rule:         blank or '*' = match ANY rule (component-level global waiver)
+                  #                 otherwise = substring match (e.g. 'ApexDoc' matches 'ApexDoc')
+                  #   file_pattern: substring match against file path (e.g. 'MyClass.cls')
+                  #   message_contains: optional substring of violation message to narrow match
                   matched = None
                   for w in waivers:
                       w_rule = w.get("rule", "").strip()
                       w_file = w.get("file_pattern", "").strip()
                       w_msg  = w.get("message_contains", "").strip()
-                      rule_match = w_rule and w_rule in rule
+                      # blank rule or '*' = global component waiver (any rule for this file)
+                      rule_match = (not w_rule or w_rule == "*") or (w_rule in rule)
                       file_match = w_file and w_file in file_path
                       msg_match  = (not w_msg) or (w_msg.lower() in problem.lower())
-                      print(f"    vs waiver rule='{w_rule}' file_pattern='{w_file}' → rule_match={rule_match} file_match={file_match} msg_match={msg_match}")
+                      waiver_type = "GLOBAL" if (not w_rule or w_rule == "*") else "RULE"
+                      print(f"    vs waiver [{waiver_type}] rule='{w_rule}' file_pattern='{w_file}' → rule_match={rule_match} file_match={file_match} msg_match={msg_match}")
                       if rule_match and file_match and msg_match:
                           matched = w
                           break
@@ -963,14 +970,16 @@ jobs:
                       days_left = (expiry - TODAY).days
 
                       if TODAY <= expiry:
+                          is_global = not matched.get("rule","").strip() or matched.get("rule","").strip() == "*"
+                          waiver_label = "GLOBAL COMPONENT WAIVER" if is_global else "WAIVED"
                           if days_left <= WARN_DAYS:
                               status = "WAIVED_EXPIRING_SOON"
                               near_expiry += 1
-                              print(f"::warning::⏰ WAIVER EXPIRING IN {days_left}d: [{rule}] {os.path.basename(file_path)}:{line} — expires {matched['expiry']} (ticket: {matched.get('ticket','n/a')})")
+                              print(f"::warning::⏰ {waiver_label} EXPIRING IN {days_left}d: [{rule}] {os.path.basename(file_path)}:{line} — expires {matched['expiry']} (ticket: {matched.get('ticket','n/a')})")
                           else:
                               status = "WAIVED"
                               waived_count += 1
-                              print(f"✅ WAIVED: [{rule}] {os.path.basename(file_path)}:{line} — expires {matched['expiry']} | approved_by: {matched.get('approved_by','n/a')} | ticket: {matched.get('ticket','n/a')}")
+                              print(f"✅ {waiver_label}: [{rule}] {os.path.basename(file_path)}:{line} — expires {matched['expiry']} | approved_by: {matched.get('approved_by','n/a')} | ticket: {matched.get('ticket','n/a')}")
                       else:
                           status = "EXPIRED_WAIVER"
                           expired_count += 1
