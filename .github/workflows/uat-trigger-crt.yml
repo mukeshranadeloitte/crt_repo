@@ -225,25 +225,29 @@ jobs:
 
           RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
 
-          COMMENT_BODY="${STATUS_ICON} CRT Job Execution Summary
+          {
+            echo "${STATUS_ICON} CRT Job Execution Summary"
+            echo ""
+            echo '```'
+            echo "┌─────────────────┬──────────────────────────────────────┐"
+            echo "│ Field           │ Value                                │"
+            echo "├─────────────────┼──────────────────────────────────────┤"
+            echo "│ Repository      │ ${REPO}"
+            echo "│ Branch          │ ${BRANCH}"
+            echo "│ PR Number       │ #${PR_NUMBER}"
+            echo "│ Workflow Run    │ #${RUN_NUMBER}"
+            echo "│ PR Raiser       │ ${PR_RAISER}"
+            echo "│ PR Approver     │ ${APPROVER_DISPLAY}"
+            echo "│ Test Build ID   │ ${BUILD_ID}"
+            echo "│ Test Result     │ ${STATUS_ICON} ${CRT_STATUS}"
+            echo "└─────────────────┴──────────────────────────────────────┘"
+            echo '```'
+            echo ""
+            echo "View full run : ${RUN_URL}"
+            echo "Commit        : ${COMMIT}"
+          } > /tmp/comment_body.txt
 
-\`\`\`
-┌─────────────────┬──────────────────────────────────────┐
-│ Field           │ Value                                │
-├─────────────────┼──────────────────────────────────────┤
-│ Repository      │ ${REPO}
-│ Branch          │ ${BRANCH}
-│ PR Number       │ #${PR_NUMBER}
-│ Workflow Run    │ #${RUN_NUMBER}
-│ PR Raiser       │ ${PR_RAISER}
-│ PR Approver     │ ${APPROVER_DISPLAY}
-│ Test Build ID   │ ${BUILD_ID}
-│ Test Result     │ ${STATUS_ICON} ${CRT_STATUS}
-└─────────────────┴──────────────────────────────────────┘
-\`\`\`
-
-View full run : ${RUN_URL}
-Commit        : ${COMMIT}"
+          COMMENT_BODY=$(cat /tmp/comment_body.txt)
 
           HTTP_CODE=$(curl -s -o /tmp/gh_response.json -w "%{http_code}" \
             -X POST \
