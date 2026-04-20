@@ -10,9 +10,9 @@ jobs:
   trigger-test:
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: write    # ← changed from read (needed to post comments)
+      pull-requests: write
       contents: read
-      issues: write           # ← added (required by the comments API)
+      issues: write
 
     steps:
 
@@ -30,7 +30,7 @@ jobs:
           COMMIT_SHA="${{ github.sha }}"
           TARGET_BRANCH="${{ github.ref_name }}"
 
-          echo "🔍 Looking for a merged PR whose merge_commit_sha = $COMMIT_SHA"
+          echo "Looking for a merged PR whose merge_commit_sha = $COMMIT_SHA"
 
           PR_DATA=$(curl -sf \
             -H "Authorization: Bearer $GH_TOKEN" \
@@ -63,7 +63,7 @@ jobs:
           APPROVER=$(curl -sf \
             -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/reviews" \
-            | jq -r '[.[] | select(.state=="APPROVED")] | last | .user.login // "No approver found"')
+            | jq -r '[.[] | select(.state=="APPROVED")] | last | .user.login // ""')
           echo "pr_approver=$APPROVER" >> $GITHUB_OUTPUT
 
       # ── STEP 3 ─ Trigger CRT job via GraphQL ──────────────────────────────
@@ -125,11 +125,10 @@ jobs:
           BUILD_NUM=$(echo "$RESPONSE" | jq -r '.data.createBuild.data.buildNumber // "N/A"')
           INIT_STATUS=$(echo "$RESPONSE" | jq -r '.data.createBuild.data.status')
 
-          echo "✅ Build triggered — ID: $BUILD_ID | #$BUILD_NUM | Status: $INIT_STATUS"
+          echo "Build triggered — ID: $BUILD_ID | #$BUILD_NUM | Status: $INIT_STATUS"
           echo "build_id=$BUILD_ID"   >> $GITHUB_OUTPUT
           echo "build_num=$BUILD_NUM" >> $GITHUB_OUTPUT
 
-          # ── Poll build status ──────────────────────────────────────────────
           MAX_ATTEMPTS=60
           ATTEMPT=0
           FINAL_STATUS="TIMED OUT"
@@ -141,7 +140,9 @@ jobs:
             STATUS_RESP=$(curl -s \
               --header "X-Authorization: $TOKEN" \
               --header "Content-Type: application/json" \
-              --data "$(jq -n --arg q "{ builds(projectId: $PROJECT_ID, jobId: $JOB_ID) { data { id status } } }" '{query: $q}')" \
+              --data "$(jq -n --arg q \
+                "{ builds(projectId: $PROJECT_ID, jobId: $JOB_ID) { data { id status } } }" \
+                '{query: $q}')" \
               https://graphql.eu-robotic.copado.com/v1)
 
             STATUS=$(echo "$STATUS_RESP" | jq -r \
@@ -151,13 +152,21 @@ jobs:
 
             echo "Attempt $ATTEMPT/$MAX_ATTEMPTS — Status: $STATUS"
 
-            if [ "$STATUS" = "succeeded" ] || [ "$STATUS" = "passed" ] || [ "$STATUS" = "success" ] || [ "$STATUS" = "completed" ]; then
+            if [ "$STATUS" = "succeeded" ] || \
+               [ "$STATUS" = "passed"    ] || \
+               [ "$STATUS" = "success"   ] || \
+               [ "$STATUS" = "completed" ]; then
               FINAL_STATUS="PASSED"
               break
-            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "error" ] || [ "$STATUS" = "aborted" ]; then
+            elif [ "$STATUS" = "failed"  ] || \
+                 [ "$STATUS" = "error"   ] || \
+                 [ "$STATUS" = "aborted" ]; then
               FINAL_STATUS="FAILED ($STATUS)"
               break
-            elif [ "$STATUS" = "executing" ] || [ "$STATUS" = "running" ] || [ "$STATUS" = "pending" ] || [ "$STATUS" = "queued" ]; then
+            elif [ "$STATUS" = "executing" ] || \
+                 [ "$STATUS" = "running"   ] || \
+                 [ "$STATUS" = "pending"   ] || \
+                 [ "$STATUS" = "queued"    ]; then
               echo "Still running..."
             else
               echo "Unrecognised status: $STATUS"
@@ -195,6 +204,11 @@ jobs:
           REPO="${{ github.repository }}"
           PR_RAISER="${{ steps.pr_meta.outputs.pr_raiser }}"
           PR_APPROVER="${{ steps.pr_meta.outputs.pr_approver }}"
+          BUILD_ID="${{ steps.crt.outputs.build_id }}"
+          RUN_NUMBER="${{ steps.pr_meta.outputs.run_number }}"
+          RUN_ID="${{ github.run_id }}"
+          BRANCH="${{ github.ref_name }}"
+          COMMIT="${{ github.sha }}"
 
           case "$CRT_STATUS" in
             PASSED)      STATUS_ICON="✅" ;;
@@ -203,34 +217,46 @@ jobs:
             *)           STATUS_ICON="⚠️"  ;;
           esac
 
-          COMMENT=$(jq -n \
-            --arg body "## ${STATUS_ICON} CRT Job Execution Summary
+          if [ -n "$PR_APPROVER" ]; then
+            APPROVER_DISPLAY="$PR_APPROVER"
+          else
+            APPROVER_DISPLAY="No approver found"
+          fi
 
-          | Field | Value |
-          |---|---|
-          | **Repository** | \`$REPO\` |
-          | **Branch** | \`${{ github.ref_name }}\` |
-          | **PR Number** | #${PR_NUMBER} |
-          | **Workflow Run** | [#${{ steps.pr_meta.outputs.run_number }}](https://github.com/${REPO}/actions/runs/${{ github.run_id }}) |
-          | **PR Raiser** | @${PR_RAISER} |
-          | **PR Approver** | @${PR_APPROVER} |
-          | **Test Build ID** | \`${{ steps.crt.outputs.build_id }}\` |
-          | **Test Result** | ${STATUS_ICON} ${CRT_STATUS} |
+          RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
 
-          > Triggered by merge commit \`${{ github.sha }}\`" \
-            '{body: $body}')
+          COMMENT_BODY="${STATUS_ICON} CRT Job Execution Summary
 
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+\`\`\`
+┌─────────────────┬──────────────────────────────────────┐
+│ Field           │ Value                                │
+├─────────────────┼──────────────────────────────────────┤
+│ Repository      │ ${REPO}
+│ Branch          │ ${BRANCH}
+│ PR Number       │ #${PR_NUMBER}
+│ Workflow Run    │ #${RUN_NUMBER}
+│ PR Raiser       │ ${PR_RAISER}
+│ PR Approver     │ ${APPROVER_DISPLAY}
+│ Test Build ID   │ ${BUILD_ID}
+│ Test Result     │ ${STATUS_ICON} ${CRT_STATUS}
+└─────────────────┴──────────────────────────────────────┘
+\`\`\`
+
+View full run : ${RUN_URL}
+Commit        : ${COMMIT}"
+
+          HTTP_CODE=$(curl -s -o /tmp/gh_response.json -w "%{http_code}" \
             -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
-            -d "$COMMENT")
+            -d "$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')")
 
           if [ "$HTTP_CODE" = "201" ]; then
-            echo "✅ Comment posted on PR #$PR_NUMBER (HTTP $HTTP_CODE)"
-            echo "   GitHub will now email @$PR_RAISER and @$PR_APPROVER automatically"
+            echo "Comment posted on PR #$PR_NUMBER — HTTP $HTTP_CODE"
+            echo "GitHub will email @$PR_RAISER and $APPROVER_DISPLAY automatically"
           else
-            echo "❌ Failed to post comment — HTTP $HTTP_CODE"
+            echo "Failed to post comment — HTTP $HTTP_CODE"
+            cat /tmp/gh_response.json
             exit 1
           fi
