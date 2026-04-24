@@ -176,16 +176,78 @@ deploy_cmd+=(--test-level AllLocalTests)
 
 **Root cause:** The AI agent invented a Python-based waiver checker instead of using the correct pure-bash implementation.
 
-**Resolution:** Delete the generated workflow and re-run the prompt. The updated prompt (rule 9, 10, 12) now explicitly prevents this. If regeneration still produces Python, manually replace the `Run dependency SCA gate with waiver support` step with the pure-bash version from `.github/workflows/e2e-uat-pipeline.yml` in this reference repo. The correct pattern is:
-```bash
-WAIVER_FILE=".github/sca-waivers.json"
-TODAY=$(date -u +%Y-%m-%d)
-npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true
-VULN_COUNT=$(jq '[.vulnerabilities // {} | to_entries[] | .value | select(.severity == "high" or .severity == "critical")] | length' audit-output.json 2>/dev/null || echo 0)
-# ... bash waiver loop using jq (no Python)
+**Immediate fix — replace the broken step in your workflow:**
+
+Find the step named `Run dependency SCA gate with waiver support` (or the step that creates `check-npm-waivers.py`) and replace it entirely with this:
+
+```yaml
+      - name: Run dependency SCA gate with waiver support
+        run: |
+          set -euo pipefail
+          WAIVER_FILE=".github/sca-waivers.json"
+          TODAY=$(date -u +%Y-%m-%d)
+          npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true
+          VULN_COUNT=$(jq '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")] | length' audit-output.json 2>/dev/null || echo 0)
+          if [[ "$VULN_COUNT" -eq 0 ]]; then
+            echo "✅ No high/critical vulnerabilities found."
+            exit 0
+          fi
+          echo "Found $VULN_COUNT high/critical vulnerability/ies. Checking waivers..."
+          WAIVERS="[]"
+          if [[ -f "$WAIVER_FILE" ]]; then
+            WAIVERS=$(jq '.' "$WAIVER_FILE" 2>/dev/null || echo "[]")
+            echo "Loaded waiver file: $WAIVER_FILE"
+          else
+            echo "No waiver file found at $WAIVER_FILE — all violations will be evaluated."
+          fi
+          FAIL=0; WAIVED=0; EXPIRED=0
+          while IFS= read -r vuln_json; do
+            PKG=$(echo "$vuln_json"  | jq -r '.name')
+            SEV=$(echo "$vuln_json"  | jq -r '.severity')
+            GHSA=$(echo "$vuln_json" | jq -r '.via[0].source // .via[0] // "unknown"' 2>/dev/null | head -1)
+            WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires >= $today)] | first // empty')
+            EXPIRED_WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires < $today)] | first // empty')
+            if [[ -n "$WAIVER" && "$WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$WAIVER" | jq -r '.expires')
+              REASON=$(echo "$WAIVER"  | jq -r '.reason')
+              APPROVED=$(echo "$WAIVER"| jq -r '.approved_by // "unknown"')
+              echo "⏳ WAIVED [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Reason: $REASON | Approved by: $APPROVED | Expires: $EXPIRES"
+              WAIVED=$((WAIVED + 1))
+            elif [[ -n "$EXPIRED_WAIVER" && "$EXPIRED_WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$EXPIRED_WAIVER" | jq -r '.expires')
+              REASON=$(echo "$EXPIRED_WAIVER"  | jq -r '.reason')
+              echo "::error::❌ EXPIRED WAIVER [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Waiver expired on $EXPIRES — fix is now required. Reason was: $REASON"
+              EXPIRED=$((EXPIRED + 1))
+              FAIL=1
+            else
+              echo "::error::❌ UNWAIVED [$SEV] $PKG (advisory: $GHSA) — no active waiver found."
+              FAIL=$((FAIL + 1))
+            fi
+          done < <(jq -c '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")][]' audit-output.json 2>/dev/null)
+          echo ""
+          echo "──────────────────────────────────────────"
+          echo "SCA Summary: $VULN_COUNT violation(s) found"
+          echo "  ✅ Waived (active):   $WAIVED"
+          echo "  ❌ Expired waivers:   $EXPIRED"
+          echo "  ❌ Unwaived failures: $((FAIL - EXPIRED))"
+          echo "──────────────────────────────────────────"
+          if [[ "$FAIL" -gt 0 ]]; then
+            echo "To suppress a known violation, add an entry to $WAIVER_FILE:"
+            echo '  { "package": "<pkg>", "severity": "<high|critical>", "reason": "<justification>", "expires": "YYYY-MM-DD", "approved_by": "<team>" }'
+            exit 1
+          fi
+          echo "✅ All violations are covered by active waivers."
 ```
 
-**Never** put bash `if [ ... ]; then` inside a `<< 'HEREDOC'` block — it will be interpreted as code in the target language, not bash.
+**Prevention:** The updated `create-e2e-uat-pipeline.prompt.md` (rules 9, 10, 12, 13) and `e2e-uat-pipeline.agent.md` (Constraints section) now include the full verbatim bash implementation. When regenerating in a new project, the agent must copy this step exactly.
+
+**Rule:** Never put bash `if [ ... ]; then` inside a `<< 'HEREDOC'` block — it will be interpreted as code in the target language, not bash.
 
 ---
 

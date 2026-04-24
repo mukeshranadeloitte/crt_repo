@@ -153,6 +153,73 @@ workflow_dispatch (action=rollback) ──────────────�
 - **Condition:** `pull_request` or `workflow_dispatch`
 - **Steps:** npm audit → check `.github/sca-waivers.json` → FAIL on unwaived vulnerabilities
 
+> ⛔ **CRITICAL — npm waiver step must be pure bash + `jq` only.** NEVER generate a Python script (`cat > check-npm-waivers.py << 'PYTHON_SCRIPT'`) for this step. If you do, the runner will fail with `SyntaxError: invalid syntax` because bash control flow (`if [ -f ... ]`) is not valid Python. Copy the following step verbatim:
+
+```yaml
+      - name: Run dependency SCA gate with waiver support
+        run: |
+          set -euo pipefail
+          WAIVER_FILE=".github/sca-waivers.json"
+          TODAY=$(date -u +%Y-%m-%d)
+          npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true
+          VULN_COUNT=$(jq '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")] | length' audit-output.json 2>/dev/null || echo 0)
+          if [[ "$VULN_COUNT" -eq 0 ]]; then
+            echo "✅ No high/critical vulnerabilities found."
+            exit 0
+          fi
+          echo "Found $VULN_COUNT high/critical vulnerability/ies. Checking waivers..."
+          WAIVERS="[]"
+          if [[ -f "$WAIVER_FILE" ]]; then
+            WAIVERS=$(jq '.' "$WAIVER_FILE" 2>/dev/null || echo "[]")
+            echo "Loaded waiver file: $WAIVER_FILE"
+          else
+            echo "No waiver file found at $WAIVER_FILE — all violations will be evaluated."
+          fi
+          FAIL=0; WAIVED=0; EXPIRED=0
+          while IFS= read -r vuln_json; do
+            PKG=$(echo "$vuln_json"  | jq -r '.name')
+            SEV=$(echo "$vuln_json"  | jq -r '.severity')
+            GHSA=$(echo "$vuln_json" | jq -r '.via[0].source // .via[0] // "unknown"' 2>/dev/null | head -1)
+            WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires >= $today)] | first // empty')
+            EXPIRED_WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires < $today)] | first // empty')
+            if [[ -n "$WAIVER" && "$WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$WAIVER" | jq -r '.expires')
+              REASON=$(echo "$WAIVER"  | jq -r '.reason')
+              APPROVED=$(echo "$WAIVER"| jq -r '.approved_by // "unknown"')
+              echo "⏳ WAIVED [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Reason: $REASON | Approved by: $APPROVED | Expires: $EXPIRES"
+              WAIVED=$((WAIVED + 1))
+            elif [[ -n "$EXPIRED_WAIVER" && "$EXPIRED_WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$EXPIRED_WAIVER" | jq -r '.expires')
+              REASON=$(echo "$EXPIRED_WAIVER"  | jq -r '.reason')
+              echo "::error::❌ EXPIRED WAIVER [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Waiver expired on $EXPIRES — fix is now required. Reason was: $REASON"
+              EXPIRED=$((EXPIRED + 1))
+              FAIL=1
+            else
+              echo "::error::❌ UNWAIVED [$SEV] $PKG (advisory: $GHSA) — no active waiver found."
+              FAIL=$((FAIL + 1))
+            fi
+          done < <(jq -c '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")][]' audit-output.json 2>/dev/null)
+          echo ""
+          echo "──────────────────────────────────────────"
+          echo "SCA Summary: $VULN_COUNT violation(s) found"
+          echo "  ✅ Waived (active):   $WAIVED"
+          echo "  ❌ Expired waivers:   $EXPIRED"
+          echo "  ❌ Unwaived failures: $((FAIL - EXPIRED))"
+          echo "──────────────────────────────────────────"
+          if [[ "$FAIL" -gt 0 ]]; then
+            echo "To suppress a known violation, add an entry to $WAIVER_FILE:"
+            echo '  { "package": "<pkg>", "severity": "<high|critical>", "reason": "<justification>", "expires": "YYYY-MM-DD", "approved_by": "<team>" }'
+            exit 1
+          fi
+          echo "✅ All violations are covered by active waivers."
+```
+
 ### Job 4 — `automated-governance`: Automated Hard Gates
 - **Needs:** `salesforce-validation`
 - **Condition:** `has_delta == true`
@@ -398,6 +465,9 @@ git show origin/pr_packages -- deploy-pr42-.../deployment-info.json
 - NEVER combine `--async` and `--wait` on the same deploy command
 - ALWAYS document `SCA_ENFORCEMENT_MODE` in any new doc or config. Set to `off` to bypass all SCA steps (initial project phase), `warn` for informational-only, `enforce` (default) to fail on expired waivers.
 - NEVER delete rows from `.github/sf-scanner-waivers.csv` — set `status=REVOKED` to retire a waiver
+- ⛔ NEVER generate `cat > check-npm-waivers.py << 'PYTHON_SCRIPT'` or any Python-based npm waiver script. The npm waiver step is pure bash + `jq` only. Copy the canonical implementation from the Job 3 section above verbatim.
+- ⛔ NEVER embed bash control flow (`if [ ... ]`, `while`, `for`) inside a `<< 'HEREDOC'` block for any language — bash goes OUTSIDE the heredoc, not inside it.
+- ⚠️ If the generated workflow creates a `check-npm-waivers.py` file or any `*.py` script for waiver checking, the generation is WRONG — delete it and replace with the bash block from Job 3.
 
 ## Approach
 1. Read the current workflow and relevant docs before making changes

@@ -63,14 +63,73 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
 - `needs: [setup]` (runs in **parallel** with Jobs 2, 5, 6)
 - **Condition:** `pull_request` or `workflow_dispatch`
 - **package.json bootstrap:** same guard as Job 2 — if no `package.json` exists a standard one is created before `npm install` so `npm audit` does not ENOENT
-- **npm waiver check — MUST be implemented entirely in bash + `jq`. NEVER use Python scripts, Python heredocs, or `cat > file.py << 'PYTHON_SCRIPT'` for this step.** Implementation pattern:
-  1. `WAIVER_FILE=".github/sca-waivers.json"` and `TODAY=$(date -u +%Y-%m-%d)`
-  2. `npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true`
-  3. Count high/critical vulns with `jq`; if 0 — `exit 0`
-  4. Load waivers with bash `if [[ -f "$WAIVER_FILE" ]]; then WAIVERS=$(jq '.' "$WAIVER_FILE"); else WAIVERS="[]"; fi`
-  5. `while IFS= read -r vuln_json; do ... done` — iterate, check active/expired waivers per package using `jq --arg`
-  6. Print summary; `exit 1` only if FAIL > 0
-  7. Upload `audit-output.json` artifact
+- **npm waiver check — MUST be implemented entirely in bash + `jq`. NEVER use Python scripts, Python heredocs, or `cat > file.py << 'PYTHON_SCRIPT'` for this step.** Copy the following verbatim — do NOT invent a new approach:
+
+```yaml
+      - name: Run dependency SCA gate with waiver support
+        run: |
+          set -euo pipefail
+          WAIVER_FILE=".github/sca-waivers.json"
+          TODAY=$(date -u +%Y-%m-%d)
+          npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true
+          VULN_COUNT=$(jq '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")] | length' audit-output.json 2>/dev/null || echo 0)
+          if [[ "$VULN_COUNT" -eq 0 ]]; then
+            echo "✅ No high/critical vulnerabilities found."
+            exit 0
+          fi
+          echo "Found $VULN_COUNT high/critical vulnerability/ies. Checking waivers..."
+          WAIVERS="[]"
+          if [[ -f "$WAIVER_FILE" ]]; then
+            WAIVERS=$(jq '.' "$WAIVER_FILE" 2>/dev/null || echo "[]")
+            echo "Loaded waiver file: $WAIVER_FILE"
+          else
+            echo "No waiver file found at $WAIVER_FILE — all violations will be evaluated."
+          fi
+          FAIL=0; WAIVED=0; EXPIRED=0
+          while IFS= read -r vuln_json; do
+            PKG=$(echo "$vuln_json"  | jq -r '.name')
+            SEV=$(echo "$vuln_json"  | jq -r '.severity')
+            GHSA=$(echo "$vuln_json" | jq -r '.via[0].source // .via[0] // "unknown"' 2>/dev/null | head -1)
+            WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires >= $today)] | first // empty')
+            EXPIRED_WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
+              '[.[] | select(.package == $pkg and .expires < $today)] | first // empty')
+            if [[ -n "$WAIVER" && "$WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$WAIVER" | jq -r '.expires')
+              REASON=$(echo "$WAIVER"  | jq -r '.reason')
+              APPROVED=$(echo "$WAIVER"| jq -r '.approved_by // "unknown"')
+              echo "⏳ WAIVED [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Reason: $REASON | Approved by: $APPROVED | Expires: $EXPIRES"
+              WAIVED=$((WAIVED + 1))
+            elif [[ -n "$EXPIRED_WAIVER" && "$EXPIRED_WAIVER" != "null" ]]; then
+              EXPIRES=$(echo "$EXPIRED_WAIVER" | jq -r '.expires')
+              REASON=$(echo "$EXPIRED_WAIVER"  | jq -r '.reason')
+              echo "::error::❌ EXPIRED WAIVER [$SEV] $PKG (advisory: $GHSA)"
+              echo "   Waiver expired on $EXPIRES — fix is now required. Reason was: $REASON"
+              EXPIRED=$((EXPIRED + 1))
+              FAIL=1
+            else
+              echo "::error::❌ UNWAIVED [$SEV] $PKG (advisory: $GHSA) — no active waiver found."
+              FAIL=$((FAIL + 1))
+            fi
+          done < <(jq -c '[.vulnerabilities // {} | to_entries[] | .value
+            | select(.severity == "high" or .severity == "critical")][]' audit-output.json 2>/dev/null)
+          echo ""
+          echo "──────────────────────────────────────────"
+          echo "SCA Summary: $VULN_COUNT violation(s) found"
+          echo "  ✅ Waived (active):   $WAIVED"
+          echo "  ❌ Expired waivers:   $EXPIRED"
+          echo "  ❌ Unwaived failures: $((FAIL - EXPIRED))"
+          echo "──────────────────────────────────────────"
+          if [[ "$FAIL" -gt 0 ]]; then
+            echo "To suppress a known violation, add an entry to $WAIVER_FILE:"
+            echo '  { "package": "<pkg>", "severity": "<high|critical>", "reason": "<justification>", "expires": "YYYY-MM-DD", "approved_by": "<team>" }'
+            exit 1
+          fi
+          echo "✅ All violations are covered by active waivers."
+```
+
 - **Critical:** bash `if`/`while`/`for` blocks must always be written as bash — NEVER embed them inside a `<< 'HEREDOC'` block for another language
 
 **Job 4 — `automated-governance`**: Automated Hard Gates
@@ -301,4 +360,5 @@ JSON array for npm audit waivers:
     PYTHON_SCRIPT
     ```
 11. **Always use `set -euo pipefail`** at the top of multi-line `run:` blocks.
-12. **The npm audit waiver check step must follow the exact bash pattern** described in Job 3 above — read the existing workflow at `.github/workflows/e2e-uat-pipeline.yml` and copy that implementation verbatim rather than inventing a new approach.
+12. **The npm audit waiver check step MUST be copied verbatim from the canonical implementation in Job 3 above** — do NOT invent a new approach, do NOT use Python, do NOT use a heredoc-based script. If uncertain, read `.github/workflows/e2e-uat-pipeline.yml` lines 1283–1367 from this reference repo and copy that implementation exactly.
+13. **If the generated workflow produces a `check-npm-waivers.py` file or any `cat > *.py << 'PYTHON_SCRIPT'` block for waiver checking, the generation is WRONG.** Delete the Python file/step and replace it with the pure-bash YAML block shown in Job 3 above.
