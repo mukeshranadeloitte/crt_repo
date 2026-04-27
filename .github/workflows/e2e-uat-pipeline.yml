@@ -2491,7 +2491,16 @@ jobs:
           echo "pr_approver=${PR_APPROVER}" >> "$GITHUB_OUTPUT"
           echo "run_number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
-          # ── Poll build status ──────────────────────────────────────────────
+      - name: Poll CRT Build Status
+        id: crt_poll
+        if: steps.crt.outputs.build_id != '' && steps.crt.outputs.build_id != 'n/a'
+        env:
+          CRT_API_TOKEN:  ${{ secrets.CRT_API_TOKEN }}
+          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
+          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
+          BUILD_ID:       ${{ steps.crt.outputs.build_id }}
+        run: |
+          set -euo pipefail
           MAX_ATTEMPTS=60
           ATTEMPT=0
           FINAL_STATUS="TIMED OUT"
@@ -2501,13 +2510,13 @@ jobs:
             sleep 30
 
             STATUS_RESP=$(curl -s \
-              --header "X-Authorization: $TOKEN" \
+              --header "X-Authorization: ${CRT_API_TOKEN}" \
               --header "Content-Type: application/json" \
-              --data "$(jq -n --arg q "{ builds(projectId: $PROJECT_ID, jobId: $JOB_ID) { data { id status } } }" '{query: $q}')" \
+              --data "$(jq -n --arg q "{ builds(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { data { id status } } }" '{query: $q}')" \
               https://graphql.eu-robotic.copado.com/v1)
 
             STATUS=$(echo "$STATUS_RESP" | jq -r \
-              --argjson bid "$BUILD_ID" \
+              --argjson bid "${BUILD_ID}" \
               '.data.builds.data // [] | map(select(.id == $bid)) | .[0].status // "UNKNOWN"' \
               | tr '[:upper:]' '[:lower:]')
 
@@ -2526,7 +2535,7 @@ jobs:
             fi
           done
 
-          echo "crt_status=$FINAL_STATUS" >> $GITHUB_OUTPUT
+          echo "crt_status=$FINAL_STATUS" >> "$GITHUB_OUTPUT"
           echo "Final CRT result: $FINAL_STATUS"
 
       - name: Print Job Summary
@@ -2541,7 +2550,7 @@ jobs:
           echo "  PR Raiser       : ${{ steps.pr_meta.outputs.pr_raiser }}"
           echo "  PR Approver     : ${{ steps.pr_meta.outputs.pr_approver }}"
           echo "  Test Build ID   : ${{ steps.crt.outputs.build_id }}"
-          echo "  Test Result     : ${{ steps.crt.outputs.crt_status }}"
+          echo "  Test Result     : ${{ steps.crt_poll.outputs.crt_status }}"
           echo "╚══════════════════════════════════════════╝"
           echo ""
       - name: Post CRT deployment comment
