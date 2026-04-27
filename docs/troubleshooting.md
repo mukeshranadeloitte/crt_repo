@@ -162,8 +162,93 @@ deploy_cmd+=(--test-level AllLocalTests)
 
 ---
 
-### `npm error ENOENT` — no such file or directory (package.json)
+### `Invalid workflow file` — YAML syntax error on line containing `{` (package.json heredoc)
 
+**Symptom:**
+```
+Invalid workflow file
+You have an error in your yaml syntax on line 99
+```
+Line 99 is the `{` that starts the `package.json` JSON body inside a `cat > package.json << 'EOF'` heredoc.
+
+**Cause:** When regenerating the workflow, an AI agent used `<< 'EOF'` with the JSON body at column 1 (unindented). In GitHub Actions, the entire `run: |` block is parsed by YAML *before* bash sees it. A bare `{` at column 1 inside a `run:` block is interpreted by the YAML parser as a flow mapping literal, not as part of the shell script string — causing a fatal YAML parse error.
+
+**Root cause:** Two mistakes in the generated code:
+1. Using `EOF` instead of `PKGJSON` as the heredoc delimiter
+2. The JSON body and closing marker at column 1 instead of indented to match the `run:` block
+
+**Immediate fix — find the broken step and replace with this exact pattern:**
+
+```yaml
+      - name: Install npm dependencies
+        run: |
+          set -euo pipefail
+          if [[ ! -f package.json ]]; then
+            echo "ℹ️  No package.json found — creating standard Salesforce package.json."
+            cat > package.json << 'PKGJSON'
+          {
+            "name": "salesforce-app",
+            "private": true,
+            "version": "1.0.0",
+            "description": "Salesforce App",
+            "scripts": {
+              "lint": "eslint **/{aura,lwc}/**/*.js",
+              "test": "npm run test:unit",
+              "test:unit": "sfdx-lwc-jest",
+              "test:unit:watch": "sfdx-lwc-jest --watch",
+              "test:unit:debug": "sfdx-lwc-jest --debug",
+              "test:unit:coverage": "sfdx-lwc-jest --coverage",
+              "prettier": "prettier --write \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
+              "prettier:verify": "prettier --check \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
+              "prepare": "husky || true",
+              "precommit": "lint-staged"
+            },
+            "devDependencies": {
+              "@lwc/eslint-plugin-lwc": "^3.1.0",
+              "@prettier/plugin-xml": "^3.4.1",
+              "@salesforce/eslint-config-lwc": "^4.0.0",
+              "@salesforce/eslint-plugin-aura": "^3.0.0",
+              "@salesforce/eslint-plugin-lightning": "^2.0.0",
+              "@salesforce/sfdx-lwc-jest": "^7.0.2",
+              "eslint": "^9.29.0",
+              "eslint-plugin-import": "^2.31.0",
+              "eslint-plugin-jest": "^28.14.0",
+              "husky": "^9.1.7",
+              "lint-staged": "^16.1.2",
+              "prettier": "^3.5.3",
+              "prettier-plugin-apex": "^2.2.6"
+            },
+            "lint-staged": {
+              "**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}": [
+                "prettier --write"
+              ],
+              "**/{aura,lwc}/**/*.js": [
+                "eslint"
+              ],
+              "**/lwc/**": [
+                "sfdx-lwc-jest -- --bail --findRelatedTests --passWithNoTests"
+              ]
+            }
+          }
+          PKGJSON
+          fi
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            npm install
+          fi
+```
+
+**Key rules — why this works:**
+- Uses `PKGJSON` as the heredoc delimiter (not `EOF`)
+- The `{` is at 10-space indentation — YAML sees this as part of the multiline string, not a flow mapping
+- The closing `PKGJSON` is at the **same 10-space indentation** as the JSON body — NOT at column 0 as in normal bash. This works because GitHub Actions strips the common leading whitespace from the entire `run:` block before passing it to bash, so bash sees `PKGJSON` at the correct column.
+
+**This same bootstrap block appears 4 times in the workflow** (Jobs 2, 3, 8, 11 — `Install npm dependencies`). All four must use this exact pattern.
+
+---
+
+### `npm error ENOENT` — no such file or directory (package.json)
 **Cause:** The project has no `package.json`. This happens when using the pipeline in a Salesforce project that was not originally set up as a Node.js project.
 
 **Resolution:** The pipeline **automatically creates** a standard Salesforce `package.json` (with eslint, prettier, sfdx-lwc-jest, husky, lint-staged) if one doesn't exist before running `npm install`. No action required — this is built in to Jobs 2, 3, 8, and 10.

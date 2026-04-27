@@ -468,6 +468,7 @@ git show origin/pr_packages -- deploy-pr42-.../deployment-info.json
 - ⛔ NEVER generate `cat > check-npm-waivers.py << 'PYTHON_SCRIPT'` or any Python-based npm waiver script. The npm waiver step is pure bash + `jq` only. Copy the canonical implementation from the Job 3 section above verbatim.
 - ⛔ NEVER embed bash control flow (`if [ ... ]`, `while`, `for`) inside a `<< 'HEREDOC'` block for any language — bash goes OUTSIDE the heredoc, not inside it.
 - ⚠️ If the generated workflow creates a `check-npm-waivers.py` file or any `*.py` script for waiver checking, the generation is WRONG — delete it and replace with the bash block from Job 3.
+- ⛔ **YAML heredoc indentation — always indent the `package.json` body 10 spaces and use `PKGJSON` as the delimiter, NOT `EOF`.** In a GitHub Actions `run: |` block, ALL content (including heredoc body) is parsed by YAML first. If the JSON `{` appears at column 1, YAML treats it as a flow mapping and raises `Invalid workflow file`. The closing `PKGJSON` marker must be at the same indentation as the JSON body (10 spaces), NOT at column 0. Copy lines 224–280 of `.github/workflows/e2e-uat-pipeline.yml` exactly.
 
 ## Approach
 1. Read the current workflow and relevant docs before making changes
