@@ -80,7 +80,7 @@ pull_request ──────────────────────�
 │
 ├─► [1] setup              (outputs: run-checkmarx, run-fortify)
 │         │
-│    ┌────┼──────────────────────────────────────┐
+│    ┌────┼────────────────────┬──────────────────┐
 │    ▼    ▼                    ▼                  ▼
 │  [2] salesforce   [3] sca-sast-stage  [5] checkmarx-sast
 │      -validation  (npm audit)         [6] fortify-sast-dast
@@ -89,6 +89,10 @@ pull_request ──────────────────────�
 │    [4] automated-governance
 │
 │ (All of 2,3,4,5,6 must pass — reviewer then approves PR)
+│
+│ IMPORTANT: Jobs 2, 3, 5, 6 ALL declare needs: [setup].
+│            Job 4 declares needs: [salesforce-validation].
+│            No job is orphaned — everything flows from setup.
 
 pull_request_review (APPROVED) ────────────────────────────────
 │
@@ -118,6 +122,7 @@ workflow_dispatch (action=rollback) ──────────────�
 
 ### Job 2 — `salesforce-validation`: Salesforce PR Validation
 - **Runs on:** `pull_request` only
+- **Needs:** `setup` — ⚠️ MUST declare `needs: [setup]` so this job is connected to the dependency graph
 - **Outputs:** `has_delta` (bool) — propagated to all downstream jobs
 - **Permissions:** `contents: read`, `pull-requests: read`
 - **Steps in order:**
@@ -469,6 +474,7 @@ git show origin/pr_packages -- deploy-pr42-.../deployment-info.json
 - ⛔ NEVER embed bash control flow (`if [ ... ]`, `while`, `for`) inside a `<< 'HEREDOC'` block for any language — bash goes OUTSIDE the heredoc, not inside it.
 - ⚠️ If the generated workflow creates a `check-npm-waivers.py` file or any `*.py` script for waiver checking, the generation is WRONG — delete it and replace with the bash block from Job 3.
 - ⛔ **YAML heredoc indentation — always indent the `package.json` body 10 spaces and use `PKGJSON` as the delimiter, NOT `EOF`.** In a GitHub Actions `run: |` block, ALL content (including heredoc body) is parsed by YAML first. If the JSON `{` appears at column 1, YAML treats it as a flow mapping and raises `Invalid workflow file`. The closing `PKGJSON` marker must be at the same indentation as the JSON body (10 spaces), NOT at column 0. Copy lines 224–280 of `.github/workflows/e2e-uat-pipeline.yml` exactly.
+- ⛔ **`salesforce-validation` MUST declare `needs: [setup]`.** Without this, the job is orphaned from the dependency graph and does not appear connected to `setup` in the GitHub Actions UI. The correct `needs:` for each job: Job 2 = `[setup]`, Job 3 = `[setup]`, Job 4 = `[salesforce-validation]`, Job 5 = `[setup]`, Job 6 = `[setup]`.
 
 ## Approach
 1. Read the current workflow and relevant docs before making changes
