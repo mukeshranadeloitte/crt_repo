@@ -1,6 +1,35 @@
 # UAT Pipeline — Setup & Configuration
 
-Complete reference for all secrets and variables required by `.github/workflows/e2e-uat-pipeline.yml`.
+Complete reference for all secrets, variables, tool requirements, and branch configuration for `.github/workflows/e2e-uat-pipeline.yml`.
+
+---
+
+## 0. Software & Tool Prerequisites
+
+These tools are **installed automatically by the workflow** on the GitHub-hosted runner. No local installation is required for the CI/CD pipeline itself. However, developers working locally or teams setting up a new project need the following.
+
+### Required on GitHub Actions runner (auto-installed by workflow)
+| Tool | Version / Notes |
+|------|----------------|
+| `@salesforce/cli` (`sf`) | Latest — installed via `npm install -g @salesforce/cli` |
+| `sfdx-git-delta` | Latest — installed via `echo y \| sf plugins install sfdx-git-delta` |
+| `@salesforce/plugin-scanner` | Latest — installed via `sf plugins install @salesforce/plugin-scanner` |
+| `jq` | Pre-installed on `ubuntu-latest` |
+| `python3` | Pre-installed on `ubuntu-latest` |
+| `curl` | Pre-installed on `ubuntu-latest` |
+| `node` / `npm` | Pre-installed on `ubuntu-latest` (LTS) |
+
+### Required for local development
+| Tool | Install Command | Purpose |
+|------|----------------|---------|
+| Salesforce CLI (`sf`) | `npm install -g @salesforce/cli` | Deploy, auth, run commands locally |
+| Node.js ≥ 18 | [nodejs.org](https://nodejs.org) | npm packages, ESLint, Prettier |
+| Java 11+ | Required by CheckMarx CxConsole | Only needed if running CheckMarx locally |
+| Git | ≥ 2.30 | `sfdx-git-delta` needs proper git history |
+| `jq` | `brew install jq` / `apt install jq` | Local script testing |
+
+### GitHub Actions runner environment
+The workflow uses `ubuntu-latest` throughout. No self-hosted runners are required.
 
 ---
 
@@ -69,6 +98,7 @@ Set these under **Settings → Secrets and variables → Actions → Variables**
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ORG_ALIAS` | `uat` | Alias used when authenticating to the target SF org |
+| `SFDX_AUTH_SECRET_NAME` | `CRT_UAT_AUTHURL` | Name of the repository secret that holds the SFDX auth URL. Change this if you store the auth URL under a different secret name. |
 | `DELTA_FROM_COMMIT` | *(none — required)* | Baseline commit SHA for `sfdx-git-delta`. **Auto-updated** after each successful deployment via `GH_PAT`. Set manually on first use. Used as a shallow-clone fallback in the deploy job (primary FROM is `git rev-parse HEAD^1`). |
 | `COVERAGE_THRESHOLD` | `85` | Minimum Apex coverage % enforced by the workflow coverage check |
 | `SOURCE_DIR` | `force-app/main/default` | Source directory passed to `sf scanner run` and fallback deploy |
@@ -161,19 +191,28 @@ The deploy job (`deploy-after-merge`) computes its delta FROM using `git rev-par
 ## 6. Quick Start Checklist
 
 ```
+SECRETS
 [ ] Secret CRT_UAT_AUTHURL set to valid SFDX auth URL
 [ ] Secret CRT_API_TOKEN set for CRT GraphQL API (X-Authorization header)
 [ ] Secret GH_PAT set (Fine-Grained PAT, Variables: Read and write)
+[ ] (Optional) CheckMarx: CX_BASE_URI, CX_TENANT, CX_CLIENT_ID, CX_CLIENT_SECRET
+[ ] (Optional) CheckMarx: CX_PROJECT_NAME (defaults to repo name)
+[ ] (Optional) Fortify: FOD_CLIENT_ID, FOD_CLIENT_SECRET, FOD_APP_NAME, FOD_RELEASE_NAME
+[ ] (Optional) Fortify DAST: FOD_DAST_SCAN_URL
+
+VARIABLES
 [ ] Variable DELTA_FROM_COMMIT set to baseline commit SHA (first deploy only)
 [ ] Variable ORG_ALIAS set (default: uat)
+[ ] Variable SFDX_AUTH_SECRET_NAME set if auth URL secret uses a non-default name (default: CRT_UAT_AUTHURL)
 [ ] Variable COVERAGE_THRESHOLD set (default: 85)
 [ ] Variable SCA_ENFORCEMENT_MODE set (default: enforce; use off for initial project phase)
-[ ] Branch protection configured on uat branch
-[ ] SF scanner waiver file: .github/sf-scanner-waivers.csv committed to main branch
-[ ] (Optional) CheckMarx secrets configured: CX_BASE_URI, CX_TENANT, CX_CLIENT_ID, CX_CLIENT_SECRET
-[ ] (Optional) Fortify secrets: FOD_CLIENT_ID, FOD_CLIENT_SECRET, FOD_APP_NAME, FOD_RELEASE_NAME
 [ ] (Optional) Fortify variables: FOD_URL, FOD_DAST_ASSESSMENT_TYPE, FOD_DAST_FREQUENCY, FOD_DAST_ENVIRONMENT
 [ ] (Optional) CRT variables: CRT_JOB_ID, CRT_PROJECT_ID, CRT_ORG_ID
+
+BRANCH & REPO CONFIG
+[ ] Branch protection configured on uat branch (see Section 3)
+[ ] SF scanner waiver file: .github/sf-scanner-waivers.csv committed to main branch
+[ ] pr_packages branch — created automatically on first deploy (no action needed)
 ```
 
 ---

@@ -15,6 +15,8 @@ export default class ViolationsDemo extends LightningElement {
     this.title = 'Mutated @api prop'; // often flagged: no-api-reassignments
   }
 
+
+  
   renderedCallback() {
     // Often flagged in LWC: querying document instead of this.template
     const el = document.querySelector('div');
