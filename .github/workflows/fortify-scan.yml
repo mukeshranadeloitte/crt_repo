@@ -34,6 +34,8 @@ jobs:
         uses: fortify/github-action/setup@v1
         with:
           fcli: bootstrapped
+        env:
+          FCLI_BOOTSTRAP_VERSION: v3.15.0 
 
       - name: Authenticate Fortify CLI
         run: |
@@ -49,5 +51,6 @@ jobs:
           FOD_URL: "https://trial.fortify.com/"
           FOD_CLIENT_ID: "dba72677-9feb-4e70-be2f-b047f252df00"
           FOD_CLIENT_SECRET: "IyZKRkI4OFFGSFFoQzhsdUdLVyhuTVV5YnRzNkEx0"
-          export-sarif: true 
+          export-sarif: true
+          fod-release-create: true
           # Optional: FOD_RELEASE: MyApp:main
