@@ -33,9 +33,7 @@ jobs:
       - name: Setup Fortify CLI
         uses: fortify/github-action/setup@v1
         with:
-          fcli: bootstrapped
-        env:
-          FCLI_BOOTSTRAP_VERSION: v3.15.0 
+          fcli: latest
 
       - name: Authenticate Fortify CLI
         run: |
