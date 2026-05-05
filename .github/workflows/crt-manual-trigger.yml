@@ -139,7 +139,8 @@ jobs:
             https://graphql.eu-robotic.copado.com/v1)
 
           echo "Available fields on RoboticBuildData:"
-          echo "$INTROSPECT_RESP" | jq -r '.data.__type.fields[]? | "  \(.name) : \(.type.name // .type.ofType.name // .type.kind)"' \
+          echo "$INTROSPECT_RESP" | jq -r \
+            '.data.__type.fields[]? | "  \(.name) : \(.type.name // .type.ofType.name // .type.kind)"' \
             2>/dev/null || echo "  (introspection not permitted or returned no fields)"
 
           # ── B: Query build using only confirmed valid fields ──────────────────
@@ -170,7 +171,6 @@ jobs:
           # ── C: Probe for log/output fields — try known candidates ────────────
           echo ""
           echo "=== Probing for build log content ==="
-
           LOG_CONTENT=""
           for FIELD in output log results logOutput buildLog; do
             PROBE=$(curl -s \
@@ -199,12 +199,9 @@ jobs:
             echo "⚠ No log content retrievable via GraphQL API."
             echo "  View the full Robot Framework log in the CRT Dashboard:"
             echo "  https://eu-robotic.copado.com/jobs/${CRT_JOB_ID}?projectId=${CRT_PROJECT_ID}"
-            echo ""
-            echo "  Full schema introspection (for debugging):"
-            echo "$INTROSPECT_RESP" | jq .
           fi
 
-          # ── D: Derive pass/fail from poll status (API has no step breakdown) ──
+          # ── D: Derive pass/fail from poll status ─────────────────────────────
           POLL_STATUS="${{ steps.crt_poll.outputs.crt_status }}"
           PASS_COUNT=0; FAIL_COUNT=0
 
@@ -256,6 +253,7 @@ jobs:
           SKIP_COUNT:     ${{ steps.crt_logs.outputs.skip_count }}
           TOTAL_COUNT:    ${{ steps.crt_logs.outputs.total_count }}
           BUILD_NUMBER:   ${{ steps.crt_logs.outputs.build_number }}
+          START_TIME:     ${{ steps.crt_logs.outputs.start_time }}
           ENV_LABEL:      ${{ github.event.inputs.environment || 'UAT' }}
           CRT_JOB_ID:     ${{ vars.CRT_JOB_ID    || '115686' }}
           CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID || '73283'  }}
@@ -271,6 +269,7 @@ jobs:
             const skipped  = process.env.SKIP_COUNT   || '?';
             const total    = process.env.TOTAL_COUNT  || '?';
             const buildNum = process.env.BUILD_NUMBER || '?';
+            const start    = process.env.START_TIME   || '?';
             const env      = process.env.ENV_LABEL;
             const jobId    = process.env.CRT_JOB_ID;
             const projId   = process.env.CRT_PROJECT_ID;
@@ -286,6 +285,7 @@ jobs:
               `|-------|-------|`,
               `| **Overall Result** | ${icon} \`${status}\` |`,
               `| **Build Number** | ${buildNum} |`,
+              `| **Start Time** | ${start} |`,
               `| **✅ Passed** | ${passed} |`,
               `| **❌ Failed** | ${failed} |`,
               `| **⏭️ Skipped** | ${skipped} |`,
@@ -315,8 +315,6 @@ jobs:
           TOTAL_COUNT:    ${{ steps.crt_logs.outputs.total_count }}
           BUILD_NUMBER:   ${{ steps.crt_logs.outputs.build_number }}
           START_TIME:     ${{ steps.crt_logs.outputs.start_time }}
-          END_TIME:       ${{ steps.crt_logs.outputs.end_time }}
-          STEPS_JSON:     ${{ steps.crt_logs.outputs.steps_json }}
           ENV_LABEL:      ${{ github.event.inputs.environment || 'UAT' }}
         run: |
           {
@@ -342,8 +340,6 @@ jobs:
             echo "| ✅ Passed | ❌ Failed | ⏭️ Skipped | 📊 Total |"
             echo "|-----------|-----------|------------|---------|"
             echo "| ${PASS_COUNT} | ${FAIL_COUNT} | ${SKIP_COUNT} | ${TOTAL_COUNT} |"
-            echo ""
-
             echo ""
             echo "### 🔗 View Results"
             echo "[Open CRT Dashboard](https://eu-robotic.copado.com/jobs/${CRT_JOB_ID}?projectId=${CRT_PROJECT_ID}&orgId=${CRT_ORG_ID})"
