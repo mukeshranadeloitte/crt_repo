@@ -1,0 +1,326 @@
+name: CRT Manual Trigger
+
+# Standalone workflow — trigger CRT robotic tests on-demand without waiting
+# for PR validation, SCA scan, or deployment.
+#
+# Inputs:
+#   pr_number   - (optional) post results as a PR comment
+#   environment - (optional) label shown in the summary (default: UAT)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to post CRT results as a comment (optional)"
+        required: false
+        default: ""
+      environment:
+        description: "Target environment label shown in the summary"
+        required: false
+        default: "UAT"
+
+jobs:
+  trigger-crt:
+    name: "Trigger CRT Test Job (EU Robotic)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: none
+      pull-requests: write
+
+    steps:
+      # ── STEP 1 — Trigger CRT build ──────────────────────────────────────────
+      - name: Trigger CRT Test Execution
+        id: crt
+        env:
+          CRT_API_TOKEN:  ${{ secrets.CRT_API_TOKEN }}
+          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
+          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
+          CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CRT_API_TOKEN}" ]; then
+            echo "::error::Missing required secret: CRT_API_TOKEN"
+            exit 1
+          fi
+
+          echo "Triggering CRT job ${CRT_JOB_ID} (project ${CRT_PROJECT_ID}, org ${CRT_ORG_ID})"
+
+          RESPONSE=$(curl -s \
+            --header "X-Authorization: ${CRT_API_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "$(jq -n --arg q "mutation { createBuild(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { message data { id buildNumber status startTime } } }" '{query: $q}')" \
+            https://graphql.eu-robotic.copado.com/v1)
+
+          echo "Response: ${RESPONSE}"
+
+          if echo "${RESPONSE}" | jq -e '.errors' > /dev/null 2>&1; then
+            ERR_MSG=$(echo "${RESPONSE}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['errors'][0].get('message','unknown'))" 2>/dev/null || echo "unknown")
+            echo "::error::Failed to trigger CRT job: ${ERR_MSG}"
+            echo "build_id=n/a"      >> "$GITHUB_OUTPUT"
+            echo "crt_status=FAILED" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          BUILD_ID=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['id'])")
+          STATUS=$(echo "${RESPONSE}"   | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data']['status'])")
+          BUILD_NO=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['createBuild']['data'].get('buildNumber','n/a'))")
+
+          echo "✅ CRT job triggered — Build ID: ${BUILD_ID} | #${BUILD_NO} | Status: ${STATUS}"
+          echo "build_id=${BUILD_ID}"   >> "$GITHUB_OUTPUT"
+          echo "crt_status=${STATUS}"   >> "$GITHUB_OUTPUT"
+
+      # ── STEP 2 — Poll until terminal status ─────────────────────────────────
+      - name: Poll CRT Build Status
+        id: crt_poll
+        if: steps.crt.outputs.build_id != '' && steps.crt.outputs.build_id != 'n/a'
+        env:
+          CRT_API_TOKEN:  ${{ secrets.CRT_API_TOKEN }}
+          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
+          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
+          BUILD_ID:       ${{ steps.crt.outputs.build_id }}
+        run: |
+          set -euo pipefail
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          FINAL_STATUS="TIMED OUT"
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 30
+
+            STATUS_RESP=$(curl -s \
+              --header "X-Authorization: ${CRT_API_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --data "$(jq -n --arg q "{ builds(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { data { id status } } }" '{query: $q}')" \
+              https://graphql.eu-robotic.copado.com/v1)
+
+            STATUS=$(echo "$STATUS_RESP" | jq -r \
+              --argjson bid "${BUILD_ID}" \
+              '.data.builds.data // [] | map(select(.id == $bid)) | .[0].status // "UNKNOWN"' \
+              | tr '[:upper:]' '[:lower:]')
+
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS — Status: $STATUS"
+
+            if [ "$STATUS" = "succeeded" ] || [ "$STATUS" = "passed" ] || [ "$STATUS" = "success" ] || [ "$STATUS" = "completed" ]; then
+              FINAL_STATUS="PASSED"
+              break
+            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "error" ] || [ "$STATUS" = "aborted" ]; then
+              FINAL_STATUS="FAILED ($STATUS)"
+              break
+            elif [ "$STATUS" = "executing" ] || [ "$STATUS" = "running" ] || [ "$STATUS" = "pending" ] || [ "$STATUS" = "queued" ]; then
+              echo "Still running..."
+            else
+              echo "Unrecognised status: $STATUS"
+            fi
+          done
+
+          echo "crt_status=$FINAL_STATUS" >> "$GITHUB_OUTPUT"
+          echo "Final CRT result: $FINAL_STATUS"
+
+      # ── STEP 3 — Fetch detailed build logs ───────────────────────────────────
+      - name: Fetch CRT Build Logs
+        id: crt_logs
+        if: always() && steps.crt.outputs.build_id != '' && steps.crt.outputs.build_id != 'n/a'
+        continue-on-error: true
+        env:
+          CRT_API_TOKEN:  ${{ secrets.CRT_API_TOKEN }}
+          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
+          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
+          BUILD_ID:       ${{ steps.crt.outputs.build_id }}
+        run: |
+          set -euo pipefail
+
+          RESULT_RESP=$(curl -s \
+            --header "X-Authorization: ${CRT_API_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "$(jq -n --arg q "{ builds(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { data { id buildNumber status startTime endTime steps { name status errorMessage } } } }" '{query: $q}')" \
+            https://graphql.eu-robotic.copado.com/v1)
+
+          echo "Raw CRT API response:"
+          echo "$RESULT_RESP" | jq .
+
+          BUILD_DATA=$(echo "$RESULT_RESP" | jq \
+            --argjson bid "${BUILD_ID}" \
+            '.data.builds.data // [] | map(select(.id == $bid)) | .[0] // {}')
+
+          BUILD_NUMBER=$(echo "$BUILD_DATA" | jq -r '.buildNumber // "N/A"')
+          START_TIME=$(echo "$BUILD_DATA"   | jq -r '.startTime   // "N/A"')
+          END_TIME=$(echo "$BUILD_DATA"     | jq -r '.endTime     // "N/A"')
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  CRT Build #${BUILD_NUMBER}  |  Start: ${START_TIME}  |  End: ${END_TIME}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          STEPS=$(echo "$BUILD_DATA" | jq -r '.steps // [] | .[] | "\(.status)\t\(.name)\t\(.errorMessage // "")"')
+
+          PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0
+
+          if [ -n "$STEPS" ]; then
+            echo ""; echo "  Test Step Results:"
+            while IFS=$'\t' read -r STEP_STATUS STEP_NAME STEP_ERR; do
+              STEP_STATUS_UPPER=$(echo "$STEP_STATUS" | tr '[:lower:]' '[:upper:]')
+              case "$STEP_STATUS_UPPER" in
+                PASSED|SUCCESS|SUCCEEDED|COMPLETED)
+                  PASS_COUNT=$((PASS_COUNT+1)); ICON="✅";;
+                FAILED|ERROR|ABORTED)
+                  FAIL_COUNT=$((FAIL_COUNT+1)); ICON="❌";;
+                *)
+                  SKIP_COUNT=$((SKIP_COUNT+1)); ICON="⏭️";;
+              esac
+              printf "  %s %-10s  %s\n" "$ICON" "$STEP_STATUS_UPPER" "${STEP_NAME:0:50}"
+              [ -n "$STEP_ERR" ] && echo "     ⚠ ${STEP_ERR:0:80}"
+            done <<< "$STEPS"
+          else
+            echo "  (No step-level data returned by CRT API)"
+          fi
+
+          TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
+          echo ""
+          echo "  Totals — Passed: ${PASS_COUNT}  Failed: ${FAIL_COUNT}  Skipped: ${SKIP_COUNT}  Total: ${TOTAL}"
+
+          echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "start_time=${START_TIME}"     >> "$GITHUB_OUTPUT"
+          echo "end_time=${END_TIME}"         >> "$GITHUB_OUTPUT"
+          echo "pass_count=${PASS_COUNT}"     >> "$GITHUB_OUTPUT"
+          echo "fail_count=${FAIL_COUNT}"     >> "$GITHUB_OUTPUT"
+          echo "skip_count=${SKIP_COUNT}"     >> "$GITHUB_OUTPUT"
+          echo "total_count=${TOTAL}"         >> "$GITHUB_OUTPUT"
+          echo "steps_json=$(echo "$BUILD_DATA" | jq -c '.steps // []')" >> "$GITHUB_OUTPUT"
+
+      # ── STEP 4 — Console summary ─────────────────────────────────────────────
+      - name: Print Job Summary
+        if: always()
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║          CRT Manual Trigger — Execution Summary          ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "  Triggered by    : ${{ github.actor }}"
+          echo "  Workflow Run #  : ${{ github.run_number }}"
+          echo "  PR Number       : ${{ github.event.inputs.pr_number || '(none)' }}"
+          echo "  Environment     : ${{ github.event.inputs.environment || 'UAT' }}"
+          echo "  Test Build ID   : ${{ steps.crt.outputs.build_id }}"
+          echo "  Build Number    : ${{ steps.crt_logs.outputs.build_number }}"
+          echo "  Start Time      : ${{ steps.crt_logs.outputs.start_time }}"
+          echo "  End Time        : ${{ steps.crt_logs.outputs.end_time }}"
+          echo "  Test Result     : ${{ steps.crt_poll.outputs.crt_status }}"
+          echo "  ── Test Counts ─────────────────────────────────────────"
+          echo "  ✅ Passed       : ${{ steps.crt_logs.outputs.pass_count }}"
+          echo "  ❌ Failed       : ${{ steps.crt_logs.outputs.fail_count }}"
+          echo "  ⏭️  Skipped      : ${{ steps.crt_logs.outputs.skip_count }}"
+          echo "  📊 Total        : ${{ steps.crt_logs.outputs.total_count }}"
+          echo "╚══════════════════════════════════════════════════════════╝"
+          echo ""
+
+      # ── STEP 5 — PR comment (only when pr_number is provided) ────────────────
+      - name: Post CRT Result Comment on PR
+        if: always() && github.event.inputs.pr_number != ''
+        uses: actions/github-script@v7
+        env:
+          CRT_STATUS:     ${{ steps.crt_poll.outputs.crt_status }}
+          PASS_COUNT:     ${{ steps.crt_logs.outputs.pass_count }}
+          FAIL_COUNT:     ${{ steps.crt_logs.outputs.fail_count }}
+          SKIP_COUNT:     ${{ steps.crt_logs.outputs.skip_count }}
+          TOTAL_COUNT:    ${{ steps.crt_logs.outputs.total_count }}
+          BUILD_NUMBER:   ${{ steps.crt_logs.outputs.build_number }}
+          ENV_LABEL:      ${{ github.event.inputs.environment || 'UAT' }}
+          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID    || '115686' }}
+          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID || '73283'  }}
+          CRT_ORG_ID:     ${{ vars.CRT_ORG_ID     || '43532'  }}
+        with:
+          script: |
+            const prNumber = parseInt('${{ github.event.inputs.pr_number }}', 10);
+            if (!prNumber) return;
+
+            const status   = process.env.CRT_STATUS   || 'UNKNOWN';
+            const passed   = process.env.PASS_COUNT   || '?';
+            const failed   = process.env.FAIL_COUNT   || '?';
+            const skipped  = process.env.SKIP_COUNT   || '?';
+            const total    = process.env.TOTAL_COUNT  || '?';
+            const buildNum = process.env.BUILD_NUMBER || '?';
+            const env      = process.env.ENV_LABEL;
+            const jobId    = process.env.CRT_JOB_ID;
+            const projId   = process.env.CRT_PROJECT_ID;
+            const orgId    = process.env.CRT_ORG_ID;
+
+            const icon = status.startsWith('PASSED') ? '✅' : status.startsWith('FAILED') ? '❌' : '⏱️';
+            const dashboardUrl = `https://eu-robotic.copado.com/jobs/${jobId}?projectId=${projId}&orgId=${orgId}`;
+
+            const body = [
+              `## 🤖 CRT Robotic Test Results (Manual Run — ${env})`,
+              ``,
+              `| Field | Value |`,
+              `|-------|-------|`,
+              `| **Overall Result** | ${icon} \`${status}\` |`,
+              `| **Build Number** | ${buildNum} |`,
+              `| **✅ Passed** | ${passed} |`,
+              `| **❌ Failed** | ${failed} |`,
+              `| **⏭️ Skipped** | ${skipped} |`,
+              `| **📊 Total** | ${total} |`,
+              ``,
+              `[🔗 Open CRT Dashboard](${dashboardUrl})`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
+
+      # ── STEP 6 — GitHub Actions Step Summary ────────────────────────────────
+      - name: CRT Test Execution Summary
+        if: always()
+        env:
+          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
+          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
+          CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
+          CRT_STATUS:     ${{ steps.crt_poll.outputs.crt_status }}
+          PASS_COUNT:     ${{ steps.crt_logs.outputs.pass_count }}
+          FAIL_COUNT:     ${{ steps.crt_logs.outputs.fail_count }}
+          SKIP_COUNT:     ${{ steps.crt_logs.outputs.skip_count }}
+          TOTAL_COUNT:    ${{ steps.crt_logs.outputs.total_count }}
+          BUILD_NUMBER:   ${{ steps.crt_logs.outputs.build_number }}
+          START_TIME:     ${{ steps.crt_logs.outputs.start_time }}
+          END_TIME:       ${{ steps.crt_logs.outputs.end_time }}
+          STEPS_JSON:     ${{ steps.crt_logs.outputs.steps_json }}
+          ENV_LABEL:      ${{ github.event.inputs.environment || 'UAT' }}
+        run: |
+          {
+            STATUS_ICON="⏱️"
+            [[ "${CRT_STATUS}" == PASSED* ]] && STATUS_ICON="✅"
+            [[ "${CRT_STATUS}" == FAILED* ]] && STATUS_ICON="❌"
+
+            echo "## 🧪 CRT Manual Test Execution Summary (${ENV_LABEL})"
+            echo ""
+            echo "| Detail | Value |"
+            echo "|--------|-------|"
+            echo "| **Overall Result** | ${STATUS_ICON} \`${CRT_STATUS}\` |"
+            echo "| **Build Number** | ${BUILD_NUMBER} |"
+            echo "| **Start Time** | ${START_TIME} |"
+            echo "| **End Time** | ${END_TIME} |"
+            echo "| **Triggered By** | ${{ github.actor }} |"
+            echo "| **Workflow Run** | #${{ github.run_number }} |"
+            echo "| **Instance** | https://eu-robotic.copado.com |"
+            echo "| **Org ID** | ${CRT_ORG_ID} |"
+            echo "| **Project ID** | ${CRT_PROJECT_ID} |"
+            echo "| **Job ID** | ${CRT_JOB_ID} |"
+            echo ""
+            echo "### 📊 Test Counts"
+            echo "| ✅ Passed | ❌ Failed | ⏭️ Skipped | 📊 Total |"
+            echo "|-----------|-----------|------------|---------|"
+            echo "| ${PASS_COUNT} | ${FAIL_COUNT} | ${SKIP_COUNT} | ${TOTAL_COUNT} |"
+            echo ""
+
+            if [ -n "${STEPS_JSON}" ] && [ "${STEPS_JSON}" != "[]" ]; then
+              echo "### 🔍 Step-by-Step Results"
+              echo "| Status | Step Name | Error |"
+              echo "|--------|-----------|-------|"
+              echo "${STEPS_JSON}" | jq -r '.[] | "| \(.status) | \(.name) | \(.errorMessage // "-") |"' 2>/dev/null || echo "(unable to parse step data)"
+            fi
+
+            echo ""
+            echo "### 🔗 View Results"
+            echo "[Open CRT Dashboard](https://eu-robotic.copado.com/jobs/${CRT_JOB_ID}?projectId=${CRT_PROJECT_ID}&orgId=${CRT_ORG_ID})"
+          } >> "$GITHUB_STEP_SUMMARY"
