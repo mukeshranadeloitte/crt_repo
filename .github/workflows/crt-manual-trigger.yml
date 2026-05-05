@@ -117,7 +117,7 @@ jobs:
           echo "crt_status=$FINAL_STATUS" >> "$GITHUB_OUTPUT"
           echo "Final CRT result: $FINAL_STATUS"
 
-      # ── STEP 3 — Fetch detailed build logs ───────────────────────────────────
+      # ── STEP 3 — Fetch build details and discover available log fields ────────
       - name: Fetch CRT Build Logs
         id: crt_logs
         if: always() && steps.crt.outputs.build_id != '' && steps.crt.outputs.build_id != 'n/a'
@@ -130,13 +130,28 @@ jobs:
         run: |
           set -euo pipefail
 
+          # ── A: Introspect schema — print all real fields on RoboticBuildData ──
+          echo "=== Introspecting RoboticBuildData schema ==="
+          INTROSPECT_RESP=$(curl -s \
+            --header "X-Authorization: ${CRT_API_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data '{"query":"{ __type(name: \"RoboticBuildData\") { name fields { name type { name kind ofType { name kind } } } } }"}' \
+            https://graphql.eu-robotic.copado.com/v1)
+
+          echo "Available fields on RoboticBuildData:"
+          echo "$INTROSPECT_RESP" | jq -r '.data.__type.fields[]? | "  \(.name) : \(.type.name // .type.ofType.name // .type.kind)"' \
+            2>/dev/null || echo "  (introspection not permitted or returned no fields)"
+
+          # ── B: Query build using only confirmed valid fields ──────────────────
+          echo ""
+          echo "=== Fetching build data (safe fields only) ==="
           RESULT_RESP=$(curl -s \
             --header "X-Authorization: ${CRT_API_TOKEN}" \
             --header "Content-Type: application/json" \
-            --data "$(jq -n --arg q "{ builds(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { data { id buildNumber status startTime endTime steps { name status errorMessage } } } }" '{query: $q}')" \
+            --data "$(jq -n --arg q "{ builds(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { data { id buildNumber status startTime } } }" '{query: $q}')" \
             https://graphql.eu-robotic.copado.com/v1)
 
-          echo "Raw CRT API response:"
+          echo "Build query response:"
           echo "$RESULT_RESP" | jq .
 
           BUILD_DATA=$(echo "$RESULT_RESP" | jq \
@@ -145,48 +160,66 @@ jobs:
 
           BUILD_NUMBER=$(echo "$BUILD_DATA" | jq -r '.buildNumber // "N/A"')
           START_TIME=$(echo "$BUILD_DATA"   | jq -r '.startTime   // "N/A"')
-          END_TIME=$(echo "$BUILD_DATA"     | jq -r '.endTime     // "N/A"')
+          BUILD_STATUS=$(echo "$BUILD_DATA" | jq -r '.status      // "N/A"')
 
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  CRT Build #${BUILD_NUMBER}  |  Start: ${START_TIME}  |  End: ${END_TIME}"
+          echo "  Build #${BUILD_NUMBER} | Status: ${BUILD_STATUS} | Start: ${START_TIME}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          STEPS=$(echo "$BUILD_DATA" | jq -r '.steps // [] | .[] | "\(.status)\t\(.name)\t\(.errorMessage // "")"')
+          # ── C: Probe for log/output fields — try known candidates ────────────
+          echo ""
+          echo "=== Probing for build log content ==="
 
-          PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0
+          LOG_CONTENT=""
+          for FIELD in output log results logOutput buildLog; do
+            PROBE=$(curl -s \
+              --header "X-Authorization: ${CRT_API_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --data "$(jq -n --arg q "{ builds(projectId: ${CRT_PROJECT_ID}, jobId: ${CRT_JOB_ID}) { data { id ${FIELD} } } }" '{query: $q}')" \
+              https://graphql.eu-robotic.copado.com/v1)
 
-          if [ -n "$STEPS" ]; then
-            echo ""; echo "  Test Step Results:"
-            while IFS=$'\t' read -r STEP_STATUS STEP_NAME STEP_ERR; do
-              STEP_STATUS_UPPER=$(echo "$STEP_STATUS" | tr '[:lower:]' '[:upper:]')
-              case "$STEP_STATUS_UPPER" in
-                PASSED|SUCCESS|SUCCEEDED|COMPLETED)
-                  PASS_COUNT=$((PASS_COUNT+1)); ICON="✅";;
-                FAILED|ERROR|ABORTED)
-                  FAIL_COUNT=$((FAIL_COUNT+1)); ICON="❌";;
-                *)
-                  SKIP_COUNT=$((SKIP_COUNT+1)); ICON="⏭️";;
-              esac
-              printf "  %s %-10s  %s\n" "$ICON" "$STEP_STATUS_UPPER" "${STEP_NAME:0:50}"
-              [ -n "$STEP_ERR" ] && echo "     ⚠ ${STEP_ERR:0:80}"
-            done <<< "$STEPS"
+            if ! echo "$PROBE" | jq -e '.errors' > /dev/null 2>&1; then
+              echo "  ✅ Field '${FIELD}' is available"
+              LOG_CONTENT=$(echo "$PROBE" | jq -r \
+                --argjson bid "${BUILD_ID}" \
+                --arg f "${FIELD}" \
+                '.data.builds.data // [] | map(select(.id == $bid)) | .[0][$f] // ""' 2>/dev/null || echo "")
+              break
+            else
+              echo "  ✗ Field '${FIELD}' not available"
+            fi
+          done
+
+          echo ""
+          if [ -n "$LOG_CONTENT" ]; then
+            echo "=== CRT Build Log ==="
+            echo "$LOG_CONTENT"
           else
-            echo "  (No step-level data returned by CRT API)"
+            echo "⚠ No log content retrievable via GraphQL API."
+            echo "  View the full Robot Framework log in the CRT Dashboard:"
+            echo "  https://eu-robotic.copado.com/jobs/${CRT_JOB_ID}?projectId=${CRT_PROJECT_ID}"
+            echo ""
+            echo "  Full schema introspection (for debugging):"
+            echo "$INTROSPECT_RESP" | jq .
           fi
 
-          TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
-          echo ""
-          echo "  Totals — Passed: ${PASS_COUNT}  Failed: ${FAIL_COUNT}  Skipped: ${SKIP_COUNT}  Total: ${TOTAL}"
+          # ── D: Derive pass/fail from poll status (API has no step breakdown) ──
+          POLL_STATUS="${{ steps.crt_poll.outputs.crt_status }}"
+          PASS_COUNT=0; FAIL_COUNT=0
+
+          if [[ "$POLL_STATUS" == "PASSED" ]]; then
+            PASS_COUNT=1
+          elif [[ "$POLL_STATUS" == FAILED* ]]; then
+            FAIL_COUNT=1
+          fi
 
           echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "start_time=${START_TIME}"     >> "$GITHUB_OUTPUT"
-          echo "end_time=${END_TIME}"         >> "$GITHUB_OUTPUT"
           echo "pass_count=${PASS_COUNT}"     >> "$GITHUB_OUTPUT"
           echo "fail_count=${FAIL_COUNT}"     >> "$GITHUB_OUTPUT"
-          echo "skip_count=${SKIP_COUNT}"     >> "$GITHUB_OUTPUT"
-          echo "total_count=${TOTAL}"         >> "$GITHUB_OUTPUT"
-          echo "steps_json=$(echo "$BUILD_DATA" | jq -c '.steps // []')" >> "$GITHUB_OUTPUT"
+          echo "skip_count=0"                 >> "$GITHUB_OUTPUT"
+          echo "total_count=$((PASS_COUNT + FAIL_COUNT))" >> "$GITHUB_OUTPUT"
 
       # ── STEP 4 — Console summary ─────────────────────────────────────────────
       - name: Print Job Summary
@@ -203,7 +236,6 @@ jobs:
           echo "  Test Build ID   : ${{ steps.crt.outputs.build_id }}"
           echo "  Build Number    : ${{ steps.crt_logs.outputs.build_number }}"
           echo "  Start Time      : ${{ steps.crt_logs.outputs.start_time }}"
-          echo "  End Time        : ${{ steps.crt_logs.outputs.end_time }}"
           echo "  Test Result     : ${{ steps.crt_poll.outputs.crt_status }}"
           echo "  ── Test Counts ─────────────────────────────────────────"
           echo "  ✅ Passed       : ${{ steps.crt_logs.outputs.pass_count }}"
@@ -299,7 +331,6 @@ jobs:
             echo "| **Overall Result** | ${STATUS_ICON} \`${CRT_STATUS}\` |"
             echo "| **Build Number** | ${BUILD_NUMBER} |"
             echo "| **Start Time** | ${START_TIME} |"
-            echo "| **End Time** | ${END_TIME} |"
             echo "| **Triggered By** | ${{ github.actor }} |"
             echo "| **Workflow Run** | #${{ github.run_number }} |"
             echo "| **Instance** | https://eu-robotic.copado.com |"
@@ -312,13 +343,6 @@ jobs:
             echo "|-----------|-----------|------------|---------|"
             echo "| ${PASS_COUNT} | ${FAIL_COUNT} | ${SKIP_COUNT} | ${TOTAL_COUNT} |"
             echo ""
-
-            if [ -n "${STEPS_JSON}" ] && [ "${STEPS_JSON}" != "[]" ]; then
-              echo "### 🔍 Step-by-Step Results"
-              echo "| Status | Step Name | Error |"
-              echo "|--------|-----------|-------|"
-              echo "${STEPS_JSON}" | jq -r '.[] | "| \(.status) | \(.name) | \(.errorMessage // "-") |"' 2>/dev/null || echo "(unable to parse step data)"
-            fi
 
             echo ""
             echo "### 🔗 View Results"
