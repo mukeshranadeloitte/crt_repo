@@ -6,49 +6,143 @@ on:
       - main
 
 jobs:
-  fortify-scan:
+  fortify-sast-dast:
+    name: Fortify on Demand Scan
     runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
-      pull-requests: write  # Required if you want to comment on PRs
+    env:
+      HAS_DAST_URL: ${{ secrets.FOD_DAST_SCAN_URL != '' }}
+      FOD_URL: ${{ vars.FOD_URL }}
+      FOD_RELEASE: ${{ secrets.FOD_APP_NAME }}:${{ secrets.FOD_RELEASE_NAME }}
+      FOD_DAST_ASSESSMENT_TYPE: ${{ vars.FOD_DAST_ASSESSMENT_TYPE || 'Dynamic Assessment' }}
+      FOD_DAST_FREQUENCY: ${{ vars.FOD_DAST_FREQUENCY || 'SingleScan' }}
+      FOD_DAST_ENVIRONMENT: ${{ vars.FOD_DAST_ENVIRONMENT || 'External' }}
+      SOURCE_DIR: force-app  # Define the source directory for scanning
+      FCLI_BOOTSTRAP_VERSION: latest  # Define the FCLI bootstrap version
     steps:
-      - name: Checkout code
+      - name: Checkout source code
         uses: actions/checkout@v4
-
-      # Add build steps if necessary for your project
-      # For Salesforce projects, you might need to install SFDX CLI or build the project
-      # Example:
-      # - name: Setup Node.js
-      #   uses: actions/setup-node@v4
-      #   with:
-      #     node-version: '18'
-      # - name: Install SFDX CLI
-      #   run: npm install -g @salesforce/cli
-      # - name: Authenticate and prepare project
-      #   run: |
-      #     sf org login jwt --username ${{ secrets.SF_USERNAME }} --jwt-key-file ${{ secrets.SF_JWT_KEY }} --set-default
-      #     sf project deploy start --source-dir force-app --test-level NoTestRun
-
-      - name: Setup Fortify CLI
-        uses: fortify/github-action/setup@v1
         with:
-          fcli: latest
+          fetch-depth: 0
 
-      - name: Authenticate Fortify CLI
-        run: |
-          # This creates a session for the CLI to use in subsequent steps
-          fcli fod session login --url "https://trial.fortify.com/" --client-id "dba72677-9feb-4e70-be2f-b047f252df00" --client-secret "IyZKRkI4OFFGSFFoQzhsdUdLVyhuTVV5YnRzNkEx0"
-
-
-      - name: Run Fortify Scan
+      - name: Run Fortify SAST Scan
         uses: fortify/github-action@v3
         env:
-          # For Fortify on Demand (FoD)
-          context: "my-fod-context"
-          FOD_URL: "https://trial.fortify.com/"
-          FOD_CLIENT_ID: "dba72677-9feb-4e70-be2f-b047f252df00"
-          FOD_CLIENT_SECRET: "IyZKRkI4OFFGSFFoQzhsdUdLVyhuTVV5YnRzNkEx0"
-          export-sarif: true
-          fod-release-create: true
-          # Optional: FOD_RELEASE: MyApp:main
+          FOD_URL: ${{ vars.FOD_URL }}
+          FOD_CLIENT_ID: ${{ secrets.FOD_CLIENT_ID }}
+          FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
+          FOD_RELEASE: ${{ secrets.FOD_APP_NAME }}:${{ secrets.FOD_RELEASE_NAME }}
+          SOURCE_DIR: ${{ env.SOURCE_DIR }}
+          DO_SAST_EXPORT: true
+          FCLI_BOOTSTRAP_VERSION: ${{ env.FCLI_BOOTSTRAP_VERSION }}
+
+      - name: Upload Fortify SAST SARIF report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fortify-sast-sarif-report
+          path: gh-fortify-sast.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload Fortify SAST results to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gh-fortify-sast.sarif
+          category: fortify-sast
+
+      - name: Setup Fortify tools for DAST
+        if: env.HAS_DAST_URL == 'true'
+        uses: fortify/github-action/setup@v3
+        with:
+          fcli: bootstrapped
+          fod-uploader: latest
+        env:
+          FCLI_BOOTSTRAP_VERSION: ${{ env.FCLI_BOOTSTRAP_VERSION }}
+
+      - name: Run Fortify DAST Scan (custom fcli flow)
+        if: env.HAS_DAST_URL == 'true'
+        env:
+          FOD_CLIENT_ID: ${{ secrets.FOD_CLIENT_ID }}
+          FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
+          FOD_DAST_SCAN_URL: ${{ secrets.FOD_DAST_SCAN_URL }}
+        run: |
+          set -euo pipefail
+
+          fcli fod session login \
+            --url "$FOD_URL" \
+            --client-id "$FOD_CLIENT_ID" \
+            --client-secret "$FOD_CLIENT_SECRET"
+
+          fcli fod dast-scan setup-website \
+            --rel "$FOD_RELEASE" \
+            --assessment-type "$FOD_DAST_ASSESSMENT_TYPE" \
+            --frequency "$FOD_DAST_FREQUENCY" \
+            --environment "$FOD_DAST_ENVIRONMENT" \
+            --url "$FOD_DAST_SCAN_URL" \
+            --skip-if-exists
+
+          fcli fod dast-scan start \
+            --rel "$FOD_RELEASE" \
+            --in-progress Queue \
+            --max-attempts 180 \
+            --wait-interval 30
+
+          fcli fod dast-scan download-latest \
+            --rel "$FOD_RELEASE" \
+            -f fortify-dast-results.fpr
+
+          # Minimal SARIF wrapper — full details are in the .fpr artifact
+          cat > gh-fortify-dast.sarif <<'SARIF'
+          {
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+              {
+                "tool": {
+                  "driver": {
+                    "name": "Fortify FoD DAST",
+                    "rules": [{ "id": "fortify-dast-results", "name": "Fortify DAST results available" }]
+                  }
+                },
+                "results": [
+                  {
+                    "ruleId": "fortify-dast-results",
+                    "level": "note",
+                    "message": { "text": "Fortify DAST scan completed. Review fortify-dast-results.fpr artifact for full details." }
+                  }
+                ]
+              }
+            ]
+          }
+          SARIF
+
+          fcli fod session logout || true
+
+      - name: Upload Fortify DAST FPR artifact
+        if: env.HAS_DAST_URL == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fortify-dast-fpr-report
+          path: fortify-dast-results.fpr
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload Fortify DAST SARIF report
+        if: env.HAS_DAST_URL == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fortify-dast-sarif-report
+          path: gh-fortify-dast.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload Fortify DAST results to GitHub Code Scanning
+        if: env.HAS_DAST_URL == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gh-fortify-dast.sarif
+          category: fortify-dast
