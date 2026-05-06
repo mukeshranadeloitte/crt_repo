@@ -297,6 +297,41 @@ jobs:
           rm -f sfdxAuthUrl.txt
           sf org display --target-org "$ORG_ALIAS"
 
+      - name: Install sfdx-git-delta plugin
+        run: |
+          set -euo pipefail
+          echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build delta package (PR head vs UAT base)
+        # Computes the diff between the PR head commit and the target UAT branch tip
+        run: |
+          sf sgd:source:delta \
+            --to   "HEAD" \
+            --from "${{ github.event.pull_request.base.sha }}" \
+            --output-dir "." \
+            --source-dir force-app/
+
+      - name: Display generated packages
+        run: |
+          set -euo pipefail
+          echo "===== package/package.xml ====="
+          cat package/package.xml 2>/dev/null || echo "(not generated)"
+          echo
+          echo "===== destructiveChanges/destructiveChanges.xml ====="
+          cat destructiveChanges/destructiveChanges.xml 2>/dev/null || echo "(not generated)"
+
+      - name: Upload delta artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: salesforce-delta-validation
+          path: |
+            package/package.xml
+            destructiveChanges/destructiveChanges.xml
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Extract test classes from PR description and comments
         id: pr-tests
         env:
@@ -334,41 +369,6 @@ jobs:
             echo "test_classes=$extracted" >> "$GITHUB_OUTPUT"
           fi
           echo ""
-
-      - name: Install sfdx-git-delta plugin
-        run: |
-          set -euo pipefail
-          echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Build delta package (PR head vs UAT base)
-        # Computes the diff between the PR head commit and the target UAT branch tip
-        run: |
-          sf sgd:source:delta \
-            --to   "HEAD" \
-            --from "${{ github.event.pull_request.base.sha }}" \
-            --output-dir "." \
-            --source-dir force-app/
-
-      - name: Display generated packages
-        run: |
-          set -euo pipefail
-          echo "===== package/package.xml ====="
-          cat package/package.xml 2>/dev/null || echo "(not generated)"
-          echo
-          echo "===== destructiveChanges/destructiveChanges.xml ====="
-          cat destructiveChanges/destructiveChanges.xml 2>/dev/null || echo "(not generated)"
-
-      - name: Upload delta artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: salesforce-delta-validation
-          path: |
-            package/package.xml
-            destructiveChanges/destructiveChanges.xml
-          if-no-files-found: warn
-          retention-days: 7
 
       - name: Compute Apex delta and infer tests
         id: delta
@@ -947,7 +947,8 @@ jobs:
           sf scanner run \
             --target "${{ steps.sca-targets.outputs.targets }}" \
             --format "csv" \
-            --outfile "sfdx-report.csv"
+            --outfile "sfdx-report.csv" \
+            --severity-threshold 3
 
       - name: Check scanner results against waivers
         id: waiver-check
