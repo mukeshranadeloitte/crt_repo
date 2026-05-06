@@ -17,10 +17,7 @@ public with sharing class AccountUtilityService {
         if (accountIds == null || accountIds.isEmpty() || String.isBlank(appendText)) {
             return 0;
         }
-        
-
-
-        
+          
         List<Account> accountsToUpdate = [
             SELECT Id, Description
             FROM Account
@@ -42,8 +39,6 @@ public with sharing class AccountUtilityService {
         return accountsToUpdate.size();
     }
 
-
-    
     public static Map<Id, Integer> getContactCountByAccount(Set<Id> accountIds) {
         Map<Id, Integer> contactCountByAccount = new Map<Id, Integer>();
 
