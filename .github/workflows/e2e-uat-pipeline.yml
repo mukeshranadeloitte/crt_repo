@@ -1173,16 +1173,26 @@ jobs:
               out.write(f"violation_count={violation_count}\n")
               out.write(f"near_expiry_count={near_expiry}\n")
 
-          # Fail the step if any waiver has expired (enforce mode only)
-          if expired_count > 0:
-              if ENFORCEMENT == "warn":
+          # Fail the step for expired waivers or unwaived violations (enforce mode only)
+          if ENFORCEMENT == "warn":
+              if expired_count > 0:
                   print(f"\n⚠️  WARN MODE: {expired_count} expired waiver(s) — would fail in enforce mode.")
-              else:
+              if violation_count > 0:
+                  print(f"\n⚠️  WARN MODE: {violation_count} unwaived violation(s) — would fail in enforce mode.")
+          else:
+              failed = False
+              if expired_count > 0:
                   print(f"\n❌ PIPELINE FAILED: {expired_count} expired waiver(s).")
                   print("   Fix violation(s) OR renew waivers in main branch (.github/sf-scanner-waivers.csv).")
+                  failed = True
+              if violation_count > 0:
+                  print(f"\n❌ PIPELINE FAILED: {violation_count} unwaived violation(s).")
+                  print("   Fix violation(s) OR add waivers to .github/sf-scanner-waivers.csv on main branch.")
+                  failed = True
+              if failed:
                   sys.exit(1)
 
-          print(f"\n✅ All active waivers valid. No expired waivers. (mode={ENFORCEMENT})")
+          print(f"\n✅ All findings waived or clean. (mode={ENFORCEMENT})")
           PYEOF
 
       - name: Post SCA governance report as PR comment
