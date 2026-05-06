@@ -1,0 +1,505 @@
+name: PR Validation Test
+
+on:
+  pull_request:
+    branches:
+      - puct_test
+    types: [opened, reopened, synchronize]
+    paths:
+      - "src/**"
+
+jobs:
+  usingsfdx:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read   # needed for gh api to read PR comments
+    steps:
+      - name: Checkout source code (with submodules)
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 200
+          submodules: recursive
+          token: ${{ secrets.PUCT_PAT }}
+
+      - name: Show Git Log
+        run: git log --oneline
+
+      - name: Verify repo structure
+        run: |
+          echo "Printing src folder structure"
+          ls -R src
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: "17"
+          distribution: "zulu"
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install @salesforce/cli --global
+          sf --version
+
+      - name: Install sfdx-git-delta plugin
+        run: |
+          echo y | sf plugins install sfdx-git-delta
+          git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Setup Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.8
+
+      - name: Build Delta Package
+        run: |
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  DELTA — PR base SHA : ${{ github.event.pull_request.base.sha }}"
+          echo "  DELTA — PR head SHA : ${{ github.event.pull_request.head.sha }}"
+          echo "════════════════════════════════════════════════════════════════"
+
+          sf sgd source delta \
+            --to   "${{ github.event.pull_request.head.sha }}" \
+            --from "${{ github.event.pull_request.base.sha }}" \
+            --output-dir . \
+            --source-dir src/
+
+      - name: Show Delta Files and Package XML
+        run: |
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  FILES CHANGED IN THIS PR (git diff)"
+          echo "════════════════════════════════════════════════════════════════"
+          git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" \
+            -- src/ \
+            | sed 's/^/   → /' || echo "   (none)"
+
+          echo ""
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  package/package.xml"
+          echo "════════════════════════════════════════════════════════════════"
+          if [[ -f package/package.xml ]]; then
+            cat package/package.xml
+          else
+            echo "   (package.xml not generated — no deployable delta)"
+          fi
+
+          echo ""
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  destructiveChanges/destructiveChanges.xml"
+          echo "════════════════════════════════════════════════════════════════"
+          if [[ -f destructiveChanges/destructiveChanges.xml ]]; then
+            cat destructiveChanges/destructiveChanges.xml
+          else
+            echo "   (not generated — no deletions in this PR)"
+          fi
+
+      - name: Authenticate Salesforce Org
+        run: |
+          echo "${{ secrets.TEST_AUTHURL }}" > SF_envnameLogin_URL.txt
+          sf org login sfdx-url --sfdx-url-file SF_envnameLogin_URL.txt
+
+      # ── Extract test classes explicitly listed in PR description or comments ──
+      # Usage: add a line like  "Tests: MyClassTest, AnotherTest"  anywhere in the PR body or a comment
+      - name: Extract Tests from PR Description and Comments
+        id: pr_tests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  TEST CLASS EXTRACTION — PR description + comments"
+          echo "════════════════════════════════════════════════════════════════"
+          echo "Looking for lines matching:  'Tests: ClassName1, ClassName2'"
+          echo ""
+
+          # Fetch PR comments body text via gh CLI
+          comments=$(gh api \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --jq '.[].body' 2>/dev/null || echo "")
+
+          full_text="${PR_BODY}
+          ${comments}"
+
+          # Match the first "Tests: ..." line (case-insensitive)
+          line=$(echo "$full_text" | grep -iE '^\s*(tests?(\s+classes?)?)\s*:' | head -1 || true)
+
+          if [[ -z "$line" ]]; then
+            echo "ℹ️  No 'Tests:' line found — will rely on committed + inferred classes."
+            echo "PR_TEST_CLASSES=" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ Found test line: $line"
+            raw=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+            # Normalise: trim whitespace, collapse spaces around commas
+            extracted=$(echo "$raw" | tr ',' '\n' | xargs | tr ' ' ',' | sed 's/,,*/,/g')
+            echo "   Extracted: $extracted"
+            echo "PR_TEST_CLASSES=$extracted" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Extract committed test classes and infer tests for production classes ──
+      - name: Extract and Infer Test Classes
+        id: extract_tests
+        env:
+          PR_TEST_CLASSES: ${{ steps.pr_tests.outputs.PR_TEST_CLASSES }}
+        run: |
+          python3 << 'PYEOF'
+          import xml.etree.ElementTree as ET
+          import os
+          import sys
+
+          # ── 1. Test classes explicitly listed in PR description/comments (highest priority) ──
+          pr_test_classes_raw = os.environ.get('PR_TEST_CLASSES', '').strip()
+          pr_explicit_tests = [c.strip() for c in pr_test_classes_raw.split(',') if c.strip()]
+          if pr_explicit_tests:
+              print(f"✅ PR-specified test classes: {pr_explicit_tests}")
+          else:
+              print("ℹ️  No PR-specified test classes — will rely on committed + inferred.")
+
+          # ── 2. Parse package.xml for all Apex classes in the delta ──
+          try:
+              tree = ET.parse('package/package.xml')
+              root = tree.getroot()
+              ns = {'sf': 'http://soap.sforce.com/2006/04/metadata'}
+              all_classes = []
+              for t in root.findall('sf:types', ns):
+                  name_el = t.find('sf:name', ns)
+                  if name_el is not None and name_el.text == 'ApexClass':
+                      for m in t.findall('sf:members', ns):
+                          if m.text:
+                              all_classes.append(m.text)
+          except Exception as e:
+              print(f"[WARN] Could not parse package/package.xml: {e}", file=sys.stderr)
+              all_classes = []
+
+          print(f"Apex classes in delta: {all_classes}")
+
+          # ── 3. Categorise: @isTest vs production ──
+          # Detection order: filename convention first (fast), then file content (authoritative)
+          TEST_SUFFIXES = ('Test', 'Tests', '_Test', 'TestClass')
+          TEST_PREFIXES = ('Test',)
+
+          def is_test_by_name(cls_name):
+              for s in TEST_SUFFIXES:
+                  if cls_name.endswith(s):
+                      return True
+              for p in TEST_PREFIXES:
+                  if cls_name.startswith(p):
+                      return True
+              return False
+
+          test_classes_in_pr = []
+          prod_classes = []
+
+          for cls in all_classes:
+              # 3a. Fast check: filename convention (e.g. AccountServiceTest, TestAccount)
+              if is_test_by_name(cls):
+                  test_classes_in_pr.append(cls)
+                  print(f"  [filename]  {cls} → test class (by naming convention)")
+                  continue
+
+              # 3b. Authoritative check: read file for @isTest annotation
+              cls_file = None
+              for dirpath, _, files in os.walk('src'):
+                  if f'{cls}.cls' in files:
+                      cls_file = os.path.join(dirpath, f'{cls}.cls')
+                      break
+              if cls_file:
+                  with open(cls_file, 'r', encoding='utf-8', errors='ignore') as f:
+                      content = f.read()
+                  if '@istest' in content.lower():
+                      test_classes_in_pr.append(cls)
+                      print(f"  [content]   {cls} → test class (@isTest annotation found)")
+                      continue
+
+              prod_classes.append(cls)
+
+          print(f"\nTest classes committed  : {test_classes_in_pr}")
+          print(f"Production classes committed: {prod_classes}")
+
+          # ── 4. Infer test classes for production classes ──
+          # Checks for: ClassNameTest, ClassName_Test, ClassNameTests, TestClassName patterns
+          inferred_tests = []
+          for cls in prod_classes:
+              for pattern in [f'{cls}Test', f'{cls}_Test', f'{cls}Tests', f'Test{cls}']:
+                  for dirpath, _, files in os.walk('src'):
+                      if f'{pattern}.cls' in files:
+                          inferred_tests.append(pattern)
+                          print(f"Inferred test class for '{cls}': {pattern}")
+                          break
+
+          # ── 5. Merge: PR-specified > committed > inferred (deduplicated) ──
+          all_tests = list(dict.fromkeys(pr_explicit_tests + test_classes_in_pr + inferred_tests))
+          print(f"\nFinal test class list: {all_tests}")
+          if pr_explicit_tests:
+              print(f"  [{len(pr_explicit_tests)}] from PR description/comments")
+          print(f"  [{len(test_classes_in_pr)}] committed @isTest classes")
+          print(f"  [{len(inferred_tests)}] inferred by naming convention")
+
+          github_output = os.environ.get('GITHUB_OUTPUT', '/dev/stdout')
+          with open(github_output, 'a') as f:
+              f.write(f"PROD_CLASSES={','.join(prod_classes)}\n")
+              if all_tests:
+                  f.write(f"TEST_CLASSES={','.join(all_tests)}\n")
+                  f.write("TEST_LEVEL=RunSpecifiedTests\n")
+                  print(f"\n✅ Will run {len(all_tests)} test class(es) with RunSpecifiedTests.")
+              else:
+                  f.write("TEST_CLASSES=\n")
+                  f.write("TEST_LEVEL=RunLocalTests\n")
+                  print("\n[WARN] No specific test classes found — falling back to RunLocalTests.")
+          PYEOF
+
+      # ── Validate deployment with async progress reporting ──
+      - name: Validate Deployment with Test Run
+        id: validate_deploy
+        env:
+          TEST_LEVEL:   ${{ steps.extract_tests.outputs.TEST_LEVEL }}
+          TEST_CLASSES: ${{ steps.extract_tests.outputs.TEST_CLASSES }}
+        run: |
+          set -euo pipefail
+
+          # ── Test class resolution summary ─────────────────────────────────────
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  TEST CLASS RESOLUTION"
+          echo "════════════════════════════════════════════════════════════════"
+          echo ""
+          echo "Test level : $TEST_LEVEL"
+          if [[ -n "${TEST_CLASSES:-}" ]]; then
+            echo "✅ Final test classes to run:"
+            echo "$TEST_CLASSES" | tr ',' '\n' | sed 's/^/   → /'
+          else
+            echo "ℹ️  No test classes resolved — will use RunLocalTests"
+          fi
+          echo "════════════════════════════════════════════════════════════════"
+          echo ""
+
+          # ── Components to validate summary ────────────────────────────────────
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  PR VALIDATION — Components to validate"
+          echo "════════════════════════════════════════════════════════════════"
+          if [[ -f package/package.xml ]]; then
+            echo ""
+            echo "📦 Components being validated (package.xml):"
+            grep -E '<members>|<name>' package/package.xml \
+              | sed 's/.*<members>\(.*\)<\/members>/   → \1/' \
+              | sed 's/.*<name>\(.*\)<\/name>/  [\1]/' \
+              || echo "   (empty or unreadable)"
+          fi
+          if [[ -f destructiveChanges/destructiveChanges.xml ]]; then
+            echo ""
+            echo "🗑️  Components being DELETED (destructiveChanges.xml):"
+            grep -E '<members>|<name>' destructiveChanges/destructiveChanges.xml \
+              | sed 's/.*<members>\(.*\)<\/members>/   → \1/' \
+              | sed 's/.*<name>\(.*\)<\/name>/  [\1]/' \
+              || echo "   (empty or unreadable)"
+          fi
+          echo ""
+          echo "🧪 Test classes: ${TEST_CLASSES:-RunLocalTests}"
+          echo "════════════════════════════════════════════════════════════════"
+          echo ""
+
+          # ── Build deploy command array ────────────────────────────────────────
+          deploy_cmd=(
+            sf project deploy start
+            -x package/package.xml
+            -o "${{ secrets.TEST_USERNAME }}"
+            --dry-run
+            --json
+            --async
+          )
+
+          if [[ "$TEST_LEVEL" == "RunSpecifiedTests" && -n "${TEST_CLASSES:-}" ]]; then
+            deploy_cmd+=(--test-level RunSpecifiedTests)
+            while IFS= read -r cls; do
+              [[ -z "$cls" ]] && continue
+              deploy_cmd+=(--tests "$(echo "$cls" | xargs)")
+            done <<< "$(echo "$TEST_CLASSES" | tr ',' '\n')"
+          else
+            deploy_cmd+=(--test-level RunLocalTests)
+          fi
+
+          echo "▶ Running: ${deploy_cmd[*]}"
+          echo ""
+
+          # ── Launch async validation ───────────────────────────────────────────
+          set +e
+          "${deploy_cmd[@]}" > deploy-start.json 2>deploy-stderr.log
+          start_rc=$?
+          set -e
+
+          if [[ $start_rc -ne 0 ]]; then
+            echo "::error::Failed to start deploy validation."
+            cat deploy-stderr.log || true
+            cat deploy-start.json || true
+            exit 1
+          fi
+
+          JOB_ID=$(jq -r '.result.id // empty' deploy-start.json 2>/dev/null || true)
+
+          if [[ -z "$JOB_ID" ]]; then
+            # Ran synchronously — use start output directly
+            cp deploy-start.json deploy_result.json
+            STATUS=$(jq -r '.result.status // "Unknown"' deploy_result.json 2>/dev/null)
+            echo "🚀 Validation completed synchronously — Status: $STATUS"
+          else
+            echo "🚀 Validation job started — ID: ${JOB_ID}"
+            echo ""
+            echo "  Time  │ Status         │ Components        │ Tests"
+            echo "────────┼────────────────┼───────────────────┼──────────────────────"
+
+            ELAPSED=0
+            MAX_WAIT=1800
+            STATUS="Pending"
+            REPORT="{}"
+
+            while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+              REPORT=$(sf project deploy report --job-id "$JOB_ID" --json 2>/dev/null || echo '{}')
+              STATUS=$(echo   "$REPORT" | jq -r '.result.status                   // "Unknown"')
+              DEPLOYED=$(echo "$REPORT" | jq -r '.result.numberComponentsDeployed // 0')
+              TOTAL=$(echo    "$REPORT" | jq -r '.result.numberComponentsTotal    // 0')
+              COMP_ERR=$(echo "$REPORT" | jq -r '.result.numberComponentErrors    // 0')
+              T_DONE=$(echo   "$REPORT" | jq -r '.result.numberTestsCompleted     // 0')
+              T_TOTAL=$(echo  "$REPORT" | jq -r '.result.numberTestsTotal         // 0')
+              T_ERR=$(echo    "$REPORT" | jq -r '.result.numberTestErrors         // 0')
+              DETAIL=$(echo   "$REPORT" | jq -r '.result.stateDetail             // ""')
+
+              printf "  %3ds  │ %-14s │ %4d/%-4d err:%-3d │ %3d/%-3d err:%-3d  %s\n" \
+                "$ELAPSED" "$STATUS" "$DEPLOYED" "$TOTAL" "$COMP_ERR" \
+                "$T_DONE" "$T_TOTAL" "$T_ERR" "${DETAIL:+(${DETAIL:0:40})}"
+
+              case "$STATUS" in
+                Succeeded|Failed|Canceled|SucceededPartial|Error) break ;;
+              esac
+
+              sleep 15
+              ELAPSED=$((ELAPSED + 15))
+            done
+
+            echo "────────┴────────────────┴───────────────────┴──────────────────────"
+            echo "$REPORT" > deploy_result.json
+          fi
+
+          # ── Failure diagnostics ───────────────────────────────────────────────
+          if [[ "$STATUS" == "Failed" || "$STATUS" == "Canceled" || "$STATUS" == "Error" ]]; then
+            echo ""
+            echo "::error::Deploy validation failed (status: $STATUS)."
+            echo ""
+            echo "--- component failures ---"
+            jq -r '.result.details.componentFailures[]?
+              | "  ❌ [\(.componentType)] \(.fileName // .fullName // "unknown"):\(.lineNumber // "?")\n     \(.problem)"' \
+              deploy_result.json 2>/dev/null || echo "  (none)"
+            echo ""
+            echo "--- test failures ---"
+            jq -r '.result.details.runTestResult.failures[]?
+              | "  ❌ \(.name).\(.methodName)\n     \(.message)"' \
+              deploy_result.json 2>/dev/null || echo "  (none)"
+            echo ""
+            echo "--- coverage warnings ---"
+            jq -r '.result.details.runTestResult.codeCoverageWarnings[]?
+              | "  ⚠️  \(.name // "unknown"): \(.message)"' \
+              deploy_result.json 2>/dev/null || echo "  (none)"
+            exit 1
+          fi
+
+          # ── Success: component status from org ────────────────────────────────
+          echo ""
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  VALIDATION RESULT — Component Status from Org"
+          echo "════════════════════════════════════════════════════════════════"
+          jq -r '"✅ Status: \(.result.status // "n/a")  |  Components checked: \(.result.numberComponentsDeployed // 0)  |  Errors: \(.result.numberComponentErrors // 0)"' \
+            deploy_result.json 2>/dev/null || true
+          echo ""
+          echo "Component breakdown:"
+          jq -r '.result.details.componentSuccesses[]?
+            | if .created   == true then "  ➕ CREATED   [\(.componentType)] \(.fileName // .fullName)"
+              elif .changed == true then "  ✏️  UPDATED   [\(.componentType)] \(.fileName // .fullName)"
+              elif .deleted == true then "  🗑️  DELETED   [\(.componentType)] \(.fileName // .fullName)"
+              else                       "  ✅ UNCHANGED [\(.componentType)] \(.fileName // .fullName)"
+              end' \
+            deploy_result.json 2>/dev/null | sort || echo "  (no component detail available)"
+          echo "════════════════════════════════════════════════════════════════"
+
+      # ── NEW: Parse coverage results and fail if any PR class is below 75% ──
+      - name: Check Test Coverage (fail if below 75%)
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import sys
+
+          COVERAGE_THRESHOLD = 75
+
+          # ── Load deploy JSON result ──
+          try:
+              with open('deploy_result.json', 'r') as f:
+                  raw = f.read()
+              # sf --json can emit warnings before the JSON object; find the first '{'
+              start = raw.find('{')
+              if start == -1:
+                  print("[ERROR] No JSON object found in deploy_result.json")
+                  print(raw[:2000])
+                  sys.exit(1)
+              result = json.loads(raw[start:])
+          except Exception as e:
+              print(f"[ERROR] Could not parse deploy_result.json: {e}")
+              sys.exit(1)
+
+          deploy_status = result.get('status', 1)
+
+          # ── Extract coverage arrays ──
+          run_test_result = (
+              result.get('result', {})
+                    .get('details', {})
+                    .get('runTestResult', {})
+          )
+          code_coverage      = run_test_result.get('codeCoverage', [])
+          coverage_warnings  = run_test_result.get('codeCoverageWarnings', [])
+
+          if coverage_warnings:
+              print("\n⚠️  Coverage Warnings from org:")
+              for w in coverage_warnings:
+                  print(f"  {w.get('message', w)}")
+
+          # ── Build coverage map ──
+          print(f"\n{'─'*62}")
+          print(f"{'Class':<50} {'Coverage':>10}")
+          print(f"{'─'*62}")
+          coverage_map = {}
+          for cov in code_coverage:
+              name  = cov.get('name', 'Unknown')
+              total = cov.get('numLocations', 0)
+              not_covered = cov.get('numLocationsNotCovered', 0)
+              pct = round(((total - not_covered) / total) * 100, 1) if total > 0 else 0.0
+              coverage_map[name] = pct
+              print(f"{name:<50} {pct:>9.1f}%")
+          print(f"{'─'*62}")
+
+          # ── Gate: check only production classes committed in this PR ──
+          prod_classes_str = "${{ steps.extract_tests.outputs.PROD_CLASSES }}"
+          prod_classes = [c.strip() for c in prod_classes_str.split(',') if c.strip()]
+
+          print(f"\n🔍 Coverage gate for PR classes (threshold: {COVERAGE_THRESHOLD}%):")
+          failed_classes = []
+          for cls in prod_classes:
+              if cls in coverage_map:
+                  pct = coverage_map[cls]
+                  icon = "✅" if pct >= COVERAGE_THRESHOLD else "❌"
+                  print(f"  {icon} {cls}: {pct:.1f}%")
+                  if pct < COVERAGE_THRESHOLD:
+                      failed_classes.append((cls, pct))
+              else:
+                  print(f"  ⚠️  {cls}: no coverage data returned — class may have 0 lines or was not exercised")
+
+          if failed_classes:
+              print(f"\n❌ COVERAGE GATE FAILED — classes below {COVERAGE_THRESHOLD}%:")
+              for cls, pct in failed_classes:
+                  print(f"     • {cls}: {pct:.1f}%")
+              sys.exit(1)
+
+          if deploy_status != 0 and not code_coverage:
+              print("\n❌ Deployment validation failed and no coverage data was returned.")
+              sys.exit(1)
+
+          print(f"\n✅ Coverage gate passed — all PR classes meet or exceed {COVERAGE_THRESHOLD}%.")
+          PYEOF
