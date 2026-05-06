@@ -386,24 +386,37 @@ jobs:
           fi
 
           apex_changed_classes=""
+          changed_test_classes=""
+
           while IFS= read -r file; do
             [[ "$file" =~ ^force-app/main/default/classes/.*\.cls$ ]] || continue
-            [[ "$file" =~ (Test|Tests)\.cls$ ]] && continue
             class_name=$(basename "$file" .cls)
-            case ",${apex_changed_classes}," in
-              *,"$class_name",*) ;;
-              *) apex_changed_classes="${apex_changed_classes:+${apex_changed_classes},}$class_name" ;;
-            esac
-          done <<< "$changed_files"
 
-          changed_test_classes=""
-          while IFS= read -r file; do
-            [[ "$file" =~ ^force-app/main/default/classes/.*(Test|Tests)\.cls$ ]] || continue
-            class_name=$(basename "$file" .cls)
-            case ",${changed_test_classes}," in
-              *,"$class_name",*) ;;
-              *) changed_test_classes="${changed_test_classes:+${changed_test_classes},}$class_name" ;;
-            esac
+            # 1. Fast check: filename naming convention
+            is_test=false
+            if [[ "$class_name" =~ (Test|Tests|TestClass|_Test)$ ]] || [[ "$class_name" =~ ^Test ]]; then
+              is_test=true
+            fi
+
+            # 2. Authoritative check: read file content for @isTest annotation
+            if [[ "$is_test" == "false" && -f "$file" ]]; then
+              if grep -qi '@istest' "$file" 2>/dev/null; then
+                is_test=true
+                echo "  [content]  $class_name → test class (@isTest annotation found)"
+              fi
+            fi
+
+            if [[ "$is_test" == "true" ]]; then
+              case ",${changed_test_classes}," in
+                *,"$class_name",*) ;;
+                *) changed_test_classes="${changed_test_classes:+${changed_test_classes},}$class_name" ;;
+              esac
+            else
+              case ",${apex_changed_classes}," in
+                *,"$class_name",*) ;;
+                *) apex_changed_classes="${apex_changed_classes:+${apex_changed_classes},}$class_name" ;;
+              esac
+            fi
           done <<< "$changed_files"
 
           inferred_test_classes="$changed_test_classes"
@@ -438,6 +451,7 @@ jobs:
           fi
 
           echo "inferred_test_classes=$inferred_test_classes" >> "$GITHUB_OUTPUT"
+          echo "prod_classes=$apex_changed_classes" >> "$GITHUB_OUTPUT"
           echo "deploy_manifest=$deploy_manifest" >> "$GITHUB_OUTPUT"
           echo "destructive_manifest=$destructive_manifest" >> "$GITHUB_OUTPUT"
           echo "apex_required=$apex_required" >> "$GITHUB_OUTPUT"
@@ -523,7 +537,7 @@ jobs:
           echo "════════════════════════════════════════════════════════════════"
           echo ""
 
-          deploy_cmd=(sf project deploy validate --target-org "$ORG_ALIAS" --json)
+          deploy_cmd=(sf project deploy start --target-org "$ORG_ALIAS" --dry-run --json)
 
           if [[ -n "${DEPLOY_MANIFEST:-}" ]]; then
             deploy_cmd+=(--manifest "$DEPLOY_MANIFEST")
@@ -690,41 +704,68 @@ jobs:
 
           [[ -f deploy-output.json ]] || { echo "::error::deploy-output.json not found."; exit 1; }
 
-          total=$(jq '[.result.details.runTestResult.codeCoverage[]?.numLocations // 0] | add // 0' deploy-output.json 2>/dev/null || echo 0)
-          uncovered=$(jq '[.result.details.runTestResult.codeCoverage[]?.numLocationsNotCovered // 0] | add // 0' deploy-output.json 2>/dev/null || echo 0)
-          total=${total:-0}; total=${total//null/0}
-          uncovered=${uncovered:-0}; uncovered=${uncovered//null/0}
+          python3 << 'PYEOF'
+          import json, sys, os
 
-          if [[ "$total" -le 0 ]]; then
-            echo "::error::Cannot determine coverage from deploy output."
-            exit 1
-          fi
+          COVERAGE_THRESHOLD = int(os.environ.get('COVERAGE_THRESHOLD', '85'))
 
-          covered=$(( total - uncovered ))
-          coverage=$(awk -v c="$covered" -v t="$total" 'BEGIN { printf "%.2f", (c/t)*100 }')
-          below=$(awk -v cov="$coverage" -v req="$COVERAGE_THRESHOLD" 'BEGIN { print (cov+0 < req+0) ? 1 : 0 }')
+          with open('deploy-output.json', 'r') as f:
+              raw = f.read()
+          start = raw.find('{')
+          result = json.loads(raw[start:])
 
-          echo "════════════════════════════════════════════════════════════════"
-          echo "  APEX COVERAGE REPORT"
-          echo "════════════════════════════════════════════════════════════════"
-          echo ""
-          echo "Per-class coverage:"
-          jq -r '.result.details.runTestResult.codeCoverage[]?
-            | ((.numLocations - .numLocationsNotCovered) / .numLocations * 100 | floor | tostring) as $pct
-            | if (.numLocations - .numLocationsNotCovered) / .numLocations * 100 < 75
-              then "  ❌ \(.name): \($pct)% (\(.numLocations - .numLocationsNotCovered)/\(.numLocations) lines)"
-              else "  ✅ \(.name): \($pct)% (\(.numLocations - .numLocationsNotCovered)/\(.numLocations) lines)"
-              end' \
-            deploy-output.json 2>/dev/null | sort || true
+          run_test_result = (
+              result.get('result', {})
+                    .get('details', {})
+                    .get('runTestResult', {})
+          )
+          code_coverage     = run_test_result.get('codeCoverage', [])
+          coverage_warnings = run_test_result.get('codeCoverageWarnings', [])
 
-          echo ""
-          echo "Overall: $covered / $total lines = $coverage%  (threshold: ${COVERAGE_THRESHOLD}%)"
-          echo "════════════════════════════════════════════════════════════════"
+          if coverage_warnings:
+              print("\n⚠️  Coverage Warnings from org:")
+              for w in coverage_warnings:
+                  print(f"  {w.get('message', w)}")
 
-          if [[ "$below" -eq 1 ]]; then
-            echo "::error::Coverage $coverage% is below required ${COVERAGE_THRESHOLD}%."
-            exit 1
-          fi
+          # Build per-class coverage map
+          print(f"\n{'─'*62}")
+          print(f"{'Class':<50} {'Coverage':>10}")
+          print(f"{'─'*62}")
+          coverage_map = {}
+          for cov in code_coverage:
+              name = cov.get('name', 'Unknown')
+              total = cov.get('numLocations', 0)
+              not_covered = cov.get('numLocationsNotCovered', 0)
+              pct = round(((total - not_covered) / total) * 100, 1) if total > 0 else 0.0
+              coverage_map[name] = pct
+              icon = "✅" if pct >= COVERAGE_THRESHOLD else "❌"
+              print(f"{icon} {name:<48} {pct:>9.1f}%")
+          print(f"{'─'*62}")
+
+          # Gate: check only production classes changed in this PR
+          prod_classes_str = "${{ steps.delta.outputs.prod_classes }}"
+          prod_classes = [c.strip() for c in prod_classes_str.split(',') if c.strip()]
+
+          print(f"\n🔍 Per-class coverage gate for PR classes (threshold: {COVERAGE_THRESHOLD}%):")
+          failed_classes = []
+          for cls in prod_classes:
+              if cls in coverage_map:
+                  pct = coverage_map[cls]
+                  icon = "✅" if pct >= COVERAGE_THRESHOLD else "❌"
+                  print(f"  {icon} {cls}: {pct:.1f}%")
+                  if pct < COVERAGE_THRESHOLD:
+                      failed_classes.append((cls, pct))
+              else:
+                  print(f"  ⚠️  {cls}: no coverage data — class may have 0 executable lines or was not exercised")
+
+          if failed_classes:
+              print(f"\n❌ COVERAGE GATE FAILED — classes below {COVERAGE_THRESHOLD}%:")
+              for cls, pct in failed_classes:
+                  print(f"     • {cls}: {pct:.1f}%")
+              sys.exit(1)
+
+          print(f"\n✅ Coverage gate passed — all PR production classes meet or exceed {COVERAGE_THRESHOLD}%.")
+          PYEOF
 
       - name: Install Salesforce Code Analyzer
         if: steps.delta.outputs.has_delta == 'true' && vars.SCA_ENFORCEMENT_MODE != 'off'
