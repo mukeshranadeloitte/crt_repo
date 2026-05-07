@@ -332,6 +332,151 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # ── Snapshot: capture the pre-PR (base-branch) versions of every changed
+      #    Salesforce file so a future rollback has a ready-made stable package.
+      #    Artifact: rollback-snapshot-pr-<N>  (retained 90 days)
+      #    Manifest: rollback-snapshot/snapshot-manifest.json
+      - name: Snapshot pre-PR stable versions from base branch
+        id: snapshot
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA:   ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA:   ${{ github.event.pull_request.head.sha }}
+          BASE_REF:   ${{ github.event.pull_request.base.ref }}
+          HEAD_REF:   ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER:  ${{ github.event.pull_request.number }}
+          PR_TITLE:   ${{ github.event.pull_request.title }}
+          PR_AUTHOR:  ${{ github.event.pull_request.user.login }}
+          REPO:       ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  ROLLBACK SNAPSHOT — capturing base-branch stable versions"
+          echo "  Base: ${BASE_REF} (${BASE_SHA:0:10})"
+          echo "  Head: ${HEAD_REF} (${HEAD_SHA:0:10})"
+          echo "════════════════════════════════════════════════════════════════"
+
+          SNAPSHOT_DIR="rollback-snapshot"
+          mkdir -p "$SNAPSHOT_DIR"
+
+          # ── Collect all changed Salesforce source files ───────────────────
+          changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null \
+            || git diff --name-only HEAD~1 HEAD)
+
+          sf_changed=$(echo "$changed_files" | grep -E '^force-app/' || true)
+
+          if [[ -z "$sf_changed" ]]; then
+            echo "ℹ️  No force-app files changed — no snapshot needed."
+            echo "snapshot_files=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ── For each changed file, restore the base-branch version ────────
+          snapped=0
+          skipped=0
+          snapped_list=""
+
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+
+            # Check file existed in base (not brand-new in this PR)
+            if git show "${BASE_SHA}:${file}" &>/dev/null; then
+              dest="${SNAPSHOT_DIR}/${file}"
+              mkdir -p "$(dirname "$dest")"
+              git show "${BASE_SHA}:${file}" > "$dest"
+              snapped=$((snapped + 1))
+              snapped_list="${snapped_list}${file}\n"
+              echo "  ✅ snapped: ${file}"
+            else
+              skipped=$((skipped + 1))
+              echo "  ⚠️  new file (no base version): ${file}"
+            fi
+          done <<< "$sf_changed"
+
+          echo ""
+          echo "Snapped ${snapped} file(s), skipped ${skipped} new file(s)."
+
+          # ── Build sfdx-git-delta package.xml for the base-branch state ────
+          # Run delta FROM HEAD (current) TO BASE (stable) to get re-deploy package
+          sf sgd:source:delta \
+            --to   "${BASE_SHA}" \
+            --from "${HEAD_SHA}" \
+            --output-dir "${SNAPSHOT_DIR}/delta/" \
+            --source-dir force-app/ \
+            2>/dev/null || true
+
+          echo ""
+          echo "===== Rollback package.xml (re-deploy stable base state) ====="
+          cat "${SNAPSHOT_DIR}/delta/package/package.xml" 2>/dev/null || echo "(none generated)"
+          echo ""
+          echo "===== Rollback destructiveChanges.xml (remove PR-added metadata) ====="
+          cat "${SNAPSHOT_DIR}/delta/destructiveChanges/destructiveChanges.xml" 2>/dev/null || echo "(none)"
+
+          # ── Write provenance manifest ─────────────────────────────────────
+          pr_info=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '{title:.title, body:.body, author:.user.login, created_at:.created_at, html_url:.html_url, base_branch:.base.ref, head_branch:.head.ref}' \
+            2>/dev/null || echo '{}')
+
+          python3 - <<PYEOF
+          import json, os, datetime
+
+          pr_info   = json.loads('''${pr_info}''')
+          snapped   = ${snapped}
+          skipped   = ${skipped}
+
+          files_raw = """${snapped_list}"""
+          snapped_files = [f for f in files_raw.strip().split('\n') if f.strip()]
+
+          manifest = {
+            "snapshot_created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "description":         "Pre-PR stable versions from base branch. Use for rollback.",
+            "pr": {
+              "number":       int(os.environ["PR_NUMBER"]),
+              "title":        pr_info.get("title", os.environ.get("PR_TITLE", "")),
+              "author":       pr_info.get("author", os.environ.get("PR_AUTHOR", "")),
+              "html_url":     pr_info.get("html_url", ""),
+              "created_at":   pr_info.get("created_at", ""),
+            },
+            "commits": {
+              "base_branch":  os.environ["BASE_REF"],
+              "base_sha":     os.environ["BASE_SHA"],
+              "head_branch":  os.environ["HEAD_REF"],
+              "head_sha":     os.environ["HEAD_SHA"],
+            },
+            "snapshot": {
+              "total_files_snapped":  snapped,
+              "total_new_files_skipped": skipped,
+              "snapped_files": snapped_files,
+            },
+            "rollback_instructions": {
+              "step1": "Download this artifact: rollback-snapshot-pr-${PR_NUMBER}",
+              "step2": "Deploy rollback-snapshot/delta/package/package.xml to restore stable versions",
+              "step3": "Deploy rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml to remove PR-added metadata",
+              "step4": "Or trigger the manual rollback workflow_dispatch with rollback_commit_sha=" + os.environ["BASE_SHA"],
+            }
+          }
+
+          os.makedirs("rollback-snapshot", exist_ok=True)
+          with open("rollback-snapshot/snapshot-manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+
+          print(json.dumps(manifest, indent=2))
+          PYEOF
+
+          echo "snapshot_files=${snapped}" >> "$GITHUB_OUTPUT"
+          echo "base_sha=${BASE_SHA}"       >> "$GITHUB_OUTPUT"
+
+      - name: Upload rollback snapshot artifact
+        if: github.event_name == 'pull_request' && steps.snapshot.outputs.snapshot_files != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-snapshot-pr-${{ github.event.pull_request.number }}
+          path: rollback-snapshot/
+          if-no-files-found: warn
+          retention-days: 90
+
       - name: Extract test classes from PR description and comments
         id: pr-tests
         env:
@@ -2616,6 +2761,84 @@ jobs:
           rm -f sfdxAuthUrl.txt
           sf org display --target-org "$ORG_ALIAS"
 
+      - name: Download pre-built rollback snapshot (if available)
+        id: snapshot-dl
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.inputs.rollback_pr_number }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${PR_NUMBER:-}" ]]; then
+            echo "ℹ️  No rollback_pr_number provided — will compute delta from git history."
+            echo "use_snapshot=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ARTIFACT_NAME="rollback-snapshot-pr-${PR_NUMBER}"
+          echo "Looking for snapshot artifact: ${ARTIFACT_NAME}"
+
+          # Find the most recent run that has this artifact
+          RUN_ID=$(gh api \
+            "repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=1" \
+            --jq '.artifacts[0].workflow_run.id // empty' 2>/dev/null || true)
+
+          if [[ -z "${RUN_ID}" ]]; then
+            echo "⚠️  Snapshot artifact '${ARTIFACT_NAME}' not found — will compute delta from git history."
+            echo "use_snapshot=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found snapshot from run ${RUN_ID}. Downloading..."
+          gh run download "${RUN_ID}" \
+            --name "${ARTIFACT_NAME}" \
+            --dir "rollback-snapshot/" \
+            --repo "${{ github.repository }}"
+
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  SNAPSHOT MANIFEST"
+          echo "════════════════════════════════════════════════════════════════"
+          cat rollback-snapshot/snapshot-manifest.json 2>/dev/null || echo "(manifest not found)"
+          echo ""
+
+          # Print summary from manifest
+          python3 - <<'PYEOF'
+          import json, sys
+          try:
+              m = json.load(open("rollback-snapshot/snapshot-manifest.json"))
+              pr = m.get("pr", {})
+              c  = m.get("commits", {})
+              s  = m.get("snapshot", {})
+              print(f"  PR #{pr.get('number')}  —  {pr.get('title','')}")
+              print(f"  Author:     {pr.get('author','')}")
+              print(f"  Base:       {c.get('base_branch','')} ({c.get('base_sha','')[:10]})")
+              print(f"  Head:       {c.get('head_branch','')} ({c.get('head_sha','')[:10]})")
+              print(f"  PR URL:     {pr.get('html_url','')}")
+              print(f"  Snapped:    {s.get('total_files_snapped',0)} file(s)")
+              print(f"  New files:  {s.get('total_new_files_skipped',0)} (no base version — will be deleted in rollback)")
+              print("")
+              print("  Files in snapshot:")
+              for f in s.get("snapped_files", []):
+                  print(f"    → {f}")
+          except Exception as e:
+              print(f"Could not parse manifest: {e}", file=sys.stderr)
+          PYEOF
+
+          echo "use_snapshot=true" >> "$GITHUB_OUTPUT"
+
+          # Check if delta package.xml exists in snapshot
+          if [[ -f "rollback-snapshot/delta/package/package.xml" ]] && grep -q '<members>' rollback-snapshot/delta/package/package.xml; then
+            echo "snapshot_deploy_manifest=rollback-snapshot/delta/package/package.xml" >> "$GITHUB_OUTPUT"
+          else
+            echo "snapshot_deploy_manifest=" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -f "rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml" ]] && grep -q '<members>' rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml; then
+            echo "snapshot_destructive_manifest=rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml" >> "$GITHUB_OUTPUT"
+          else
+            echo "snapshot_destructive_manifest=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build rollback delta (HEAD → rollback commit)
         id: rollback-delta
         env:
@@ -2693,6 +2916,10 @@ jobs:
       - name: Execute rollback deployment
         id: rollback-deploy
         env:
+          # Prefer snapshot manifests (pre-built from PR validation) over git-computed delta
+          USE_SNAPSHOT:                  ${{ steps.snapshot-dl.outputs.use_snapshot }}
+          SNAPSHOT_DEPLOY_MANIFEST:      ${{ steps.snapshot-dl.outputs.snapshot_deploy_manifest }}
+          SNAPSHOT_DESTRUCTIVE_MANIFEST: ${{ steps.snapshot-dl.outputs.snapshot_destructive_manifest }}
           ROLLBACK_DEPLOY_MANIFEST:      ${{ steps.rollback-delta.outputs.rollback_deploy_manifest }}
           ROLLBACK_DESTRUCTIVE_MANIFEST: ${{ steps.rollback-delta.outputs.rollback_destructive_manifest }}
           HAS_APEX:                      ${{ steps.rollback-delta.outputs.has_apex }}
@@ -2700,7 +2927,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${ROLLBACK_DEPLOY_MANIFEST}" && -z "${ROLLBACK_DESTRUCTIVE_MANIFEST}" ]]; then
+          # Prefer the pre-built snapshot artifact when provided (it contains the exact
+          # base-branch file versions captured at PR validation time)
+          if [[ "${USE_SNAPSHOT}" == "true" ]]; then
+            DEPLOY_MANIFEST="${SNAPSHOT_DEPLOY_MANIFEST}"
+            DESTRUCTIVE_MANIFEST="${SNAPSHOT_DESTRUCTIVE_MANIFEST}"
+            echo "📦 Using pre-built rollback snapshot (captured at PR validation time)"
+            cat rollback-snapshot/snapshot-manifest.json 2>/dev/null | python3 -c "
+          import json,sys
+          m=json.load(sys.stdin)
+          pr=m.get('pr',{})
+          c=m.get('commits',{})
+          print(f'  PR #{pr.get(\"number\")} by {pr.get(\"author\")} — {pr.get(\"title\",\"\")}')
+          print(f'  Stable base: {c.get(\"base_branch\")} @ {c.get(\"base_sha\",\"\")[:10]}')
+          print(f'  PR URL: {pr.get(\"html_url\",\"\")}')
+          " 2>/dev/null || true
+          else
+            DEPLOY_MANIFEST="${ROLLBACK_DEPLOY_MANIFEST}"
+            DESTRUCTIVE_MANIFEST="${ROLLBACK_DESTRUCTIVE_MANIFEST}"
+            echo "🔧 Using git-computed rollback delta (no snapshot artifact found)"
+          fi
+
+          if [[ -z "${DEPLOY_MANIFEST}" && -z "${DESTRUCTIVE_MANIFEST}" ]]; then
             echo "::error::Nothing to rollback — no delta found between HEAD and ${ROLLBACK_SHA}."
             echo "This may mean the PR only had non-Salesforce changes, or the commit SHA is incorrect."
             exit 1
@@ -2708,13 +2956,13 @@ jobs:
 
           rollback_cmd=(sf project deploy start --target-org "$ORG_ALIAS" --wait 60 --json)
 
-          if [[ -n "${ROLLBACK_DEPLOY_MANIFEST}" ]]; then
-            rollback_cmd+=(--manifest "${ROLLBACK_DEPLOY_MANIFEST}")
+          if [[ -n "${DEPLOY_MANIFEST}" ]]; then
+            rollback_cmd+=(--manifest "${DEPLOY_MANIFEST}")
           fi
 
-          if [[ -n "${ROLLBACK_DESTRUCTIVE_MANIFEST}" ]]; then
+          if [[ -n "${DESTRUCTIVE_MANIFEST}" ]]; then
             # Pre-destructive: delete new metadata BEFORE re-deploying old state
-            rollback_cmd+=(--pre-destructive-changes "${ROLLBACK_DESTRUCTIVE_MANIFEST}")
+            rollback_cmd+=(--pre-destructive-changes "${DESTRUCTIVE_MANIFEST}")
           fi
 
           if [[ "${HAS_APEX}" == "true" ]]; then
