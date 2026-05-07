@@ -336,176 +336,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ── Snapshot: capture the pre-PR (base-branch) versions of every changed
-      #    Salesforce file so a future rollback has a ready-made stable package.
-      #    Artifact: rollback-snapshot-pr-<N>  (retained 90 days)
-      #    Manifest: rollback-snapshot/snapshot-manifest.json
-      - name: Snapshot pre-PR stable versions from base branch
-        id: snapshot
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
-          BASE_SHA:   ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA:   ${{ github.event.pull_request.head.sha }}
-          BASE_REF:   ${{ github.event.pull_request.base.ref }}
-          HEAD_REF:   ${{ github.event.pull_request.head.ref }}
-          PR_NUMBER:  ${{ github.event.pull_request.number }}
-          PR_TITLE:   ${{ github.event.pull_request.title }}
-          PR_AUTHOR:  ${{ github.event.pull_request.user.login }}
-          REPO:       ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          # ── Use the latest tip of the target (base) branch ───────────────
-          # BASE_SHA = github.event.pull_request.base.sha is the merge-base commit
-          # (where the PR branched from). The target branch may have new commits
-          # since then. We resolve the current tip of BASE_REF to always snapshot
-          # the most up-to-date stable version of each file.
-          TARGET_TIP=$(git rev-parse "origin/${BASE_REF}" 2>/dev/null || echo "${BASE_SHA}")
-          echo "════════════════════════════════════════════════════════════════"
-          echo "  ROLLBACK SNAPSHOT — capturing target-branch stable versions"
-          echo "  Target branch:  ${BASE_REF}"
-          echo "  Target tip SHA: ${TARGET_TIP:0:10}  (latest commit on ${BASE_REF})"
-          echo "  PR base SHA:    ${BASE_SHA:0:10}  (merge-base when PR was opened)"
-          echo "  Head: ${HEAD_REF} (${HEAD_SHA:0:10})"
-          echo "════════════════════════════════════════════════════════════════"
-
-          SNAPSHOT_DIR="rollback-snapshot"
-          mkdir -p "$SNAPSHOT_DIR"
-
-          # ── Collect all changed Salesforce source files ───────────────────
-          changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null \
-            || git diff --name-only HEAD~1 HEAD)
-
-          sf_changed=$(echo "$changed_files" | grep -E '^force-app/' || true)
-
-          if [[ -z "$sf_changed" ]]; then
-            echo "ℹ️  No force-app files changed — no snapshot needed."
-            echo "snapshot_files=0" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # ── For each changed file, restore from the target branch tip ─────
-          # Priority: target branch tip (most current stable) → PR merge-base fallback
-          snapped=0
-          skipped=0
-          snapped_list=""
-          snapped_from_tip=0
-          snapped_from_base=0
-
-          while IFS= read -r file; do
-            [[ -z "$file" ]] && continue
-
-            # Try target branch tip first (latest stable version on UAT/target)
-            if git show "${TARGET_TIP}:${file}" &>/dev/null; then
-              dest="${SNAPSHOT_DIR}/${file}"
-              mkdir -p "$(dirname "$dest")"
-              git show "${TARGET_TIP}:${file}" > "$dest"
-              snapped=$((snapped + 1))
-              snapped_from_tip=$((snapped_from_tip + 1))
-              snapped_list="${snapped_list}${file}\n"
-              echo "  ✅ snapped from ${BASE_REF} tip: ${file}"
-            # Fallback: PR merge-base (for files that existed when PR was opened but were removed from target since)
-            elif git show "${BASE_SHA}:${file}" &>/dev/null; then
-              dest="${SNAPSHOT_DIR}/${file}"
-              mkdir -p "$(dirname "$dest")"
-              git show "${BASE_SHA}:${file}" > "$dest"
-              snapped=$((snapped + 1))
-              snapped_from_base=$((snapped_from_base + 1))
-              snapped_list="${snapped_list}${file}\n"
-              echo "  ✅ snapped from merge-base (fallback): ${file}"
-            else
-              skipped=$((skipped + 1))
-              echo "  ⚠️  new file (not in ${BASE_REF}): ${file}"
-            fi
-          done <<< "$sf_changed"
-
-          echo ""
-          echo "Snapped ${snapped} file(s): ${snapped_from_tip} from ${BASE_REF} tip, ${snapped_from_base} from merge-base."
-          echo "Skipped ${skipped} new file(s) (no version exists in target branch)."
-
-          # ── Build sfdx-git-delta package.xml for the target-branch state ──
-          # Run delta FROM HEAD (current) TO target tip (stable) to get re-deploy package
-          sf sgd:source:delta \
-            --to   "${TARGET_TIP}" \
-            --from "${HEAD_SHA}" \
-            --output-dir "${SNAPSHOT_DIR}/delta/" \
-            --source-dir force-app/ \
-            2>/dev/null || true
-
-          echo ""
-          echo "===== Rollback package.xml (re-deploy stable base state) ====="
-          cat "${SNAPSHOT_DIR}/delta/package/package.xml" 2>/dev/null || echo "(none generated)"
-          echo ""
-          echo "===== Rollback destructiveChanges.xml (remove PR-added metadata) ====="
-          cat "${SNAPSHOT_DIR}/delta/destructiveChanges/destructiveChanges.xml" 2>/dev/null || echo "(none)"
-
-          # ── Write provenance manifest ─────────────────────────────────────
-          export TARGET_TIP
-          pr_info=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
-            --jq '{title:.title, body:.body, author:.user.login, created_at:.created_at, html_url:.html_url, base_branch:.base.ref, head_branch:.head.ref}' \
-            2>/dev/null || echo '{}')
-
-          python3 - <<PYEOF
-          import json, os, datetime
-
-          pr_info   = json.loads('''${pr_info}''')
-          snapped   = ${snapped}
-          skipped   = ${skipped}
-
-          files_raw = """${snapped_list}"""
-          snapped_files = [f for f in files_raw.strip().split('\n') if f.strip()]
-
-          manifest = {
-            "snapshot_created_at": datetime.datetime.utcnow().isoformat() + "Z",
-            "description":         "Stable versions captured from target branch at PR validation time. Use for rollback.",
-            "pr": {
-              "number":       int(os.environ["PR_NUMBER"]),
-              "title":        pr_info.get("title", os.environ.get("PR_TITLE", "")),
-              "author":       pr_info.get("author", os.environ.get("PR_AUTHOR", "")),
-              "html_url":     pr_info.get("html_url", ""),
-              "created_at":   pr_info.get("created_at", ""),
-            },
-            "commits": {
-              "target_branch":    os.environ["BASE_REF"],
-              "target_tip_sha":   os.environ["TARGET_TIP"],
-              "pr_merge_base_sha": os.environ["BASE_SHA"],
-              "feature_branch":   os.environ["HEAD_REF"],
-              "feature_sha":      os.environ["HEAD_SHA"],
-            },
-            "snapshot": {
-              "source":                  f"{os.environ['BASE_REF']} tip ({os.environ['TARGET_TIP'][:10]})",
-              "total_files_snapped":     snapped,
-              "total_new_files_skipped": skipped,
-              "snapped_files":           snapped_files,
-            },
-            "rollback_instructions": {
-              "step1": "Download this artifact: rollback-snapshot-pr-${PR_NUMBER}",
-              "step2": "Deploy rollback-snapshot/delta/package/package.xml to restore stable versions from " + os.environ["BASE_REF"],
-              "step3": "Deploy rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml to remove PR-added metadata",
-              "step4": "Or trigger the manual rollback workflow_dispatch with rollback_commit_sha=" + os.environ["TARGET_TIP"] + " rollback_pr_number=${PR_NUMBER}",
-            }
-          }
-
-          os.makedirs("rollback-snapshot", exist_ok=True)
-          with open("rollback-snapshot/snapshot-manifest.json", "w") as f:
-              json.dump(manifest, f, indent=2)
-
-          print(json.dumps(manifest, indent=2))
-          PYEOF
-
-          echo "snapshot_files=${snapped}"     >> "$GITHUB_OUTPUT"
-          echo "target_tip_sha=${TARGET_TIP}"  >> "$GITHUB_OUTPUT"
-
-      - name: Upload rollback snapshot artifact
-        if: github.event_name == 'pull_request' && steps.snapshot.outputs.snapshot_files != '0'
-        uses: actions/upload-artifact@v4
-        with:
-          name: rollback-snapshot-pr-${{ github.event.pull_request.number }}
-          path: rollback-snapshot/
-          if-no-files-found: warn
-          retention-days: 90
-
       - name: Extract test classes from PR description and comments
         id: pr-tests
         env:
@@ -2391,12 +2221,159 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+      # ── Rollback Snapshot: capture the pre-deploy (target-branch tip) versions
+      #    of every deployed file. Stored in pr_packages alongside the deployment.
+      #    This gives a permanent, browseable rollback record for each deploy.
+      - name: Snapshot pre-deploy stable versions from target branch
+        id: snapshot
+        env:
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA:   ${{ needs.approval-merge-gate.outputs.base_sha }}
+          HEAD_SHA:   ${{ needs.approval-merge-gate.outputs.head_sha }}
+          PR_NUMBER:  ${{ needs.approval-merge-gate.outputs.pr_number }}
+          REPO:       ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Resolve current target-branch tip (not just the merge-base).
+          # The merge event may have been approved against an older base_sha.
+          BASE_REF=$(git branch -r --contains "$BASE_SHA" 2>/dev/null \
+            | grep -v HEAD | head -1 | sed 's|origin/||' | xargs || true)
+          if [[ -z "$BASE_REF" ]]; then
+            # Fallback: derive from PR info via GH API
+            BASE_REF=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.base.ref' 2>/dev/null || echo "")
+          fi
+
+          if [[ -n "$BASE_REF" ]]; then
+            TARGET_TIP=$(git rev-parse "origin/${BASE_REF}" 2>/dev/null || echo "$BASE_SHA")
+          else
+            TARGET_TIP="$BASE_SHA"
+            BASE_REF="unknown"
+          fi
+
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  ROLLBACK SNAPSHOT (deploy-time) — capturing pre-deploy stable state"
+          echo "  Target branch:  ${BASE_REF}"
+          echo "  Target tip SHA: ${TARGET_TIP:0:10}"
+          echo "  Deployed SHA:   ${HEAD_SHA:0:10}"
+          echo "════════════════════════════════════════════════════════════════"
+
+          SNAPSHOT_DIR="rollback-snapshot"
+          mkdir -p "$SNAPSHOT_DIR"
+
+          # ── Files changed by this deployment ─────────────────────────────
+          changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null \
+            || git diff --name-only HEAD~1 HEAD)
+          sf_changed=$(echo "$changed_files" | grep -E '^force-app/' || true)
+
+          if [[ -z "$sf_changed" ]]; then
+            echo "ℹ️  No force-app files in deployment — no snapshot needed."
+            echo "snapshot_files=0"   >> "$GITHUB_OUTPUT"
+            echo "target_tip_sha=${TARGET_TIP}" >> "$GITHUB_OUTPUT"
+            echo "base_ref=${BASE_REF}"         >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          snapped=0; skipped=0; snapped_list=""; snapped_from_tip=0; snapped_from_base=0
+
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            if git show "${TARGET_TIP}:${file}" &>/dev/null; then
+              dest="${SNAPSHOT_DIR}/${file}"
+              mkdir -p "$(dirname "$dest")"
+              git show "${TARGET_TIP}:${file}" > "$dest"
+              snapped=$((snapped + 1)); snapped_from_tip=$((snapped_from_tip + 1))
+              snapped_list="${snapped_list}${file}\n"
+              echo "  ✅ snapped from ${BASE_REF} tip: ${file}"
+            elif git show "${BASE_SHA}:${file}" &>/dev/null; then
+              dest="${SNAPSHOT_DIR}/${file}"
+              mkdir -p "$(dirname "$dest")"
+              git show "${BASE_SHA}:${file}" > "$dest"
+              snapped=$((snapped + 1)); snapped_from_base=$((snapped_from_base + 1))
+              snapped_list="${snapped_list}${file}\n"
+              echo "  ✅ snapped from merge-base (fallback): ${file}"
+            else
+              skipped=$((skipped + 1))
+              echo "  ⚠️  new file (not in ${BASE_REF}): ${file}"
+            fi
+          done <<< "$sf_changed"
+
+          echo "Snapped ${snapped} file(s) (${snapped_from_tip} from tip, ${snapped_from_base} from base). Skipped ${skipped} new file(s)."
+
+          # ── Build reverse delta manifests ────────────────────────────────
+          sf sgd:source:delta \
+            --to   "${TARGET_TIP}" \
+            --from "${HEAD_SHA}" \
+            --output-dir "${SNAPSHOT_DIR}/delta/" \
+            --source-dir force-app/ \
+            2>/dev/null || true
+
+          # ── Write provenance manifest ────────────────────────────────────
+          export TARGET_TIP BASE_REF
+          pr_info=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '{title:.title, author:.user.login, created_at:.created_at, html_url:.html_url}' \
+            2>/dev/null || echo '{}')
+
+          python3 - <<PYEOF
+          import json, os, datetime
+
+          pr_info      = json.loads('''${pr_info}''')
+          snapped      = ${snapped}
+          skipped      = ${skipped}
+          files_raw    = """${snapped_list}"""
+          snapped_files = [f for f in files_raw.strip().split('\n') if f.strip()]
+
+          manifest = {
+            "snapshot_created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "snapshot_stage":      "deploy-after-merge",
+            "description":         "Pre-deploy stable versions captured from target branch at merge/deploy time. Use for rollback.",
+            "pr": {
+              "number":     int(os.environ["PR_NUMBER"]),
+              "title":      pr_info.get("title", ""),
+              "author":     pr_info.get("author", ""),
+              "html_url":   pr_info.get("html_url", ""),
+              "created_at": pr_info.get("created_at", ""),
+            },
+            "commits": {
+              "target_branch":      os.environ["BASE_REF"],
+              "target_tip_sha":     os.environ["TARGET_TIP"],
+              "pr_merge_base_sha":  os.environ["BASE_SHA"],
+              "deployed_sha":       os.environ["HEAD_SHA"],
+            },
+            "snapshot": {
+              "source":                  f"{os.environ['BASE_REF']} tip ({os.environ['TARGET_TIP'][:10]})",
+              "total_files_snapped":     snapped,
+              "total_new_files_skipped": skipped,
+              "snapped_files":           snapped_files,
+            },
+            "rollback_instructions": {
+              "step1": "Check out the pr_packages branch and find this PR's folder.",
+              "step2": "Deploy rollback-snapshot/delta/package/package.xml to restore stable versions from " + os.environ["BASE_REF"],
+              "step3": "Deploy rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml to remove PR-added metadata",
+              "step4": "Or trigger the manual rollback workflow_dispatch with rollback_commit_sha=" + os.environ["TARGET_TIP"] + " rollback_pr_number=${PR_NUMBER}",
+            }
+          }
+
+          os.makedirs("rollback-snapshot", exist_ok=True)
+          with open("rollback-snapshot/snapshot-manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+
+          print(json.dumps(manifest, indent=2))
+          PYEOF
+
+          echo "snapshot_files=${snapped}"          >> "$GITHUB_OUTPUT"
+          echo "target_tip_sha=${TARGET_TIP}"       >> "$GITHUB_OUTPUT"
+          echo "base_ref=${BASE_REF}"               >> "$GITHUB_OUTPUT"
+
       - name: Commit deployment package to pr_packages branch
         env:
           PKG_NAME:    ${{ steps.pkg.outputs.pkg_name }}
           PKG_DIR:     ${{ steps.pkg.outputs.pkg_dir }}
           DEPLOY_SHA:  ${{ steps.pkg.outputs.deployed_commit }}
           GH_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
+          SNAPSHOT_FILES: ${{ steps.snapshot.outputs.snapshot_files }}
+          TARGET_TIP:     ${{ steps.snapshot.outputs.target_tip_sha }}
+          BASE_REF:       ${{ steps.snapshot.outputs.base_ref }}
         run: |
           set -euo pipefail
 
@@ -2414,19 +2391,29 @@ jobs:
             git commit --allow-empty -m "chore: initialise pr_packages branch"
           fi
 
-          # Copy the package into the branch
+          # Copy the deployment package into the branch
           mkdir -p "${PKG_NAME}"
           cp -r "${GITHUB_WORKSPACE}/${PKG_DIR}/." "${PKG_NAME}/"
+
+          # Copy rollback snapshot into a subdirectory of this deploy folder
+          if [[ "${SNAPSHOT_FILES:-0}" != "0" ]] && [[ -d "${GITHUB_WORKSPACE}/rollback-snapshot" ]]; then
+            mkdir -p "${PKG_NAME}/rollback-snapshot"
+            cp -r "${GITHUB_WORKSPACE}/rollback-snapshot/." "${PKG_NAME}/rollback-snapshot/"
+            echo "✅ Rollback snapshot (${SNAPSHOT_FILES} file(s) from ${BASE_REF} tip: ${TARGET_TIP:0:10}) included in pr_packages."
+          else
+            echo "ℹ️  No rollback snapshot generated — no force-app files changed or new-files-only deploy."
+          fi
 
           git add "${PKG_NAME}"
           git commit -m "deploy: ${PKG_NAME}
 
           Deployed commit: ${DEPLOY_SHA}
           PR: ${{ github.event.pull_request.number || 'n/a' }}
+          Rollback snapshot: ${SNAPSHOT_FILES:-0} file(s) from ${BASE_REF:-unknown} (${TARGET_TIP:0:10})
           Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           git push origin pr_packages
-          echo "✅ Package committed to pr_packages branch: ${PKG_NAME}"
+          echo "✅ Package + rollback snapshot committed to pr_packages branch: ${PKG_NAME}"
 
       - name: Update DELTA_FROM_COMMIT variable to deployed commit
         env:
