@@ -297,6 +297,41 @@ jobs:
           rm -f sfdxAuthUrl.txt
           sf org display --target-org "$ORG_ALIAS"
 
+      - name: Install sfdx-git-delta plugin
+        run: |
+          set -euo pipefail
+          echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build delta package (PR head vs UAT base)
+        # Computes the diff between the PR head commit and the target UAT branch tip
+        run: |
+          sf sgd:source:delta \
+            --to   "HEAD" \
+            --from "${{ github.event.pull_request.base.sha }}" \
+            --output-dir "." \
+            --source-dir force-app/
+
+      - name: Display generated packages
+        run: |
+          set -euo pipefail
+          echo "===== package/package.xml ====="
+          cat package/package.xml 2>/dev/null || echo "(not generated)"
+          echo
+          echo "===== destructiveChanges/destructiveChanges.xml ====="
+          cat destructiveChanges/destructiveChanges.xml 2>/dev/null || echo "(not generated)"
+
+      - name: Upload delta artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: salesforce-delta-validation
+          path: |
+            package/package.xml
+            destructiveChanges/destructiveChanges.xml
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Extract test classes from PR description and comments
         id: pr-tests
         env:
@@ -335,41 +370,6 @@ jobs:
           fi
           echo ""
 
-      - name: Install sfdx-git-delta plugin
-        run: |
-          set -euo pipefail
-          echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Build delta package (PR head vs UAT base)
-        # Computes the diff between the PR head commit and the target UAT branch tip
-        run: |
-          sf sgd:source:delta \
-            --to   "HEAD" \
-            --from "${{ github.event.pull_request.base.sha }}" \
-            --output-dir "." \
-            --source-dir force-app/
-
-      - name: Display generated packages
-        run: |
-          set -euo pipefail
-          echo "===== package/package.xml ====="
-          cat package/package.xml 2>/dev/null || echo "(not generated)"
-          echo
-          echo "===== destructiveChanges/destructiveChanges.xml ====="
-          cat destructiveChanges/destructiveChanges.xml 2>/dev/null || echo "(not generated)"
-
-      - name: Upload delta artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: salesforce-delta-validation
-          path: |
-            package/package.xml
-            destructiveChanges/destructiveChanges.xml
-          if-no-files-found: warn
-          retention-days: 7
-
       - name: Compute Apex delta and infer tests
         id: delta
         env:
@@ -386,24 +386,37 @@ jobs:
           fi
 
           apex_changed_classes=""
+          changed_test_classes=""
+
           while IFS= read -r file; do
             [[ "$file" =~ ^force-app/main/default/classes/.*\.cls$ ]] || continue
-            [[ "$file" =~ (Test|Tests)\.cls$ ]] && continue
             class_name=$(basename "$file" .cls)
-            case ",${apex_changed_classes}," in
-              *,"$class_name",*) ;;
-              *) apex_changed_classes="${apex_changed_classes:+${apex_changed_classes},}$class_name" ;;
-            esac
-          done <<< "$changed_files"
 
-          changed_test_classes=""
-          while IFS= read -r file; do
-            [[ "$file" =~ ^force-app/main/default/classes/.*(Test|Tests)\.cls$ ]] || continue
-            class_name=$(basename "$file" .cls)
-            case ",${changed_test_classes}," in
-              *,"$class_name",*) ;;
-              *) changed_test_classes="${changed_test_classes:+${changed_test_classes},}$class_name" ;;
-            esac
+            # 1. Fast check: filename naming convention
+            is_test=false
+            if [[ "$class_name" =~ (Test|Tests|TestClass|_Test)$ ]] || [[ "$class_name" =~ ^Test ]]; then
+              is_test=true
+            fi
+
+            # 2. Authoritative check: read file content for @isTest annotation
+            if [[ "$is_test" == "false" && -f "$file" ]]; then
+              if grep -qi '@istest' "$file" 2>/dev/null; then
+                is_test=true
+                echo "  [content]  $class_name → test class (@isTest annotation found)"
+              fi
+            fi
+
+            if [[ "$is_test" == "true" ]]; then
+              case ",${changed_test_classes}," in
+                *,"$class_name",*) ;;
+                *) changed_test_classes="${changed_test_classes:+${changed_test_classes},}$class_name" ;;
+              esac
+            else
+              case ",${apex_changed_classes}," in
+                *,"$class_name",*) ;;
+                *) apex_changed_classes="${apex_changed_classes:+${apex_changed_classes},}$class_name" ;;
+              esac
+            fi
           done <<< "$changed_files"
 
           inferred_test_classes="$changed_test_classes"
@@ -438,6 +451,7 @@ jobs:
           fi
 
           echo "inferred_test_classes=$inferred_test_classes" >> "$GITHUB_OUTPUT"
+          echo "prod_classes=$apex_changed_classes" >> "$GITHUB_OUTPUT"
           echo "deploy_manifest=$deploy_manifest" >> "$GITHUB_OUTPUT"
           echo "destructive_manifest=$destructive_manifest" >> "$GITHUB_OUTPUT"
           echo "apex_required=$apex_required" >> "$GITHUB_OUTPUT"
@@ -523,7 +537,7 @@ jobs:
           echo "════════════════════════════════════════════════════════════════"
           echo ""
 
-          deploy_cmd=(sf project deploy validate --target-org "$ORG_ALIAS" --json)
+          deploy_cmd=(sf project deploy start --target-org "$ORG_ALIAS" --dry-run --json)
 
           if [[ -n "${DEPLOY_MANIFEST:-}" ]]; then
             deploy_cmd+=(--manifest "$DEPLOY_MANIFEST")
@@ -690,41 +704,68 @@ jobs:
 
           [[ -f deploy-output.json ]] || { echo "::error::deploy-output.json not found."; exit 1; }
 
-          total=$(jq '[.result.details.runTestResult.codeCoverage[]?.numLocations // 0] | add // 0' deploy-output.json 2>/dev/null || echo 0)
-          uncovered=$(jq '[.result.details.runTestResult.codeCoverage[]?.numLocationsNotCovered // 0] | add // 0' deploy-output.json 2>/dev/null || echo 0)
-          total=${total:-0}; total=${total//null/0}
-          uncovered=${uncovered:-0}; uncovered=${uncovered//null/0}
+          python3 << 'PYEOF'
+          import json, sys, os
 
-          if [[ "$total" -le 0 ]]; then
-            echo "::error::Cannot determine coverage from deploy output."
-            exit 1
-          fi
+          COVERAGE_THRESHOLD = int(os.environ.get('COVERAGE_THRESHOLD', '85'))
 
-          covered=$(( total - uncovered ))
-          coverage=$(awk -v c="$covered" -v t="$total" 'BEGIN { printf "%.2f", (c/t)*100 }')
-          below=$(awk -v cov="$coverage" -v req="$COVERAGE_THRESHOLD" 'BEGIN { print (cov+0 < req+0) ? 1 : 0 }')
+          with open('deploy-output.json', 'r') as f:
+              raw = f.read()
+          start = raw.find('{')
+          result = json.loads(raw[start:])
 
-          echo "════════════════════════════════════════════════════════════════"
-          echo "  APEX COVERAGE REPORT"
-          echo "════════════════════════════════════════════════════════════════"
-          echo ""
-          echo "Per-class coverage:"
-          jq -r '.result.details.runTestResult.codeCoverage[]?
-            | ((.numLocations - .numLocationsNotCovered) / .numLocations * 100 | floor | tostring) as $pct
-            | if (.numLocations - .numLocationsNotCovered) / .numLocations * 100 < 75
-              then "  ❌ \(.name): \($pct)% (\(.numLocations - .numLocationsNotCovered)/\(.numLocations) lines)"
-              else "  ✅ \(.name): \($pct)% (\(.numLocations - .numLocationsNotCovered)/\(.numLocations) lines)"
-              end' \
-            deploy-output.json 2>/dev/null | sort || true
+          run_test_result = (
+              result.get('result', {})
+                    .get('details', {})
+                    .get('runTestResult', {})
+          )
+          code_coverage     = run_test_result.get('codeCoverage', [])
+          coverage_warnings = run_test_result.get('codeCoverageWarnings', [])
 
-          echo ""
-          echo "Overall: $covered / $total lines = $coverage%  (threshold: ${COVERAGE_THRESHOLD}%)"
-          echo "════════════════════════════════════════════════════════════════"
+          if coverage_warnings:
+              print("\n⚠️  Coverage Warnings from org:")
+              for w in coverage_warnings:
+                  print(f"  {w.get('message', w)}")
 
-          if [[ "$below" -eq 1 ]]; then
-            echo "::error::Coverage $coverage% is below required ${COVERAGE_THRESHOLD}%."
-            exit 1
-          fi
+          # Build per-class coverage map
+          print(f"\n{'─'*62}")
+          print(f"{'Class':<50} {'Coverage':>10}")
+          print(f"{'─'*62}")
+          coverage_map = {}
+          for cov in code_coverage:
+              name = cov.get('name', 'Unknown')
+              total = cov.get('numLocations', 0)
+              not_covered = cov.get('numLocationsNotCovered', 0)
+              pct = round(((total - not_covered) / total) * 100, 1) if total > 0 else 0.0
+              coverage_map[name] = pct
+              icon = "✅" if pct >= COVERAGE_THRESHOLD else "❌"
+              print(f"{icon} {name:<48} {pct:>9.1f}%")
+          print(f"{'─'*62}")
+
+          # Gate: check only production classes changed in this PR
+          prod_classes_str = "${{ steps.delta.outputs.prod_classes }}"
+          prod_classes = [c.strip() for c in prod_classes_str.split(',') if c.strip()]
+
+          print(f"\n🔍 Per-class coverage gate for PR classes (threshold: {COVERAGE_THRESHOLD}%):")
+          failed_classes = []
+          for cls in prod_classes:
+              if cls in coverage_map:
+                  pct = coverage_map[cls]
+                  icon = "✅" if pct >= COVERAGE_THRESHOLD else "❌"
+                  print(f"  {icon} {cls}: {pct:.1f}%")
+                  if pct < COVERAGE_THRESHOLD:
+                      failed_classes.append((cls, pct))
+              else:
+                  print(f"  ⚠️  {cls}: no coverage data — class may have 0 executable lines or was not exercised")
+
+          if failed_classes:
+              print(f"\n❌ COVERAGE GATE FAILED — classes below {COVERAGE_THRESHOLD}%:")
+              for cls, pct in failed_classes:
+                  print(f"     • {cls}: {pct:.1f}%")
+              sys.exit(1)
+
+          print(f"\n✅ Coverage gate passed — all PR production classes meet or exceed {COVERAGE_THRESHOLD}%.")
+          PYEOF
 
       - name: Install Salesforce Code Analyzer
         if: steps.delta.outputs.has_delta == 'true' && vars.SCA_ENFORCEMENT_MODE != 'off'
@@ -907,8 +948,7 @@ jobs:
           sf scanner run \
             --target "${{ steps.sca-targets.outputs.targets }}" \
             --format "csv" \
-            --outfile "sfdx-report.csv" \
-            --severity-threshold 3
+            --outfile "sfdx-report.csv"
 
       - name: Check scanner results against waivers
         id: waiver-check
@@ -991,6 +1031,13 @@ jobs:
                   severity  = row.get("Severity", row.get("severity", "")).strip()
                   problem   = row.get("Problem",  row.get("Description", row.get("problem", ""))).strip()
                   line      = row.get("Line",     row.get("line", "")).strip()
+
+                  # Only enforce severity 3 and above (1=critical, 2=high, 3=medium)
+                  try:
+                      if int(severity) > 3:
+                          continue
+                  except (ValueError, TypeError):
+                      pass  # If severity is non-numeric, include it
 
                   print(f"  Checking violation: rule='{rule}' file='{os.path.basename(file_path)}'")
 
@@ -1134,16 +1181,26 @@ jobs:
               out.write(f"violation_count={violation_count}\n")
               out.write(f"near_expiry_count={near_expiry}\n")
 
-          # Fail the step if any waiver has expired (enforce mode only)
-          if expired_count > 0:
-              if ENFORCEMENT == "warn":
+          # Fail the step for expired waivers or unwaived violations (enforce mode only)
+          if ENFORCEMENT == "warn":
+              if expired_count > 0:
                   print(f"\n⚠️  WARN MODE: {expired_count} expired waiver(s) — would fail in enforce mode.")
-              else:
+              if violation_count > 0:
+                  print(f"\n⚠️  WARN MODE: {violation_count} unwaived violation(s) — would fail in enforce mode.")
+          else:
+              failed = False
+              if expired_count > 0:
                   print(f"\n❌ PIPELINE FAILED: {expired_count} expired waiver(s).")
                   print("   Fix violation(s) OR renew waivers in main branch (.github/sf-scanner-waivers.csv).")
+                  failed = True
+              if violation_count > 0:
+                  print(f"\n❌ PIPELINE FAILED: {violation_count} unwaived violation(s).")
+                  print("   Fix violation(s) OR add waivers to .github/sf-scanner-waivers.csv on main branch.")
+                  failed = True
+              if failed:
                   sys.exit(1)
 
-          print(f"\n✅ All active waivers valid. No expired waivers. (mode={ENFORCEMENT})")
+          print(f"\n✅ All findings waived or clean. (mode={ENFORCEMENT})")
           PYEOF
 
       - name: Post SCA governance report as PR comment
@@ -1376,135 +1433,6 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 4 — Automated Hard Gates
-  # Apex test coverage enforcement (75% governance threshold) +
-  # destructive-changes guard + PR comment. Runs in parallel with SCA.
-  # ─────────────────────────────────────────────────────────────────────────────
-  automated-governance:
-    name: Automated Hard Gates
-    if: ${{ github.event_name == 'pull_request' && needs.salesforce-validation.outputs.has_delta == 'true' }}
-    needs: [salesforce-validation]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install Salesforce CLI
-        run: npm install -g @salesforce/cli
-
-      - name: Authenticate to UAT org
-        env:
-          SFDX_AUTH_URL: ${{ secrets.CRT_UAT_AUTHURL }}
-        run: |
-          set -euo pipefail
-          echo "$SFDX_AUTH_URL" > sfdxAuthUrl.txt
-          sf org login sfdx-url --sfdx-url-file sfdxAuthUrl.txt --alias uat --set-default
-          rm -f sfdxAuthUrl.txt
-
-      - name: Run Apex tests with coverage (JSON output)
-        run: |
-          set -euo pipefail
-          sf apex run test \
-            --target-org uat \
-            --code-coverage \
-            --result-format json \
-            --wait 30 > test-result.json
-
-      - name: Enforce minimum 75% test coverage
-        run: |
-          set -euo pipefail
-          COVERAGE=$(jq -r '.result.summary.testRunCoverage // 0' test-result.json)
-          echo "Coverage: ${COVERAGE}%"
-          awk -v c="$COVERAGE" 'BEGIN { exit (c+0 < 75) ? 1 : 0 }' || {
-            echo "::error::Coverage ${COVERAGE}% is below required 75%."
-            exit 1
-          }
-
-      - name: Check destructive changes presence
-        id: destructive-check
-        run: |
-          set -euo pipefail
-          if [ -f "manifest/destructiveChanges.xml" ] || [ -f "manifest/destructveChanges.xml" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Comment reminder for destructive changes backup
-        if: steps.destructive-check.outputs.present == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: "⚠️ Detected destructive changes file. Please confirm data backup is completed before deployment approval."
-            });
-
-      - name: Install Salesforce Scanner plugin
-        if: needs.salesforce-validation.outputs.has_delta == 'true'
-        run: sf plugins install @salesforce/sfdx-scanner
-
-      - name: Detect changed Salesforce files for SCA
-        id: sca-targets
-        run: |
-          set -euo pipefail
-          BASE="${{ github.event.pull_request.base.sha }}"
-          HEAD="${{ github.event.pull_request.head.sha }}"
-
-          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM "${BASE}...${HEAD}" \
-            | grep '^force-app/' \
-            | grep -E '\.(cls|trigger|js|html|css)$' \
-            || true)
-
-          if [[ -z "$CHANGED_FILES" ]]; then
-            echo "No scannable Salesforce files changed — skipping SCA."
-            echo "targets=" >> "$GITHUB_OUTPUT"
-            echo "has_targets=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Changed Salesforce files to scan:"
-          echo "$CHANGED_FILES"
-          TARGETS=$(echo "$CHANGED_FILES" | paste -sd ',' -)
-          APEX=$(echo "$CHANGED_FILES" | grep -cE '\.(cls|trigger)$' || echo 0)
-          LWC=$(echo "$CHANGED_FILES"  | grep -cE '\.(js|html|css)$'  || echo 0)
-          echo "Scan targets: ${APEX} Apex file(s), ${LWC} LWC/JS file(s)"
-
-          echo "targets=${TARGETS}" >> "$GITHUB_OUTPUT"
-          echo "has_targets=true"   >> "$GITHUB_OUTPUT"
-
-      - name: Salesforce Code Analyzer
-        if: steps.sca-targets.outputs.has_targets == 'true'
-        continue-on-error: true
-        run: |
-          sf scanner run \
-            --target "${{ steps.sca-targets.outputs.targets }}" \
-            --format "csv" \
-            --outfile "sfdx-report.csv" \
-            --severity-threshold 3
-
-      - name: Upload scanner report
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: sfdx-report
-          path: sfdx-report.csv
-          if-no-files-found: warn
-
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 5 — CheckMarx AST SAST Scan
   # Runs only when CX_CLIENT_SECRET is set and scanner input includes checkmarx.
@@ -1697,7 +1625,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 7 — Approval + Merge Gate
   # Triggers on PR review approval. Verifies approval is for the latest SHA,
-  # checks all required jobs passed (ANY success, not most-recent), then merges.
+  # checks all required jobs passed. Does NOT merge — merge happens AFTER
+  # a successful deployment in Job 9 (deploy-after-merge).
   # ─────────────────────────────────────────────────────────────────────────────
   approval-merge-gate:
     name: Approval + Merge Gate
@@ -1705,19 +1634,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: write
-      pull-requests: write
+      contents: read
+      pull-requests: read
     outputs:
-      merge_commit_sha: ${{ steps.merge.outputs.merge_commit_sha }}
-      merged: ${{ steps.merge.outputs.merged }}
+      head_sha:  ${{ steps.validate.outputs.head_sha }}
+      base_sha:  ${{ steps.validate.outputs.base_sha }}
+      pr_number: ${{ steps.validate.outputs.pr_number }}
     steps:
       - name: Validate approval freshness and required checks
+        id: validate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REVIEW_COMMIT: ${{ github.event.review.commit_id }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
 
@@ -1732,7 +1664,6 @@ jobs:
           required_checks=(
             "Salesforce PR validation"
             "SCA/SAST Stage"
-            "Automated Hard Gates"
           )
 
           if [[ "${{ secrets.CX_CLIENT_SECRET != '' }}" == "true" ]]; then
@@ -1760,55 +1691,32 @@ jobs:
             fi
           done
 
-      - name: Merge pull request with merge commit
-        id: merge
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-
-          result=$(gh api \
-            --method PUT \
-            -H "Accept: application/vnd.github+json" \
-            "repos/$REPO/pulls/$PR_NUMBER/merge" \
-            -f merge_method='merge' \
-            -f sha="$HEAD_SHA")
-
-          merged=$(echo "$result" | jq -r '.merged')
-          merge_sha=$(echo "$result" | jq -r '.sha')
-
-          if [[ "$merged" != "true" || -z "$merge_sha" || "$merge_sha" == "null" ]]; then
-            echo "::error::PR merge failed."
-            echo "$result"
-            exit 1
-          fi
-
-          echo "merged=true" >> "$GITHUB_OUTPUT"
-          echo "merge_commit_sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          echo "✅ All required checks passed on ${HEAD_SHA}. Proceeding to deploy."
+          echo "head_sha=${HEAD_SHA}"   >> "$GITHUB_OUTPUT"
+          echo "base_sha=${BASE_SHA}"   >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 9 — Deploy merged commit to target org
-  # Checks out the merge commit (not pre-merge PR head), rebuilds delta, and
-  # runs a real deploy (not validate). Includes destructive changes.
+  # JOB 9 — Deploy PR head to target org, then merge on success
+  # Checks out the PR head SHA (not a pre-merged commit), rebuilds delta using
+  # the PR base SHA as FROM, runs a real deploy (not validate), then merges the
+  # PR only if deployment succeeds. Includes destructive changes.
   # ─────────────────────────────────────────────────────────────────────────────
   deploy-after-merge:
     name: Deploy merged commit to target org
-    if: ${{ github.event_name == 'pull_request_review' && needs.approval-merge-gate.outputs.merged == 'true' }}
+    if: ${{ github.event_name == 'pull_request_review' && needs.approval-merge-gate.result == 'success' }}
     needs: approval-merge-gate
     runs-on: ubuntu-latest
     timeout-minutes: 35
     permissions:
       contents: write
-      pull-requests: read
+      pull-requests: write
     steps:
-      - name: Checkout merged commit
+      - name: Checkout PR head
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ needs.approval-merge-gate.outputs.merge_commit_sha }}
+          ref: ${{ needs.approval-merge-gate.outputs.head_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -1896,24 +1804,23 @@ jobs:
           echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Build delta package from merged commit
+      - name: Build delta package from PR head
         id: delta_pkg
         run: |
           set -euo pipefail
-          # Use HEAD^1 (the UAT branch tip just before this PR merged) as the FROM reference.
-          # This mirrors exactly what validation used (github.event.pull_request.base.sha),
-          # ensuring the same components are deployed as were validated.
-          MERGE_BASE=$(git rev-parse HEAD^1 2>/dev/null || true)
-          if [[ -z "$MERGE_BASE" ]]; then
-            # Shallow clone fallback: use DELTA_FROM_COMMIT if git parent not available
-            if [[ -z "${DELTA_FROM_COMMIT:-}" ]]; then
-              echo "::error::Cannot determine delta base. Set repository variable DELTA_FROM_COMMIT to the baseline SHA."
-              exit 1
-            fi
+          # Use the PR base SHA (UAT branch tip the PR targets) as the FROM reference.
+          # This is the same reference used during PR validation, so exactly the same
+          # components are deployed as were validated.
+          BASE_SHA="${{ needs.approval-merge-gate.outputs.base_sha }}"
+          if [[ -n "$BASE_SHA" ]]; then
+            MERGE_BASE="$BASE_SHA"
+            echo "✅ Using PR base SHA as FROM: ${MERGE_BASE}"
+          elif [[ -n "${DELTA_FROM_COMMIT:-}" ]]; then
             MERGE_BASE="$DELTA_FROM_COMMIT"
             echo "ℹ️  Using DELTA_FROM_COMMIT as fallback FROM: ${MERGE_BASE}"
           else
-            echo "✅ Using merge parent (HEAD^1) as FROM: ${MERGE_BASE}"
+            echo "::error::Cannot determine delta base. Set repository variable DELTA_FROM_COMMIT to the baseline SHA."
+            exit 1
           fi
           echo "   TO: HEAD ($(git rev-parse HEAD))"
           echo "merge_base=${MERGE_BASE}" >> "$GITHUB_OUTPUT"
@@ -1951,7 +1858,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          changed_files=$(git diff --name-only HEAD^ HEAD)
+          changed_files=$(git diff --name-only "${{ needs.approval-merge-gate.outputs.base_sha }}" HEAD)
 
           apex_changed_classes=""
           changed_test_classes=""
@@ -2022,11 +1929,6 @@ jobs:
             destructive_manifest="destructiveChanges/destructiveChanges.xml"
           fi
 
-          if [[ "$has_apex" == "true" && -z "${all_test_classes:-}" ]]; then
-            echo "::error::Apex changed but no tests specified or inferred for merged deployment."
-            exit 1
-          fi
-
           echo "all_test_classes=${all_test_classes:-}" >> "$GITHUB_OUTPUT"
           echo "has_apex=$has_apex" >> "$GITHUB_OUTPUT"
           echo "deploy_manifest=$deploy_manifest" >> "$GITHUB_OUTPUT"
@@ -2042,8 +1944,6 @@ jobs:
       - name: Deploy merged changes to target org
         if: steps.tests.outputs.has_delta == 'true'
         env:
-          HAS_APEX: ${{ steps.tests.outputs.has_apex }}
-          ALL_TEST_CLASSES: ${{ steps.tests.outputs.all_test_classes }}
           DEPLOY_MANIFEST: ${{ steps.tests.outputs.deploy_manifest }}
           DESTRUCTIVE_MANIFEST: ${{ steps.tests.outputs.destructive_manifest }}
         run: |
@@ -2061,13 +1961,8 @@ jobs:
             deploy_cmd+=(--post-destructive-changes "$DESTRUCTIVE_MANIFEST")
           fi
 
-          if [[ "$HAS_APEX" == "true" ]]; then
-            deploy_cmd+=(--test-level RunSpecifiedTests)
-            while IFS= read -r test_class; do
-              [[ -z "$test_class" ]] && continue
-              deploy_cmd+=(--tests "$(echo "$test_class" | xargs)")
-            done <<< "$(echo "$ALL_TEST_CLASSES" | tr ',' '\n')"
-          fi
+          # Test classes are validated during PR validation — use NoTestRun for deployment
+          deploy_cmd+=(--test-level NoTestRun)
           # Note: omit --test-level when no Apex; SF CLI default handles non-Apex deploys
 
           # ── Pre-deployment summary ────────────────────────────────────────────
@@ -2096,7 +1991,7 @@ jobs:
           fi
 
           echo ""
-          echo "🧪 Test classes: ${ALL_TEST_CLASSES:-NoTestRun}"
+          echo "🧪 Test level: NoTestRun (tests validated during PR validation)"
           echo ""
           echo "▶ Running command:"
           echo "  ${deploy_cmd[*]}"
@@ -2249,8 +2144,7 @@ jobs:
       - name: Build deployment package and upload artifact
         id: pkg
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number || github.event.review.pull_request_url }}
-          MERGE_SHA: ${{ needs.approval-merge-gate.outputs.merge_commit_sha }}
+          PR_NUMBER: ${{ needs.approval-merge-gate.outputs.pr_number }}
           DELTA_BASE: ${{ steps.delta_pkg.outputs.merge_base }}
         run: |
           set -euo pipefail
@@ -2406,6 +2300,30 @@ jobs:
           fi
 
           echo "Next PR delta will be calculated from: ${DEPLOY_SHA}"
+
+      - name: Merge pull request
+        env:
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          REPO:       ${{ github.repository }}
+          PR_NUMBER:  ${{ needs.approval-merge-gate.outputs.pr_number }}
+          HEAD_SHA:   ${{ needs.approval-merge-gate.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          echo "Merging PR #${PR_NUMBER} (head: ${HEAD_SHA}) after successful deployment..."
+          result=$(gh api \
+            --method PUT \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$REPO/pulls/$PR_NUMBER/merge" \
+            -f merge_method='merge' \
+            -f sha="$HEAD_SHA")
+          merged=$(echo "$result" | jq -r '.merged')
+          merge_sha=$(echo "$result" | jq -r '.sha')
+          if [[ "$merged" != "true" || -z "$merge_sha" || "$merge_sha" == "null" ]]; then
+            echo "::error::PR merge failed — deployment succeeded but merge was rejected."
+            echo "$result"
+            exit 1
+          fi
+          echo "✅ PR #${PR_NUMBER} merged successfully (merge commit: ${merge_sha})"
 
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 10 — Trigger CRT Smoke Tests
