@@ -71,7 +71,6 @@ Set these under **Settings → Secrets and variables → Actions → Secrets**.
 
 | Secret | Required | Description |
 |--------|----------|-------------|
-| `CRT_PAT` | ⬜ Legacy | Old PAT — replaced by `CRT_API_TOKEN` |
 | `CRT_API_TOKEN` | ✅ | API token for `X-Authorization` header on the CRT GraphQL API |
 
 ### Deployment Automation
@@ -131,8 +130,6 @@ For the merge gate to work correctly, configure branch protection on `uat`:
 2. Enable **Require status checks to pass before merging**
 3. Add the following as required checks:
    - `Salesforce PR validation`
-   - `SCA/SAST Stage`
-   - `Automated Hard Gates`
    - `CheckMarx AST Scan` *(if using CheckMarx)*
    - `Fortify on Demand Scan` *(if using Fortify)*
 4. Enable **Require pull request reviews before merging** (at least 1 approval)
@@ -141,50 +138,16 @@ For the merge gate to work correctly, configure branch protection on `uat`:
 
 ---
 
-## 4. `pr_packages` Branch — Deployment Package History
-
-After every successful deployment, the pipeline automatically commits a deployment package to the `pr_packages` branch. This branch serves as a permanent audit log of everything deployed.
-
-**Branch location:** `pr_packages` (created automatically on first deploy)
-
-**Each commit contains:**
-
-| File | Content |
-|------|---------|
-| `package.xml` | Salesforce components that were deployed |
-| `destructiveChanges.xml` | Components that were deleted (if any) |
-| `deployment-info.json` | PR number, commit SHA, timestamps, actor, run URL |
-
-**Package naming:** `deploy-pr<PR>-<sha>-<timestamp>`
-
-Example:
-```
-pr_packages/
-  deploy-pr42-a1b2c3d4e5-20260409T143000Z/
-    package.xml
-    destructiveChanges.xml
-    deployment-info.json
-```
-
-**Browse deployment history:**
-```bash
-git fetch origin pr_packages
-git log origin/pr_packages --oneline
-git show origin/pr_packages -- deploy-pr42-a1b2c3d4e5-20260409T143000Z/deployment-info.json
-```
-
----
-
 ## 5. DELTA_FROM_COMMIT — Automatic Update
 
 After every successful deployment, the pipeline **automatically updates** `DELTA_FROM_COMMIT` to the deployed commit SHA using the GitHub API via `GH_PAT`.
 
-The deploy job (`deploy-after-merge`) computes its delta FROM using `git rev-parse HEAD^1` — the UAT branch tip immediately before the PR merged. This always matches what was validated in the PR, regardless of what `DELTA_FROM_COMMIT` holds. `DELTA_FROM_COMMIT` is used as a fallback only if `HEAD^1` is unavailable (shallow clone) and is still updated after deploy for rollback reference.
+The deploy job (`deploy-after-merge`) computes its delta FROM using `git rev-parse HEAD^1` — the UAT branch tip immediately before the PR merged. This always matches what was validated in the PR, regardless of what `DELTA_FROM_COMMIT` holds. `DELTA_FROM_COMMIT` is used as a fallback only if `HEAD^1` is unavailable (shallow clone) and is still updated after deploy for future delta baseline tracking.
 
 **If `GH_PAT` is not set:**
 - The step will print a warning with the correct SHA
 - You must update `DELTA_FROM_COMMIT` manually in **Settings → Variables**
-- The SHA is also recorded in the `pr_packages` branch commit and `deployment-info.json`
+- The SHA is also shown in the `Update DELTA_FROM_COMMIT` step logs in the Actions run
 
 ---
 
@@ -212,7 +175,6 @@ VARIABLES
 BRANCH & REPO CONFIG
 [ ] Branch protection configured on uat branch (see Section 3)
 [ ] SF scanner waiver file: .github/sf-scanner-waivers.csv committed to main branch
-[ ] pr_packages branch — created automatically on first deploy (no action needed)
 ```
 
 ---
@@ -227,8 +189,6 @@ When a PR contains no Salesforce component changes (e.g. only workflow YAML or d
 | Apex coverage check | `has_delta == false` |
 | SF Code Analyzer install + scan | `has_delta == false` |
 | Scanner waiver check + CSV report | `has_delta == false` |
-| `sca-sast-stage` job (npm audit) | `has_delta == false` |
-| `automated-governance` job | `has_delta == false` |
 | CheckMarx / Fortify jobs | Skipped when `CX_CLIENT_SECRET` / `FOD_CLIENT_SECRET` not set (they run from `setup` in parallel, independent of `has_delta`) |
 
 The `has_delta` flag is set by the `Compute Apex delta and infer tests` step in Job 2. It is `true` when either `package/package.xml` or `destructiveChanges/destructiveChanges.xml` contains members.

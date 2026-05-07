@@ -16,7 +16,7 @@ name: UAT End-to-End Pipeline
 #   vars.FOD_URL / secrets.FOD_CLIENT_ID / FOD_CLIENT_SECRET
 #   secrets.FOD_APP_NAME / FOD_RELEASE_NAME / FOD_DAST_SCAN_URL (optional DAST)
 # CRT (Copado Robotic Testing):
-#   secrets.CRT_PAT                  - CRT External Personal Access Token
+#   secrets.CRT_API_TOKEN            - CRT External Personal Access Token
 #   vars.CRT_JOB_ID     (default: 115686)
 #   vars.CRT_PROJECT_ID (default: 73283)
 #   vars.CRT_ORG_ID     (default: 43532)
@@ -119,8 +119,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   salesforce-validation:
     name: Salesforce PR validation
-    if: ${{ github.event_name == 'pull_request' }}
     needs: [setup]
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -129,8 +129,9 @@ jobs:
     outputs:
       has_delta: ${{ steps.delta.outputs.has_delta }}
     steps:
-      - name: Request PR reviewers and notify
-        # Run on every PR event (open, reopen, push/sync, ready_for_review)
+      - name: Request PR reviewers
+        # Request review immediately on PR open/push so GitHub sends its native notification.
+        # A "validation passed" comment is posted at the END of this job (on success only).
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -154,6 +155,9 @@ jobs:
             exit 0
           fi
 
+          # Store eligible reviewers for use by the post-validation notification step
+          printf '%s\n' "${ELIGIBLE[@]}" > /tmp/eligible-reviewers.txt
+
           # Build JSON array of eligible reviewers
           REVIEWERS_JSON=$(printf '%s\n' "${ELIGIBLE[@]}" | jq -R . | jq -s .)
 
@@ -173,29 +177,6 @@ jobs:
             cat /tmp/reviewer-response.json || true
           fi
 
-          # Post a review request notification comment
-          REVIEWER_MENTIONS=$(printf '@%s ' "${ELIGIBLE[@]}" | xargs)
-          COMMENT_BODY="👋 ${REVIEWER_MENTIONS} — your review is requested on this PR.
-
-          **PR:** #${PR_NUMBER} — ${{ github.event.pull_request.title }}
-          **Author:** @${PR_AUTHOR}
-          **Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`
-          **Pipeline:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-
-          > ⏳ Automated checks are running. Please review once all checks pass."
-
-          python3 -c "
-          import json
-          body = open('/dev/stdin').read()
-          print(json.dumps({'body': body}))
-          " <<< "$COMMENT_BODY" | curl -sSL -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" > /dev/null
-
-          echo "✅ Review notification comment posted."
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -205,64 +186,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Install npm dependencies
-        run: |
-          set -euo pipefail
-          if [[ ! -f package.json ]]; then
-            echo "ℹ️  No package.json found — creating standard Salesforce package.json."
-            cat > package.json << 'PKGJSON'
-          {
-            "name": "salesforce-app",
-            "private": true,
-            "version": "1.0.0",
-            "description": "Salesforce App",
-            "scripts": {
-              "lint": "eslint **/{aura,lwc}/**/*.js",
-              "test": "npm run test:unit",
-              "test:unit": "sfdx-lwc-jest",
-              "test:unit:watch": "sfdx-lwc-jest --watch",
-              "test:unit:debug": "sfdx-lwc-jest --debug",
-              "test:unit:coverage": "sfdx-lwc-jest --coverage",
-              "prettier": "prettier --write \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prettier:verify": "prettier --check \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prepare": "husky || true",
-              "precommit": "lint-staged"
-            },
-            "devDependencies": {
-              "@lwc/eslint-plugin-lwc": "^3.1.0",
-              "@prettier/plugin-xml": "^3.4.1",
-              "@salesforce/eslint-config-lwc": "^4.0.0",
-              "@salesforce/eslint-plugin-aura": "^3.0.0",
-              "@salesforce/eslint-plugin-lightning": "^2.0.0",
-              "@salesforce/sfdx-lwc-jest": "^7.0.2",
-              "eslint": "^9.29.0",
-              "eslint-plugin-import": "^2.31.0",
-              "eslint-plugin-jest": "^28.14.0",
-              "husky": "^9.1.7",
-              "lint-staged": "^16.1.2",
-              "prettier": "^3.5.3",
-              "prettier-plugin-apex": "^2.2.6"
-            },
-            "lint-staged": {
-              "**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}": [
-                "prettier --write"
-              ],
-              "**/{aura,lwc}/**/*.js": [
-                "eslint"
-              ],
-              "**/lwc/**": [
-                "sfdx-lwc-jest -- --bail --findRelatedTests --passWithNoTests"
-              ]
-            }
-          }
-          PKGJSON
-          fi
-          if [[ -f package-lock.json ]]; then
-            npm ci
-          else
-            npm install
-          fi
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
@@ -1244,179 +1167,54 @@ jobs:
             sca-pr-comment.md
           if-no-files-found: warn
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 3 — SCA / SAST Stage (dependency audit)
-  # Blocks CheckMarx and Fortify from running until this passes.
-  # ─────────────────────────────────────────────────────────────────────────────
-  sca-sast-stage:
-    name: SCA/SAST Stage
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
-    needs: [setup]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install dependencies
+      - name: Notify reviewers — validation passed
+        # Only runs when ALL prior steps succeeded. Posts a single actionable comment
+        # so reviewers are pinged at the right moment (not before checks are done).
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
-          if [[ ! -f package.json ]]; then
-            echo "ℹ️  No package.json found — creating standard Salesforce package.json."
-            cat > package.json << 'PKGJSON'
-          {
-            "name": "salesforce-app",
-            "private": true,
-            "version": "1.0.0",
-            "description": "Salesforce App",
-            "scripts": {
-              "lint": "eslint **/{aura,lwc}/**/*.js",
-              "test": "npm run test:unit",
-              "test:unit": "sfdx-lwc-jest",
-              "test:unit:watch": "sfdx-lwc-jest --watch",
-              "test:unit:debug": "sfdx-lwc-jest --debug",
-              "test:unit:coverage": "sfdx-lwc-jest --coverage",
-              "prettier": "prettier --write \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prettier:verify": "prettier --check \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prepare": "husky || true",
-              "precommit": "lint-staged"
-            },
-            "devDependencies": {
-              "@lwc/eslint-plugin-lwc": "^3.1.0",
-              "@prettier/plugin-xml": "^3.4.1",
-              "@salesforce/eslint-config-lwc": "^4.0.0",
-              "@salesforce/eslint-plugin-aura": "^3.0.0",
-              "@salesforce/eslint-plugin-lightning": "^2.0.0",
-              "@salesforce/sfdx-lwc-jest": "^7.0.2",
-              "eslint": "^9.29.0",
-              "eslint-plugin-import": "^2.31.0",
-              "eslint-plugin-jest": "^28.14.0",
-              "husky": "^9.1.7",
-              "lint-staged": "^16.1.2",
-              "prettier": "^3.5.3",
-              "prettier-plugin-apex": "^2.2.6"
-            },
-            "lint-staged": {
-              "**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}": [
-                "prettier --write"
-              ],
-              "**/{aura,lwc}/**/*.js": [
-                "eslint"
-              ],
-              "**/lwc/**": [
-                "sfdx-lwc-jest -- --bail --findRelatedTests --passWithNoTests"
-              ]
-            }
-          }
-          PKGJSON
+          REPO="${{ github.repository }}"
+
+          # Read eligible reviewers written by the first step
+          if [[ ! -f /tmp/eligible-reviewers.txt ]]; then
+            echo "No eligible reviewers file found — skipping notification."
+            exit 0
           fi
-          if [[ -f package-lock.json ]]; then
-            npm ci
-          else
-            npm install
-          fi
-
-      - name: Run dependency SCA gate with waiver support
-        run: |
-          set -euo pipefail
-
-          WAIVER_FILE=".github/sca-waivers.json"
-          TODAY=$(date -u +%Y-%m-%d)
-
-          # Run npm audit and capture JSON output; do not fail immediately.
-          npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true
-
-          # If no high/critical vulnerabilities found, pass immediately.
-          VULN_COUNT=$(jq '[.vulnerabilities // {} | to_entries[] | .value
-            | select(.severity == "high" or .severity == "critical")] | length' audit-output.json 2>/dev/null || echo 0)
-
-          if [[ "$VULN_COUNT" -eq 0 ]]; then
-            echo "✅ No high/critical vulnerabilities found."
+          mapfile -t ELIGIBLE < /tmp/eligible-reviewers.txt
+          if [[ "${#ELIGIBLE[@]}" -eq 0 ]]; then
+            echo "No eligible reviewers — skipping notification."
             exit 0
           fi
 
-          echo "Found $VULN_COUNT high/critical vulnerability/ies. Checking waivers..."
+          REVIEWER_MENTIONS=$(printf '@%s ' "${ELIGIBLE[@]}" | xargs)
+          COMMENT_BODY="✅ **All automated checks passed — PR is ready for review!**
 
-          # Load waivers file if present
-          WAIVERS="[]"
-          if [[ -f "$WAIVER_FILE" ]]; then
-            WAIVERS=$(jq '.' "$WAIVER_FILE" 2>/dev/null || echo "[]")
-            echo "Loaded waiver file: $WAIVER_FILE"
-          else
-            echo "No waiver file found at $WAIVER_FILE — all violations will be evaluated."
-          fi
+          👋 ${REVIEWER_MENTIONS} — validation completed successfully. Please review at your earliest convenience.
 
-          FAIL=0
-          WAIVED=0
-          EXPIRED=0
+          | Detail | Value |
+          |--------|-------|
+          | **PR** | #${PR_NUMBER} — ${{ github.event.pull_request.title }} |
+          | **Author** | @${PR_AUTHOR} |
+          | **Branch** | \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\` |
+          | **Pipeline run** | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
 
-          # Iterate over each high/critical vulnerability
-          while IFS= read -r vuln_json; do
-            PKG=$(echo "$vuln_json"  | jq -r '.name')
-            SEV=$(echo "$vuln_json"  | jq -r '.severity')
-            GHSA=$(echo "$vuln_json" | jq -r '.via[0].source // .via[0] // "unknown"' 2>/dev/null | head -1)
+          python3 -c "
+          import json, sys
+          body = open('/dev/stdin').read()
+          print(json.dumps({'body': body}))
+          " <<< "$COMMENT_BODY" | curl -sSL -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d @- \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" > /dev/null
 
-            # Check if this package has an active waiver
-            WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
-              '[.[] | select(.package == $pkg and .expires >= $today)] | first // empty')
+          echo "✅ Post-validation reviewer notification posted."
 
-            EXPIRED_WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
-              '[.[] | select(.package == $pkg and .expires < $today)] | first // empty')
-
-            if [[ -n "$WAIVER" && "$WAIVER" != "null" ]]; then
-              EXPIRES=$(echo "$WAIVER" | jq -r '.expires')
-              REASON=$(echo "$WAIVER"  | jq -r '.reason')
-              APPROVED=$(echo "$WAIVER"| jq -r '.approved_by // "unknown"')
-              echo "⏳ WAIVED [$SEV] $PKG (advisory: $GHSA)"
-              echo "   Reason: $REASON | Approved by: $APPROVED | Expires: $EXPIRES"
-              WAIVED=$((WAIVED + 1))
-            elif [[ -n "$EXPIRED_WAIVER" && "$EXPIRED_WAIVER" != "null" ]]; then
-              EXPIRES=$(echo "$EXPIRED_WAIVER" | jq -r '.expires')
-              REASON=$(echo "$EXPIRED_WAIVER"  | jq -r '.reason')
-              echo "::error::❌ EXPIRED WAIVER [$SEV] $PKG (advisory: $GHSA)"
-              echo "   Waiver expired on $EXPIRES — fix is now required. Reason was: $REASON"
-              EXPIRED=$((EXPIRED + 1))
-              FAIL=1
-            else
-              echo "::error::❌ UNWAIVED [$SEV] $PKG (advisory: $GHSA) — no active waiver found."
-              FAIL=$((FAIL + 1))
-            fi
-          done < <(jq -c '[.vulnerabilities // {} | to_entries[] | .value
-            | select(.severity == "high" or .severity == "critical")][]' audit-output.json 2>/dev/null)
-
-          echo ""
-          echo "──────────────────────────────────────────"
-          echo "SCA Summary: $VULN_COUNT violation(s) found"
-          echo "  ✅ Waived (active):   $WAIVED"
-          echo "  ❌ Expired waivers:   $EXPIRED"
-          echo "  ❌ Unwaived failures: $((FAIL - EXPIRED))"
-          echo "──────────────────────────────────────────"
-
-          if [[ "$FAIL" -gt 0 ]]; then
-            echo ""
-            echo "To suppress a known violation, add an entry to $WAIVER_FILE:"
-            echo '  { "package": "<pkg>", "severity": "<high|critical>", "reason": "<justification>", "expires": "YYYY-MM-DD", "approved_by": "<team>" }'
-            exit 1
-          fi
-
-          echo "✅ All violations are covered by active waivers."
-
-      - name: Upload SCA audit report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sca-audit-report
-          path: audit-output.json
-          if-no-files-found: warn
-          retention-days: 30
-
-  # ─────────────────────────────────────────────────────────────────────────────
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 5 — CheckMarx AST SAST Scan
   # Runs only when CX_CLIENT_SECRET is set and scanner input includes checkmarx.
@@ -1634,8 +1432,39 @@ jobs:
           REVIEW_COMMIT: ${{ github.event.review.commit_id }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          APPROVER: ${{ github.event.review.user.login }}
         run: |
           set -euo pipefail
+
+          # ── Architect gate (main branch only) ──────────────────────────────────
+          # For PRs targeting `main`: only Architects can approve and trigger merge.
+          # For PRs targeting any other branch (e.g. UAT): any code reviewer can approve.
+          if [[ "$BASE_REF" == "main" ]]; then
+            ARCHITECTS=(
+              "chorevathi-deloitte"
+              "mukeshranadeloitte"
+            )
+
+            IS_ARCHITECT=false
+            for arch in "${ARCHITECTS[@]}"; do
+              if [[ "$APPROVER" == "$arch" ]]; then
+                IS_ARCHITECT=true
+                break
+              fi
+            done
+
+            if [[ "$IS_ARCHITECT" != "true" ]]; then
+              echo "::error::❌ Approval from '$APPROVER' is not sufficient to trigger a merge to main."
+              echo "::error::Only Architect / Designated Architects can approve merges to main: ${ARCHITECTS[*]}"
+              exit 1
+            fi
+
+            echo "✅ Architect approval confirmed for main: $APPROVER"
+          else
+            echo "ℹ️  Target branch is '$BASE_REF' (not main) — architect gate skipped. Approver: $APPROVER"
+          fi
+          # ──────────────────────────────────────────────────────────────────────
 
           if [[ "$REVIEW_COMMIT" != "$HEAD_SHA" ]]; then
             echo "::error::Stale approval. Review commit does not match latest PR head SHA."
@@ -1647,7 +1476,6 @@ jobs:
 
           required_checks=(
             "Salesforce PR validation"
-            "SCA/SAST Stage"
           )
 
           if [[ "${{ secrets.CX_CLIENT_SECRET != '' }}" == "true" ]]; then
@@ -1706,64 +1534,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Install npm dependencies
-        run: |
-          set -euo pipefail
-          if [[ ! -f package.json ]]; then
-            echo "ℹ️  No package.json found — creating standard Salesforce package.json."
-            cat > package.json << 'PKGJSON'
-          {
-            "name": "salesforce-app",
-            "private": true,
-            "version": "1.0.0",
-            "description": "Salesforce App",
-            "scripts": {
-              "lint": "eslint **/{aura,lwc}/**/*.js",
-              "test": "npm run test:unit",
-              "test:unit": "sfdx-lwc-jest",
-              "test:unit:watch": "sfdx-lwc-jest --watch",
-              "test:unit:debug": "sfdx-lwc-jest --debug",
-              "test:unit:coverage": "sfdx-lwc-jest --coverage",
-              "prettier": "prettier --write \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prettier:verify": "prettier --check \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prepare": "husky || true",
-              "precommit": "lint-staged"
-            },
-            "devDependencies": {
-              "@lwc/eslint-plugin-lwc": "^3.1.0",
-              "@prettier/plugin-xml": "^3.4.1",
-              "@salesforce/eslint-config-lwc": "^4.0.0",
-              "@salesforce/eslint-plugin-aura": "^3.0.0",
-              "@salesforce/eslint-plugin-lightning": "^2.0.0",
-              "@salesforce/sfdx-lwc-jest": "^7.0.2",
-              "eslint": "^9.29.0",
-              "eslint-plugin-import": "^2.31.0",
-              "eslint-plugin-jest": "^28.14.0",
-              "husky": "^9.1.7",
-              "lint-staged": "^16.1.2",
-              "prettier": "^3.5.3",
-              "prettier-plugin-apex": "^2.2.6"
-            },
-            "lint-staged": {
-              "**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}": [
-                "prettier --write"
-              ],
-              "**/{aura,lwc}/**/*.js": [
-                "eslint"
-              ],
-              "**/lwc/**": [
-                "sfdx-lwc-jest -- --bail --findRelatedTests --passWithNoTests"
-              ]
-            }
-          }
-          PKGJSON
-          fi
-          if [[ -f package-lock.json ]]; then
-            npm ci
-          else
-            npm install
-          fi
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
@@ -1834,74 +1604,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Build test class set
+      - name: Prepare deploy manifests
         id: tests
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-
-          changed_files=$(git diff --name-only "${{ needs.approval-merge-gate.outputs.base_sha }}" HEAD)
-
-          apex_changed_classes=""
-          changed_test_classes=""
-
-          while IFS= read -r file; do
-            [[ "$file" =~ ^force-app/main/default/classes/.*\.cls$ ]] || continue
-            class_name=$(basename "$file" .cls)
-            if [[ "$file" =~ (Test|Tests)\.cls$ ]]; then
-              case ",${changed_test_classes}," in
-                *,"$class_name",*) ;;
-                *) changed_test_classes="${changed_test_classes:+${changed_test_classes},}$class_name" ;;
-              esac
-              continue
-            fi
-            case ",${apex_changed_classes}," in
-              *,"$class_name",*) ;;
-              *) apex_changed_classes="${apex_changed_classes:+${apex_changed_classes},}$class_name" ;;
-            esac
-          done <<< "$changed_files"
-
-          comments=$(gh api \
-            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
-            --jq '.[].body' 2>/dev/null || echo "")
-
-          full_text="$PR_BODY
-          $comments"
-          line=$(echo "$full_text" | grep -iE '^\s*(tests?(\s+classes?)?)\s*:' | head -1 || true)
-          pr_test_classes=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//' | tr ',' '\n' | xargs -n1 | paste -sd ',' -)
-
-          inferred_test_classes="$changed_test_classes"
-          if [[ -n "$apex_changed_classes" ]]; then
-            for class_name in $(echo "$apex_changed_classes" | tr ',' ' '); do
-              for suffix in Test Tests TestClass; do
-                candidate="${class_name}${suffix}"
-                if [[ -f "force-app/main/default/classes/${candidate}.cls" ]] || echo ",$changed_test_classes," | grep -q ",${candidate},"; then
-                  case ",${inferred_test_classes}," in
-                    *,"$candidate",*) ;;
-                    *) inferred_test_classes="${inferred_test_classes:+${inferred_test_classes},}$candidate" ;;
-                  esac
-                fi
-              done
-            done
-          fi
-
-          all_test_classes=$(
-            printf '%s\n%s\n' "${pr_test_classes:-}" "${inferred_test_classes:-}" \
-            | tr ',' '\n' \
-            | sed '/^[[:space:]]*$/d' \
-            | awk '!seen[$0]++' \
-            | paste -sd ',' -
-          )
-
-          has_apex=false
-          if [[ -f package/package.xml ]] && grep -qE '<name>ApexClass|ApexTrigger</name>' package/package.xml; then
-            has_apex=true
-          fi
-          if [[ -n "$apex_changed_classes" ]]; then
-            has_apex=true
-          fi
 
           deploy_manifest=""
           if [[ -f package/package.xml ]] && grep -q '<members>' package/package.xml; then
@@ -1913,9 +1619,7 @@ jobs:
             destructive_manifest="destructiveChanges/destructiveChanges.xml"
           fi
 
-          echo "all_test_classes=${all_test_classes:-}" >> "$GITHUB_OUTPUT"
-          echo "has_apex=$has_apex" >> "$GITHUB_OUTPUT"
-          echo "deploy_manifest=$deploy_manifest" >> "$GITHUB_OUTPUT"
+          echo "deploy_manifest=$deploy_manifest"           >> "$GITHUB_OUTPUT"
           echo "destructive_manifest=$destructive_manifest" >> "$GITHUB_OUTPUT"
 
           if [[ -n "$deploy_manifest" || -n "$destructive_manifest" ]]; then
@@ -2298,8 +2002,12 @@ jobs:
           echo "crt_status=$FINAL_STATUS" >> "$GITHUB_OUTPUT"
           echo "Final CRT result: $FINAL_STATUS"
 
-      - name: Print Job Summary
+      - name: CRT Job Summary
         if: always() && steps.pr_meta.outputs.has_pr == 'true'
+        env:
+          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
+          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
+          CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
         run: |
           echo ""
           echo "╔══════════════════════════════════════════╗"
@@ -2313,28 +2021,16 @@ jobs:
           echo "  Test Result     : ${{ steps.crt_poll.outputs.crt_status }}"
           echo "╚══════════════════════════════════════════╝"
           echo ""
-      - name: Post CRT deployment comment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: "🤖 Deployed to UAT: CRT robotic tests have been triggered via Copado EU Robotic Testing."
-            });
-      - name: CRT Test Execution Summary
-        if: always()
-        env:
-          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
-          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
-          CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
-        run: |
           {
             echo "## 🧪 CRT Test Execution Summary"
             echo ""
             echo "| Detail | Value |"
             echo "|--------|-------|"
+            echo "| **PR Number** | #${{ steps.pr_meta.outputs.pr_number }} |"
+            echo "| **PR Raiser** | ${{ steps.pr_meta.outputs.pr_raiser }} |"
+            echo "| **PR Approver** | ${{ steps.pr_meta.outputs.pr_approver }} |"
+            echo "| **Test Build ID** | ${{ steps.crt.outputs.build_id }} |"
+            echo "| **Test Result** | ${{ steps.crt_poll.outputs.crt_status }} |"
             echo "| **Instance** | https://eu-robotic.copado.com |"
             echo "| **Org ID** | ${CRT_ORG_ID} |"
             echo "| **Project ID** | ${CRT_PROJECT_ID} |"

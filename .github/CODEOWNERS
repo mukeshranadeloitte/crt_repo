@@ -1,0 +1,16 @@
+# CODEOWNERS — Branch protection for main
+#
+# GitHub enforces these rules when "Require review from Code Owners" is enabled
+# in the branch protection settings for `main` (NOT for UAT or other branches).
+#
+# For PRs targeting `main`: architect approval is required (enforced by GitHub + pipeline).
+# For PRs targeting other branches (e.g. UAT): any designated code reviewer can approve.
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# All files — Architect / Designated Architect approval required
+* @chorevathi-deloitte @mukeshranadeloitte
+
+# Workflow files — extra protection: architects must approve any pipeline changes
+.github/workflows/ @chorevathi-deloitte @mukeshranadeloitte
+.github/CODEOWNERS  @chorevathi-deloitte @mukeshranadeloitte

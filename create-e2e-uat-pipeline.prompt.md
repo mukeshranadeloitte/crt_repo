@@ -14,7 +14,7 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
 ### Triggers
 - `pull_request` to `uat` branch for paths: `force-app/**`, `.github/workflows/e2e-uat-pipeline.yml`, `.github/sf-scanner-waivers.csv` — types: opened, reopened, synchronize, edited, ready_for_review
 - `pull_request_review` — types: submitted
-- `workflow_dispatch` with inputs: `scanner` (choices: all | checkmarx | fortify), `action` (choices: deploy | rollback), `rollback_commit_sha` (string), `rollback_pr_number` (string)
+- `workflow_dispatch` with inputs: `scanner` (choices: all | checkmarx | fortify)
 
 ### Global env vars (configurable via `vars.*`)
 - `ORG_ALIAS` (default: `uat`)
@@ -32,10 +32,10 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
 
 **Job 2 — `salesforce-validation`**: Salesforce PR Validation
 - Triggers: `pull_request` only
-- **`needs: [setup]`** — must always depend on `setup` so it appears in the connected dependency graph
+- **No `needs:` dependency** — starts immediately when a PR opens, in parallel with other PR jobs
 - **Outputs:** `has_delta` (bool) — set `true` if `package/package.xml` or `destructiveChanges/destructiveChanges.xml` contains members
 - Steps:
-  1. checkout (fetch-depth: 0) → setup-node 20 → **bootstrap `package.json` if missing** (writes full standard Salesforce `package.json` via bash heredoc — use EXACT versions below and EXACT indentation pattern from rule 14) → npm install → install Salesforce CLI
+  1. checkout (fetch-depth: 0) → install Salesforce CLI
   2. Authenticate org from `secrets.CRT_UAT_AUTHURL`
   3. Extract test classes from PR body + comments (pattern: `Tests: Class1, Class2`)
   4. Install `sfdx-git-delta` → build delta package → upload delta artifact
@@ -60,106 +60,27 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
 - **Key:** `--test-level NoTestRun` is invalid for validate — omit `--test-level` when no Apex changed.
 - **Key:** All SCA steps are gated on `vars.SCA_ENFORCEMENT_MODE != 'off'`. In `warn` mode, nothing fails.
 
-**Job 3 — `sca-sast-stage`**: SCA/SAST Stage (npm audit)
-- `needs: [setup]` (runs in **parallel** with Jobs 2, 5, 6)
-- **Condition:** `pull_request` or `workflow_dispatch`
-- **package.json bootstrap:** same guard as Job 2 — if no `package.json` exists a standard one is created before `npm install` so `npm audit` does not ENOENT
-- **npm waiver check — MUST be implemented entirely in bash + `jq`. NEVER use Python scripts, Python heredocs, or `cat > file.py << 'PYTHON_SCRIPT'` for this step.** Copy the following verbatim — do NOT invent a new approach:
+**Job 3 — `checkmarx-sast`**: CheckMarx AST Scan
+- `needs: [setup]` (runs in **parallel** with Job 4), conditional on `run-checkmarx == 'true'`
 
-```yaml
-      - name: Run dependency SCA gate with waiver support
-        run: |
-          set -euo pipefail
-          WAIVER_FILE=".github/sca-waivers.json"
-          TODAY=$(date -u +%Y-%m-%d)
-          npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true
-          VULN_COUNT=$(jq '[.vulnerabilities // {} | to_entries[] | .value
-            | select(.severity == "high" or .severity == "critical")] | length' audit-output.json 2>/dev/null || echo 0)
-          if [[ "$VULN_COUNT" -eq 0 ]]; then
-            echo "✅ No high/critical vulnerabilities found."
-            exit 0
-          fi
-          echo "Found $VULN_COUNT high/critical vulnerability/ies. Checking waivers..."
-          WAIVERS="[]"
-          if [[ -f "$WAIVER_FILE" ]]; then
-            WAIVERS=$(jq '.' "$WAIVER_FILE" 2>/dev/null || echo "[]")
-            echo "Loaded waiver file: $WAIVER_FILE"
-          else
-            echo "No waiver file found at $WAIVER_FILE — all violations will be evaluated."
-          fi
-          FAIL=0; WAIVED=0; EXPIRED=0
-          while IFS= read -r vuln_json; do
-            PKG=$(echo "$vuln_json"  | jq -r '.name')
-            SEV=$(echo "$vuln_json"  | jq -r '.severity')
-            GHSA=$(echo "$vuln_json" | jq -r '.via[0].source // .via[0] // "unknown"' 2>/dev/null | head -1)
-            WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
-              '[.[] | select(.package == $pkg and .expires >= $today)] | first // empty')
-            EXPIRED_WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
-              '[.[] | select(.package == $pkg and .expires < $today)] | first // empty')
-            if [[ -n "$WAIVER" && "$WAIVER" != "null" ]]; then
-              EXPIRES=$(echo "$WAIVER" | jq -r '.expires')
-              REASON=$(echo "$WAIVER"  | jq -r '.reason')
-              APPROVED=$(echo "$WAIVER"| jq -r '.approved_by // "unknown"')
-              echo "⏳ WAIVED [$SEV] $PKG (advisory: $GHSA)"
-              echo "   Reason: $REASON | Approved by: $APPROVED | Expires: $EXPIRES"
-              WAIVED=$((WAIVED + 1))
-            elif [[ -n "$EXPIRED_WAIVER" && "$EXPIRED_WAIVER" != "null" ]]; then
-              EXPIRES=$(echo "$EXPIRED_WAIVER" | jq -r '.expires')
-              REASON=$(echo "$EXPIRED_WAIVER"  | jq -r '.reason')
-              echo "::error::❌ EXPIRED WAIVER [$SEV] $PKG (advisory: $GHSA)"
-              echo "   Waiver expired on $EXPIRES — fix is now required. Reason was: $REASON"
-              EXPIRED=$((EXPIRED + 1))
-              FAIL=1
-            else
-              echo "::error::❌ UNWAIVED [$SEV] $PKG (advisory: $GHSA) — no active waiver found."
-              FAIL=$((FAIL + 1))
-            fi
-          done < <(jq -c '[.vulnerabilities // {} | to_entries[] | .value
-            | select(.severity == "high" or .severity == "critical")][]' audit-output.json 2>/dev/null)
-          echo ""
-          echo "──────────────────────────────────────────"
-          echo "SCA Summary: $VULN_COUNT violation(s) found"
-          echo "  ✅ Waived (active):   $WAIVED"
-          echo "  ❌ Expired waivers:   $EXPIRED"
-          echo "  ❌ Unwaived failures: $((FAIL - EXPIRED))"
-          echo "──────────────────────────────────────────"
-          if [[ "$FAIL" -gt 0 ]]; then
-            echo "To suppress a known violation, add an entry to $WAIVER_FILE:"
-            echo '  { "package": "<pkg>", "severity": "<high|critical>", "reason": "<justification>", "expires": "YYYY-MM-DD", "approved_by": "<team>" }'
-            exit 1
-          fi
-          echo "✅ All violations are covered by active waivers."
-```
+**Job 4 — `fortify-sast-dast`**: Fortify SAST + optional DAST
+- `needs: [setup]` (runs in **parallel** with Job 3), conditional on `run-fortify == 'true'`
 
-- **Critical:** bash `if`/`while`/`for` blocks must always be written as bash — NEVER embed them inside a `<< 'HEREDOC'` block for another language
-
-**Job 4 — `automated-governance`**: Automated Hard Gates
-- `needs: [salesforce-validation]` — also implicitly connected to `setup` via `salesforce-validation`
-- `needs: [salesforce-validation]`
-- **Condition:** `needs.salesforce-validation.outputs.has_delta == 'true'`
-- Full Apex test suite with coverage (`$COVERAGE_THRESHOLD` minimum, default 85%), destructive changes check + PR comment, targeted SCA
-
-**Job 5 — `checkmarx-sast`**: CheckMarx AST Scan
-- `needs: [setup]` (runs in **parallel** with Jobs 2, 3, 6), conditional on `run-checkmarx == 'true'`
-
-**Job 6 — `fortify-sast-dast`**: Fortify SAST + optional DAST
-- `needs: [setup]` (runs in **parallel** with Jobs 2, 3, 5), conditional on `run-fortify == 'true'`
-
-**Job 7 — `approval-merge-gate`**: Approval + Merge Gate
+**Job 5 — `approval-merge-gate`**: Approval + Merge Gate
 - Triggers on `pull_request_review` (state=approved)
 - Verifies approval freshness, merges PR, outputs `merge_commit_sha`
 
-**Job 8 — `deploy-after-merge`**: Deploy to UAT
+**Job 6 — `deploy-after-merge`**: Deploy to UAT
 - `needs: [approval-merge-gate]`, `permissions: contents: write`
 - Steps:
-  1. Build delta package: `id: delta_pkg` — uses `git rev-parse HEAD^1` (merge parent = UAT branch tip before PR merged) as FROM for `sfdx-git-delta`. Exports `merge_base` output. Falls back to `DELTA_FROM_COMMIT` only if `HEAD^1` is unavailable (shallow clone).
-  2. `sf project deploy start --async` → poll every 15s → live progress table → component breakdown → per-class coverage
-  3. Build deployment package: `package.xml` + `destructiveChanges.xml` + `components.zip` + `deployment-info.json`
-  4. Upload artifact (90-day retention)
-  5. Commit package folder to `pr_packages` orphan branch
-  6. Update `DELTA_FROM_COMMIT` via GitHub API (saved for rollback reference + fallback): `curl -L -X PATCH -H "Authorization: Bearer ${GH_PAT}" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/{repo}/actions/variables/DELTA_FROM_COMMIT -d '{"name":"DELTA_FROM_COMMIT","value":"<sha>"}'`
+  1. Checkout merge commit + install SF CLI + authenticate org + install `sfdx-git-delta`
+  2. Build delta package: uses `git rev-parse HEAD^1` (merge parent = UAT branch tip before PR merged) as FROM for `sfdx-git-delta`. Falls back to `DELTA_FROM_COMMIT` only if `HEAD^1` is unavailable (shallow clone).
+  3. Display & upload delta artifacts
+  4. **Prepare deploy manifests**: check for `package.xml` / `destructiveChanges.xml`; do NOT infer or run test classes
+  5. `sf project deploy start --async --test-level NoTestRun` → poll every 15s → live progress table → component breakdown (tests already ran in PR validation)
+  6. Update `DELTA_FROM_COMMIT` via `git rev-parse HEAD` + GitHub API (`PATCH /actions/variables/DELTA_FROM_COMMIT`)
 
-**Job 9 — `trigger-crt-tests`**: CRT Smoke Tests
+**Job 7 — `trigger-crt-tests`**: CRT Smoke Tests
 - `needs: [deploy-after-merge]`
 - GraphQL API: `POST https://graphql.eu-robotic.copado.com/v1` with `X-Authorization: ${CRT_API_TOKEN}`
 - Mutation: `createBuild(projectId: <id>, jobId: <id>)` — triggers the build
@@ -167,7 +88,7 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
 - CRT statuses are **lowercase**: `executing`, `passed`, `failed`, `error`, `cancelled`, `skipped`
 - Terminal check uses `is_terminal()` function matching lowercase values; exports `build_id` and `crt_status` outputs
 - Step `id: pr_meta` (runs `if: always()`) — fetches PR number, raiser (PR author), and last approver via GitHub API
-- Step `Print Job Summary` (runs `if: always() && steps.pr_meta.outputs.has_pr == 'true'`) — prints a box:
+- Step `CRT Job Summary` (runs `if: always() && steps.pr_meta.outputs.has_pr == 'true'`) — prints a box AND writes GitHub Step Summary markdown:
   ```
   ╔══════════════════════════════════════════╗
   ║        CRT Job Execution Summary         ║
@@ -180,19 +101,13 @@ Create a workflow named `UAT End-to-End Pipeline` with the following characteris
     Test Result     : <crt_status>
   ╚══════════════════════════════════════════╝
   ```
-- Posts result PR comment + GitHub Step Summary (with final CRT status icon + Build ID) with CRT dashboard link
-
-**Job 10 — `rollback`**: Rollback Deployment
-- Triggers on `workflow_dispatch` with `action=rollback`
-- Input: `rollback_commit_sha` — the SHA to revert TO
-- Uses `sfdx-git-delta` in reverse: new metadata treated as destructive
-- Uses `--pre-destructive-changes` to delete new components before re-deploying prior state
+- Posts result PR comment with CRT dashboard link
 
 ---
 
 ## Canonical `package.json` devDependencies (MUST use these EXACT versions)
 
-When bootstrapping `package.json` (in any job that creates it if missing), use these exact version specifiers. **Do NOT guess or invent versions — only use what is listed here:**
+If a job needs npm (e.g. for local tooling), use these exact version specifiers when bootstrapping `package.json`. **Do NOT guess or invent versions — only use what is listed here:**
 
 ```json
 {
@@ -278,19 +193,6 @@ Comment rows starting with `#` are ignored.
 Status values: `WAIVED` (active, >30d), `WAIVED_EXPIRING_SOON` (≤30d), `VIOLATION` (no waiver), `EXPIRED_WAIVER` (past expiry — fails pipeline in enforce mode).
 Results written to `sca-governance-report.csv` (includes Days_Left, Approved_Date columns).
 
-### `.github/sca-waivers.json`
-JSON array for npm audit waivers:
-```json
-{
-  "package": "lodash",
-  "severity": "high",
-  "advisory": "GHSA-xxxx-xxxx-xxxx",
-  "reason": "No fix available.",
-  "expires": "YYYY-MM-DD",
-  "approved_by": "platform-security"
-}
-```
-
 ---
 
 ## Required Secrets & Variables
@@ -300,9 +202,9 @@ JSON array for npm audit waivers:
 | `CRT_UAT_AUTHURL` | Secret | ✅ | — | SFDX Auth URL for UAT org |
 | `GH_PAT` | Secret | ✅ | — | Fine-Grained PAT with Variables: Read+Write |
 | `CRT_API_TOKEN` | Secret | ✅ | — | CRT GraphQL API token (X-Authorization header) |
-| `CX_CLIENT_SECRET` | Secret | ⬜ | — | Enables CheckMarx Job 5 |
-| `FOD_CLIENT_SECRET` | Secret | ⬜ | — | Enables Fortify Job 6 |
-| `DELTA_FROM_COMMIT` | Variable | ✅ | — | Baseline SHA (used for rollback reference + shallow-clone fallback) |
+| `CX_CLIENT_SECRET` | Secret | ⬜ | — | Enables CheckMarx Job 3 |
+| `FOD_CLIENT_SECRET` | Secret | ⬜ | — | Enables Fortify Job 4 |
+| `DELTA_FROM_COMMIT` | Variable | ✅ | — | Baseline SHA for `sfdx-git-delta`. Auto-updated after each deploy. Used as shallow-clone fallback. |
 | `ORG_ALIAS` | Variable | ⬜ | `uat` | SF org alias |
 | `COVERAGE_THRESHOLD` | Variable | ⬜ | `85` | Apex coverage % |
 | `SCA_ENFORCEMENT_MODE` | Variable | ⬜ | `enforce` | `enforce` = expired waivers fail; `warn` = nothing fails; `off` = all SCA steps skipped |
@@ -318,19 +220,16 @@ JSON array for npm audit waivers:
 - All required secrets (with descriptions + how to create GH_PAT)
 - All required variables (with defaults)
 - Branch protection rules
-- `pr_packages` branch description
 - DELTA_FROM_COMMIT auto-update explanation
 - No-delta skip behaviour table
 - Quick start checklist
 
 ### `docs/sca-waivers.md`
-- Part 1: SF Code Analyzer waivers (schema, governance, expiry policy, who updates, results CSV format)
-- Part 2: npm SCA waivers (schema, governance)
+- SF Code Analyzer waivers (schema, governance, expiry policy, who updates, results CSV format)
 
 ### `docs/manual_runbook.md`
 - PR review and deployment approver guide — PR review approval is the single human gate before deployment (no ReleaseGate)
-- Rollback procedure: find SHA, trigger workflow_dispatch with action=rollback
-- What rollback does (new metadata → destructive, modified → re-deployed, deleted → restored)
+- Manual revert guidance: if a deployment needs reverting, it must be done manually in the Salesforce org
 
 ### `docs/troubleshooting.md`
 - Common failures per job with diagnosis and fix
@@ -402,11 +301,7 @@ JSON array for npm audit waivers:
     - The closing `PKGJSON` must be at the SAME indentation as the `{` line
     - Read `.github/workflows/e2e-uat-pipeline.yml` lines 224–280 and copy the exact indentation pattern
 
-15. **⛔ Job `needs:` chain is mandatory — all PR jobs must be connected to `setup`.** The correct `needs:` for every job that runs on `pull_request`:
-    - Job 2 `salesforce-validation`: `needs: [setup]`
-    - Job 3 `sca-sast-stage`: `needs: [setup]`
-    - Job 4 `automated-governance`: `needs: [salesforce-validation]`
-    - Job 5 `checkmarx-sast`: `needs: [setup]`
-    - Job 6 `fortify-sast-dast`: `needs: [setup]`
-
-    If `salesforce-validation` does NOT have `needs: [setup]`, it runs as an orphan parallel to `setup` rather than after it, and the jobs appear disconnected in the GitHub Actions UI. This is always wrong.
+15. **Job `needs:` chain for PR jobs:**
+    - Job 2 `salesforce-validation`: NO `needs:` — starts immediately in parallel with `setup`
+    - Job 3 `checkmarx-sast`: `needs: [setup]`
+    - Job 4 `fortify-sast-dast`: `needs: [setup]`
