@@ -1432,8 +1432,33 @@ jobs:
           REVIEW_COMMIT: ${{ github.event.review.commit_id }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          APPROVER: ${{ github.event.review.user.login }}
         run: |
           set -euo pipefail
+
+          # ── Architect gate ─────────────────────────────────────────────────────
+          # Only Architect / Designated Architects can approve and trigger a merge.
+          # Add GitHub usernames below to grant merge approval authority.
+          ARCHITECTS=(
+            "chorevathi-deloitte"
+          )
+
+          IS_ARCHITECT=false
+          for arch in "${ARCHITECTS[@]}"; do
+            if [[ "$APPROVER" == "$arch" ]]; then
+              IS_ARCHITECT=true
+              break
+            fi
+          done
+
+          if [[ "$IS_ARCHITECT" != "true" ]]; then
+            echo "::error::❌ Approval from '$APPROVER' is not sufficient to trigger deployment."
+            echo "::error::Only Architect / Designated Architects can approve merges to main: ${ARCHITECTS[*]}"
+            exit 1
+          fi
+
+          echo "✅ Architect approval confirmed: $APPROVER"
+          # ──────────────────────────────────────────────────────────────────────
 
           if [[ "$REVIEW_COMMIT" != "$HEAD_SHA" ]]; then
             echo "::error::Stale approval. Review commit does not match latest PR head SHA."

@@ -1,0 +1,16 @@
+# CODEOWNERS — Branch protection for main
+#
+# GitHub enforces these rules when "Require review from Code Owners" is enabled
+# in the branch protection settings for `main`.
+#
+# Only the users/teams listed here can approve a PR that changes these paths.
+# Without their approval, the PR cannot be merged into main.
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# All files — Architect / Designated Architect approval required
+* @chorevathi-deloitte
+
+# Workflow files — extra protection: architects must approve any pipeline changes
+.github/workflows/ @chorevathi-deloitte
+.github/CODEOWNERS  @chorevathi-deloitte
