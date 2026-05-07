@@ -18,9 +18,6 @@ private class AccountUtilityServiceTest {
         insert contacts;
     }
 
-   
-    
-    
     @isTest
     static void testGetAccountsByType() {
         Test.startTest();
