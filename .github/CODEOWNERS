@@ -1,10 +1,10 @@
 # CODEOWNERS — Branch protection for main
 #
 # GitHub enforces these rules when "Require review from Code Owners" is enabled
-# in the branch protection settings for `main`.
+# in the branch protection settings for `main` (NOT for UAT or other branches).
 #
-# Only the users/teams listed here can approve a PR that changes these paths.
-# Without their approval, the PR cannot be merged into main.
+# For PRs targeting `main`: architect approval is required (enforced by GitHub + pipeline).
+# For PRs targeting other branches (e.g. UAT): any designated code reviewer can approve.
 #
 # Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
