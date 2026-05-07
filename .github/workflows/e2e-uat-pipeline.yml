@@ -129,8 +129,9 @@ jobs:
     outputs:
       has_delta: ${{ steps.delta.outputs.has_delta }}
     steps:
-      - name: Request PR reviewers and notify
-        # Run on every PR event (open, reopen, push/sync, ready_for_review)
+      - name: Request PR reviewers
+        # Request review immediately on PR open/push so GitHub sends its native notification.
+        # A "validation passed" comment is posted at the END of this job (on success only).
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -154,6 +155,9 @@ jobs:
             exit 0
           fi
 
+          # Store eligible reviewers for use by the post-validation notification step
+          printf '%s\n' "${ELIGIBLE[@]}" > /tmp/eligible-reviewers.txt
+
           # Build JSON array of eligible reviewers
           REVIEWERS_JSON=$(printf '%s\n' "${ELIGIBLE[@]}" | jq -R . | jq -s .)
 
@@ -172,29 +176,6 @@ jobs:
             echo "::warning::Failed to request reviewers (HTTP $HTTP):"
             cat /tmp/reviewer-response.json || true
           fi
-
-          # Post a review request notification comment
-          REVIEWER_MENTIONS=$(printf '@%s ' "${ELIGIBLE[@]}" | xargs)
-          COMMENT_BODY="👋 ${REVIEWER_MENTIONS} — your review is requested on this PR.
-
-          **PR:** #${PR_NUMBER} — ${{ github.event.pull_request.title }}
-          **Author:** @${PR_AUTHOR}
-          **Branch:** \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\`
-          **Pipeline:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-
-          > ⏳ Automated checks are running. Please review once all checks pass."
-
-          python3 -c "
-          import json
-          body = open('/dev/stdin').read()
-          print(json.dumps({'body': body}))
-          " <<< "$COMMENT_BODY" | curl -sSL -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" > /dev/null
-
-          echo "✅ Review notification comment posted."
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -1185,6 +1166,54 @@ jobs:
             fetched-waivers.csv
             sca-pr-comment.md
           if-no-files-found: warn
+
+      - name: Notify reviewers — validation passed
+        # Only runs when ALL prior steps succeeded. Posts a single actionable comment
+        # so reviewers are pinged at the right moment (not before checks are done).
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+
+          # Read eligible reviewers written by the first step
+          if [[ ! -f /tmp/eligible-reviewers.txt ]]; then
+            echo "No eligible reviewers file found — skipping notification."
+            exit 0
+          fi
+          mapfile -t ELIGIBLE < /tmp/eligible-reviewers.txt
+          if [[ "${#ELIGIBLE[@]}" -eq 0 ]]; then
+            echo "No eligible reviewers — skipping notification."
+            exit 0
+          fi
+
+          REVIEWER_MENTIONS=$(printf '@%s ' "${ELIGIBLE[@]}" | xargs)
+          COMMENT_BODY="✅ **All automated checks passed — PR is ready for review!**
+
+          👋 ${REVIEWER_MENTIONS} — validation completed successfully. Please review at your earliest convenience.
+
+          | Detail | Value |
+          |--------|-------|
+          | **PR** | #${PR_NUMBER} — ${{ github.event.pull_request.title }} |
+          | **Author** | @${PR_AUTHOR} |
+          | **Branch** | \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\` |
+          | **Pipeline run** | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+
+          python3 -c "
+          import json, sys
+          body = open('/dev/stdin').read()
+          print(json.dumps({'body': body}))
+          " <<< "$COMMENT_BODY" | curl -sSL -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d @- \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" > /dev/null
+
+          echo "✅ Post-validation reviewer notification posted."
 
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 5 — CheckMarx AST SAST Scan
