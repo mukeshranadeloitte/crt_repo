@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+    <types>
+        <members>AccountUtilityService</members>
+        <members>AccountUtilityServiceTest</members>
+        <members>CoverageDemoService</members>
+        <members>SmokeTestPingResourceTest</members>
+        <name>ApexClass</name>
+    </types>
+    <version>66.0</version>
+</Package>
