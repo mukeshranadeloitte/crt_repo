@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html xmlns:o="urn:schemas-microsoft-com:office:office"
+      xmlns:w="urn:schemas-microsoft-com:office:word"
+      xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta charset="UTF-8">
+<title>Salesforce CI/CD Pipeline — Client Assessment Questionnaire</title>
+<style>
+  body { font-family: Calibri, Arial, sans-serif; font-size: 11pt; margin: 2cm; color: #1a1a1a; }
+  h1   { font-size: 18pt; color: #003087; border-bottom: 2px solid #003087; padding-bottom: 6px; }
+  h2   { font-size: 13pt; color: #003087; margin-top: 20px; margin-bottom: 4px; }
+  h3   { font-size: 11pt; color: #444; margin-top: 14px; margin-bottom: 4px; }
+  p.purpose { background: #f0f4ff; border-left: 4px solid #003087; padding: 8px 12px; font-style: italic; }
+  p.legend  { font-size: 10pt; margin: 0 0 4px 0; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 10px; }
+  th    { background: #003087; color: #fff; font-weight: bold; text-align: left; padding: 6px 8px; font-size: 10pt; }
+  td    { border: 1px solid #c0c8d8; padding: 5px 8px; font-size: 10pt; vertical-align: top; }
+  tr:nth-child(even) td { background: #f5f7fc; }
+  .help { background: #eaf4ea; border-left: 3px solid #2e7d32; padding: 6px 10px; font-size: 10pt; margin: 4px 0 14px 0; }
+  .score-0  { background: #fde9e9; }
+  .score-1  { background: #fff4e5; }
+  .score-2  { background: #fffde7; }
+  .score-3  { background: #eaf4ea; }
+  hr   { border: none; border-top: 1px solid #c0c8d8; margin: 18px 0; }
+  .footer { font-size: 9pt; color: #888; margin-top: 24px; }
+</style>
+</head>
+<body>
+
+<h1>Salesforce CI/CD Pipeline &mdash; Client Assessment Questionnaire</h1>
+
+<p class="purpose">
+  <strong>Purpose:</strong> Understand your current CI/CD maturity and identify how the UAT End-to-End Pipeline can improve your delivery process.<br>
+  <strong>Instructions:</strong> For each item, mark your current status:
+</p>
+<p class="legend">&#9989; <strong>Already have it</strong> &mdash; fully implemented</p>
+<p class="legend">&#9888;&#65039; <strong>Partially</strong> &mdash; in place but incomplete or inconsistent</p>
+<p class="legend">&#10060; <strong>Not in place</strong> &mdash; not implemented</p>
+<p class="legend">&#10067; <strong>Unsure</strong> &mdash; need to investigate</p>
+
+<hr>
+
+<!-- SECTION 1 -->
+<h2>Section 1 &mdash; Source Control &amp; Branching</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>1.1</td><td>Do you use Git-based source control (GitHub / GitLab / Bitbucket)?</td><td></td><td></td></tr>
+  <tr><td>1.2</td><td>Do you have a dedicated UAT/integration branch separate from main?</td><td></td><td></td></tr>
+  <tr><td>1.3</td><td>Are all Salesforce metadata changes committed via source control (not direct org deployment)?</td><td></td><td></td></tr>
+  <tr><td>1.4</td><td>Do you follow a Pull Request (PR) / Merge Request process before deploying?</td><td></td><td></td></tr>
+  <tr><td>1.5</td><td>Do you have branch protection rules (e.g. require PR reviews before merge)?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> Enforces a PR-first workflow with branch protection, automatically validates every PR before it can be merged, and prevents direct deploys to UAT by requiring all changes to flow through the pipeline.</div>
+
+<!-- SECTION 2 -->
+<h2>Section 2 &mdash; PR Validation &amp; Delta Deployment</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>2.1</td><td>Do you validate changes against the target org <strong>before</strong> merging?</td><td></td><td></td></tr>
+  <tr><td>2.2</td><td>Do you deploy only the <strong>delta</strong> (changed components) rather than the full org metadata?</td><td></td><td></td></tr>
+  <tr><td>2.3</td><td>Do you track which <strong>Apex test classes</strong> to run per PR (specified in PR or auto-inferred)?</td><td></td><td></td></tr>
+  <tr><td>2.4</td><td>Do you handle <strong>destructive changes</strong> (deleted components) in your pipeline?</td><td></td><td></td></tr>
+  <tr><td>2.5</td><td>Do you receive <strong>live deployment progress</strong> during CI runs (component count, errors, status)?</td><td></td><td></td></tr>
+  <tr><td>2.6</td><td>Do you get a <strong>per-component breakdown</strong> (created / updated / deleted) in your pipeline logs?</td><td></td><td></td></tr>
+  <tr><td>2.7</td><td>Are reviewers <strong>automatically requested</strong> and notified when a PR is opened?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> Uses <code>sfdx-git-delta</code> to compute the exact diff between the PR branch and the UAT tip. Only changed components are validated/deployed. Test classes are extracted from the PR description or automatically inferred from naming conventions (<code>*Test</code>, <code>*Tests</code>, <code>*TestClass</code>). Live progress is streamed every 15 seconds.</div>
+
+<!-- SECTION 3 -->
+<h2>Section 3 &mdash; Test Coverage &amp; Apex Testing</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>3.1</td><td>Is Apex test coverage enforced <strong>automatically</strong> in your pipeline?</td><td></td><td></td></tr>
+  <tr><td>3.2</td><td>What is your current <strong>minimum Apex coverage threshold</strong>?</td><td></td><td>____%</td></tr>
+  <tr><td>3.3</td><td>Do you receive <strong>per-class coverage breakdowns</strong> in your pipeline output?</td><td></td><td></td></tr>
+  <tr><td>3.4</td><td>Are test failures surfaced clearly with <strong>class name + method + error message</strong>?</td><td></td><td></td></tr>
+  <tr><td>3.5</td><td>Are coverage warnings (classes below threshold) reported separately from failures?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> Enforces a configurable coverage threshold (default 85%, set via <code>vars.COVERAGE_THRESHOLD</code>). Per-class coverage is printed in a formatted report. Test failures include full class name, method name, and error message.</div>
+
+<!-- SECTION 4 -->
+<h2>Section 4 &mdash; Code Quality (Salesforce Code Analyzer / SAST)</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>4.1</td><td>Do you run <strong>Salesforce Code Analyzer</strong> (SF CLI scanner) on PRs?</td><td></td><td></td></tr>
+  <tr><td>4.2</td><td>Does your scanner target only <strong>changed files</strong> (not the entire repo on every PR)?</td><td></td><td></td></tr>
+  <tr><td>4.3</td><td>Does your pipeline <strong>post scanner results as a PR comment</strong> for developer visibility?</td><td></td><td></td></tr>
+  <tr><td>4.4</td><td>Do you have a <strong>waiver / exemption mechanism</strong> for known violations?</td><td></td><td></td></tr>
+  <tr><td>4.5</td><td>Do waivers <strong>auto-expire</strong> after a set date (forcing eventual remediation)?</td><td></td><td></td></tr>
+  <tr><td>4.6</td><td>Can you waive violations at different levels? (specific file / all files for a rule / all rules for a component)</td><td></td><td></td></tr>
+  <tr><td>4.7</td><td>Are waiver files <strong>protected</strong> so only authorised staff (Tech Lead / DevOps) can update them on <code>main</code>?</td><td></td><td></td></tr>
+  <tr><td>4.8</td><td>Do you scan <strong>LWC / JavaScript</strong> components in addition to Apex?</td><td></td><td></td></tr>
+  <tr><td>4.9</td><td>Can the scanner be <strong>toggled off</strong> during initial project phases without editing the workflow?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> Scans only changed <code>.cls</code>, <code>.trigger</code>, <code>.js</code>, <code>.html</code>, <code>.css</code> files per PR. Results are posted as a PR comment with a colour-coded governance table (&#9989; Waived / &#9200; Expiring / &#10060; Expired / &#9888; Unwaived). Waivers stored in <code>.github/sf-scanner-waivers.csv</code> on <code>main</code> only. Enforcement controlled by <code>vars.SCA_ENFORCEMENT_MODE</code>.</div>
+
+<!-- SECTION 5 -->
+<h2>Section 5 &mdash; Dependency Security (npm SCA)</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>5.1</td><td>Do you run <strong>npm audit</strong> or equivalent dependency vulnerability scanning?</td><td></td><td></td></tr>
+  <tr><td>5.2</td><td>Do you block the pipeline on <strong>high/critical</strong> npm vulnerabilities?</td><td></td><td></td></tr>
+  <tr><td>5.3</td><td>Do you have a <strong>waiver mechanism</strong> for known npm vulnerabilities with expiry dates?</td><td></td><td></td></tr>
+  <tr><td>5.4</td><td>Do npm audit results survive the pipeline even if <code>package.json</code> doesn&apos;t exist in the repo?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> Runs <code>npm audit --json</code> on every PR. High/critical vulnerabilities are matched against <code>.github/sca-waivers.json</code>. Active waivers (with future expiry) pass; expired waivers fail the pipeline. If no <code>package.json</code> exists, a standard Salesforce one is auto-created.</div>
+
+<!-- SECTION 6 -->
+<h2>Section 6 &mdash; Advanced SAST (CheckMarx / Fortify)</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>6.1</td><td>Do you use <strong>CheckMarx AST</strong> for SAST scanning?</td><td></td><td></td></tr>
+  <tr><td>6.2</td><td>Do you use <strong>Fortify on Demand</strong> for SAST scanning?</td><td></td><td></td></tr>
+  <tr><td>6.3</td><td>Do you perform <strong>DAST</strong> (Dynamic Application Security Testing)?</td><td></td><td></td></tr>
+  <tr><td>6.4</td><td>Are SAST results published to <strong>GitHub Code Scanning / Security tab</strong>?</td><td></td><td></td></tr>
+  <tr><td>6.5</td><td>Do SAST scans run <strong>in parallel</strong> with other pipeline jobs (not blocking deployments)?</td><td></td><td></td></tr>
+  <tr><td>6.6</td><td>Can individual scanners be <strong>enabled/disabled</strong> without editing the YAML?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> CheckMarx (Job 5) and Fortify (Job 6) run in parallel with PR validation — they do not block the deploy path. Each scanner is enabled automatically when its corresponding secret is present (<code>CX_CLIENT_SECRET</code> / <code>FOD_CLIENT_SECRET</code>). SARIF reports are uploaded to GitHub Code Scanning.</div>
+
+<!-- SECTION 7 -->
+<h2>Section 7 &mdash; Deployment Approval &amp; Merge Gate</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>7.1</td><td>Does your pipeline require <strong>at least one PR approval</strong> before deployment?</td><td></td><td></td></tr>
+  <tr><td>7.2</td><td>Does your pipeline check that the approval is for the <strong>latest commit</strong> (not a stale review)?</td><td></td><td></td></tr>
+  <tr><td>7.3</td><td>Does your pipeline verify <strong>all required checks passed</strong> before allowing merge?</td><td></td><td></td></tr>
+  <tr><td>7.4</td><td>Is the PR <strong>automatically merged</strong> once approved and all checks pass?</td><td></td><td></td></tr>
+  <tr><td>7.5</td><td>Is there a record of <strong>who approved</strong> and <strong>who triggered</strong> each deployment?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> The Approval + Merge Gate (Job 7) validates the approval is for the latest commit SHA, checks all required jobs have successful runs, then auto-merges via GitHub API. The approver and PR raiser are recorded in the CRT summary comment.</div>
+
+<!-- SECTION 8 -->
+<h2>Section 8 &mdash; Post-Merge Deployment</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>8.1</td><td>Does your pipeline automatically <strong>deploy to UAT</strong> after PR is merged?</td><td></td><td></td></tr>
+  <tr><td>8.2</td><td>Do you maintain a <strong>deployment history</strong> (what was deployed, when, by whom)?</td><td></td><td></td></tr>
+  <tr><td>8.3</td><td>Are deployment packages (<code>package.xml</code> + <code>components.zip</code>) <strong>stored as artefacts</strong>?</td><td></td><td></td></tr>
+  <tr><td>8.4</td><td>Is a <strong>baseline commit SHA</strong> automatically tracked for the next delta calculation?</td><td></td><td></td></tr>
+  <tr><td>8.5</td><td>Are deployment packages <strong>committed to a dedicated branch</strong> for long-term audit?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> After merge, Job 8 rebuilds the delta and deploys. A deployment package (<code>package.xml</code>, <code>destructiveChanges.xml</code>, <code>components.zip</code>, <code>deployment-info.json</code>) is uploaded as a GitHub Artefact (90-day retention) and committed to the <code>pr_packages</code> orphan branch. <code>DELTA_FROM_COMMIT</code> is automatically updated for the next PR&apos;s baseline.</div>
+
+<!-- SECTION 9 -->
+<h2>Section 9 &mdash; Rollback</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>9.1</td><td>Do you have a documented <strong>rollback procedure</strong> for failed deployments?</td><td></td><td></td></tr>
+  <tr><td>9.2</td><td>Can rollback be triggered with a <strong>single action</strong> (e.g. one-click workflow trigger)?</td><td></td><td></td></tr>
+  <tr><td>9.3</td><td>Does rollback correctly handle <strong>new metadata</strong> introduced by the PR (destructive delete)?</td><td></td><td></td></tr>
+  <tr><td>9.4</td><td>Are rollback actions <strong>logged and commented</strong> on the original PR?</td><td></td><td></td></tr>
+  <tr><td>9.5</td><td>What is your current average time to rollback a bad deployment?</td><td></td><td>____mins</td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> Rollback (Job 11) is triggered via <code>workflow_dispatch</code> with <code>action=rollback</code> and a <code>rollback_commit_sha</code>. It uses <code>sfdx-git-delta</code> in reverse: components added by the PR are deleted (pre-destructive), components previously deleted are re-deployed. A result comment is posted to the original PR.</div>
+
+<!-- SECTION 10 -->
+<h2>Section 10 &mdash; Automated Smoke / Regression Testing</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>10.1</td><td>Do you run automated <strong>smoke or regression tests</strong> after every UAT deployment?</td><td></td><td></td></tr>
+  <tr><td>10.2</td><td>Do you use <strong>Copado Robotic Testing (CRT)</strong> or equivalent test automation tool?</td><td></td><td></td></tr>
+  <tr><td>10.3</td><td>Are test results <strong>summarised and posted</strong> back to the PR?</td><td></td><td></td></tr>
+  <tr><td>10.4</td><td>Does a failed smoke test result in a <strong>visible notification</strong> to the team?</td><td></td><td></td></tr>
+  <tr><td>10.5</td><td>Is a <strong>link to the test dashboard</strong> included in the pipeline summary?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> After deployment, Job 10 triggers a CRT build via GraphQL API, polls for completion, and posts a result summary to the PR including PR number, raiser, approver, test build ID, and pass/fail result. A link to the CRT dashboard is added to the GitHub Step Summary.</div>
+
+<!-- SECTION 11 -->
+<h2>Section 11 &mdash; Observability &amp; Governance</h2>
+<table>
+  <tr><th width="5%">#</th><th width="65%">Question</th><th width="10%">Status</th><th width="20%">Notes / Details</th></tr>
+  <tr><td>11.1</td><td>Do you have a <strong>single pipeline</strong> covering PR validation &rarr; approval &rarr; deploy &rarr; test?</td><td></td><td></td></tr>
+  <tr><td>11.2</td><td>Are all pipeline artefacts (reports, logs, packages) <strong>retained</strong> for audit purposes?</td><td></td><td></td></tr>
+  <tr><td>11.3</td><td>Can pipeline behaviour be configured via <strong>repository variables</strong> without editing YAML?</td><td></td><td></td></tr>
+  <tr><td>11.4</td><td>Can you <strong>bypass SCA</strong> during initial project setup without removing scanner steps?</td><td></td><td></td></tr>
+  <tr><td>11.5</td><td>Are concurrent pipeline runs <strong>cancelled automatically</strong> when a new commit is pushed?</td><td></td><td></td></tr>
+  <tr><td>11.6</td><td>Do you have <strong>destructive change reminders</strong> posted to PRs automatically?</td><td></td><td></td></tr>
+</table>
+<div class="help"><strong>How this pipeline helps:</strong> All configurable values are exposed as <code>vars.*</code> repository variables. <code>SCA_ENFORCEMENT_MODE=off</code> bypasses all scanner steps. Concurrency groups cancel superseded runs automatically. Artefacts are retained 7&ndash;90 days. Destructive changes trigger an automatic PR comment reminding reviewers to confirm data backup.</div>
+
+<!-- SECTION 12 -->
+<h2>Section 12 &mdash; Current Pain Points</h2>
+<table>
+  <tr><th width="5%">#</th><th width="50%">Question</th><th width="45%">Your Answer</th></tr>
+  <tr><td>12.1</td><td>What is the biggest bottleneck in your current CI/CD pipeline?</td><td></td></tr>
+  <tr><td>12.2</td><td>How long does a typical PR-to-UAT-deployment cycle take today?</td><td></td></tr>
+  <tr><td>12.3</td><td>How often do failed deployments require manual intervention?</td><td></td></tr>
+  <tr><td>12.4</td><td>Do developers have clear visibility of <strong>why</strong> a pipeline failed?</td><td></td></tr>
+  <tr><td>12.5</td><td>Are there compliance/security scan requirements you currently cannot meet?</td><td></td></tr>
+  <tr><td>12.6</td><td>Which Salesforce metadata types cause the most deployment issues?</td><td></td></tr>
+  <tr><td>12.7</td><td>Is your current coverage threshold enforced automatically or manually reviewed?</td><td></td></tr>
+  <tr><td>12.8</td><td>How do you currently handle emergency rollbacks?</td><td></td></tr>
+</table>
+
+<hr>
+
+<!-- SCORING GUIDE -->
+<h2>Scoring Guide</h2>
+<p>Count the number of &#9989; responses across Sections 1&ndash;11 and use the table below to gauge maturity:</p>
+<table>
+  <tr><th>Score</th><th>Maturity Level</th><th>Recommendation</th></tr>
+  <tr class="score-0"><td>0&ndash;30% &#9989;</td><td>Manual / ad-hoc</td><td>Pipeline provides <strong>immediate high value</strong> &mdash; automates most of the delivery process from scratch</td></tr>
+  <tr class="score-1"><td>31&ndash;60% &#9989;</td><td>Partial automation</td><td>Pipeline <strong>fills critical gaps</strong> &mdash; delta deploy, waivers, auto-merge, rollback</td></tr>
+  <tr class="score-2"><td>61&ndash;80% &#9989;</td><td>Mature CI/CD</td><td>Pipeline <strong>enhances governance &amp; security</strong> &mdash; SCA enforcement, expiry-based waivers, CRT integration</td></tr>
+  <tr class="score-3"><td>81&ndash;100% &#9989;</td><td>Advanced</td><td>Pipeline offers <strong>fine-tuning</strong> &mdash; custom waiver levels, parallel SAST, audit trail, advanced rollback</td></tr>
+</table>
+
+<hr>
+
+<!-- PIPELINE SUMMARY -->
+<h2>Pipeline Summary &mdash; What This Pipeline Delivers</h2>
+<table>
+  <tr><th>Capability</th><th>Detail</th></tr>
+  <tr><td><strong>Delta deployment</strong></td><td>Only changed components deployed &mdash; faster, safer</td></tr>
+  <tr><td><strong>Auto test class inference</strong></td><td>Named <code>*Test</code> / <code>*Tests</code> classes found automatically</td></tr>
+  <tr><td><strong>PR validation</strong></td><td>Check-only deploy validates before merge</td></tr>
+  <tr><td><strong>Apex coverage enforcement</strong></td><td>Configurable threshold (default 85%)</td></tr>
+  <tr><td><strong>Salesforce Code Analyzer</strong></td><td>Scans only changed files; results as PR comment</td></tr>
+  <tr><td><strong>SCA waiver system</strong></td><td>Expiry-based with 4 waiver levels (specific / global rule / global component / global all)</td></tr>
+  <tr><td><strong>npm dependency audit</strong></td><td>High/critical vulnerabilities checked with waiver support</td></tr>
+  <tr><td><strong>CheckMarx SAST</strong></td><td>Optional; enabled by secret presence</td></tr>
+  <tr><td><strong>Fortify SAST + DAST</strong></td><td>Optional; enabled by secret presence</td></tr>
+  <tr><td><strong>Auto reviewer request</strong></td><td>Designated reviewers requested and notified on PR open</td></tr>
+  <tr><td><strong>Approval + merge gate</strong></td><td>Verifies freshness of approval + all checks before auto-merge</td></tr>
+  <tr><td><strong>Post-merge deployment</strong></td><td>Deploys merge commit to UAT; streams live progress</td></tr>
+  <tr><td><strong>Deployment artefacts</strong></td><td>package.xml, components.zip, deployment-info.json &mdash; 90-day retention</td></tr>
+  <tr><td><strong>Rollback</strong></td><td>One-click via <code>workflow_dispatch</code>; handles new metadata correctly</td></tr>
+  <tr><td><strong>CRT smoke tests</strong></td><td>Auto-triggered after deploy; result posted as PR comment</td></tr>
+  <tr><td><strong>Audit trail</strong></td><td>PR raiser, approver, deployed SHA, run URL all recorded</td></tr>
+</table>
+
+<p class="footer"><em>Document generated from <code>e2e-uat-pipeline.yml</code> &mdash; UAT End-to-End Pipeline</em></p>
+
+</body>
+</html>
