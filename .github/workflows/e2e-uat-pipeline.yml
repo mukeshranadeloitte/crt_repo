@@ -1441,6 +1441,7 @@ jobs:
           # Add GitHub usernames below to grant merge approval authority.
           ARCHITECTS=(
             "chorevathi-deloitte"
+            "mukeshranadeloitte"
           )
 
           IS_ARCHITECT=false

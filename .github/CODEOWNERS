@@ -9,8 +9,8 @@
 # Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # All files — Architect / Designated Architect approval required
-* @chorevathi-deloitte
+* @chorevathi-deloitte @mukeshranadeloitte
 
 # Workflow files — extra protection: architects must approve any pipeline changes
-.github/workflows/ @chorevathi-deloitte
-.github/CODEOWNERS  @chorevathi-deloitte
+.github/workflows/ @chorevathi-deloitte @mukeshranadeloitte
+.github/CODEOWNERS  @chorevathi-deloitte @mukeshranadeloitte
