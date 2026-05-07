@@ -352,9 +352,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          # ── Use the latest tip of the target (base) branch ───────────────
+          # BASE_SHA = github.event.pull_request.base.sha is the merge-base commit
+          # (where the PR branched from). The target branch may have new commits
+          # since then. We resolve the current tip of BASE_REF to always snapshot
+          # the most up-to-date stable version of each file.
+          TARGET_TIP=$(git rev-parse "origin/${BASE_REF}" 2>/dev/null || echo "${BASE_SHA}")
           echo "════════════════════════════════════════════════════════════════"
-          echo "  ROLLBACK SNAPSHOT — capturing base-branch stable versions"
-          echo "  Base: ${BASE_REF} (${BASE_SHA:0:10})"
+          echo "  ROLLBACK SNAPSHOT — capturing target-branch stable versions"
+          echo "  Target branch:  ${BASE_REF}"
+          echo "  Target tip SHA: ${TARGET_TIP:0:10}  (latest commit on ${BASE_REF})"
+          echo "  PR base SHA:    ${BASE_SHA:0:10}  (merge-base when PR was opened)"
           echo "  Head: ${HEAD_REF} (${HEAD_SHA:0:10})"
           echo "════════════════════════════════════════════════════════════════"
 
@@ -373,35 +381,49 @@ jobs:
             exit 0
           fi
 
-          # ── For each changed file, restore the base-branch version ────────
+          # ── For each changed file, restore from the target branch tip ─────
+          # Priority: target branch tip (most current stable) → PR merge-base fallback
           snapped=0
           skipped=0
           snapped_list=""
+          snapped_from_tip=0
+          snapped_from_base=0
 
           while IFS= read -r file; do
             [[ -z "$file" ]] && continue
 
-            # Check file existed in base (not brand-new in this PR)
-            if git show "${BASE_SHA}:${file}" &>/dev/null; then
+            # Try target branch tip first (latest stable version on UAT/target)
+            if git show "${TARGET_TIP}:${file}" &>/dev/null; then
+              dest="${SNAPSHOT_DIR}/${file}"
+              mkdir -p "$(dirname "$dest")"
+              git show "${TARGET_TIP}:${file}" > "$dest"
+              snapped=$((snapped + 1))
+              snapped_from_tip=$((snapped_from_tip + 1))
+              snapped_list="${snapped_list}${file}\n"
+              echo "  ✅ snapped from ${BASE_REF} tip: ${file}"
+            # Fallback: PR merge-base (for files that existed when PR was opened but were removed from target since)
+            elif git show "${BASE_SHA}:${file}" &>/dev/null; then
               dest="${SNAPSHOT_DIR}/${file}"
               mkdir -p "$(dirname "$dest")"
               git show "${BASE_SHA}:${file}" > "$dest"
               snapped=$((snapped + 1))
+              snapped_from_base=$((snapped_from_base + 1))
               snapped_list="${snapped_list}${file}\n"
-              echo "  ✅ snapped: ${file}"
+              echo "  ✅ snapped from merge-base (fallback): ${file}"
             else
               skipped=$((skipped + 1))
-              echo "  ⚠️  new file (no base version): ${file}"
+              echo "  ⚠️  new file (not in ${BASE_REF}): ${file}"
             fi
           done <<< "$sf_changed"
 
           echo ""
-          echo "Snapped ${snapped} file(s), skipped ${skipped} new file(s)."
+          echo "Snapped ${snapped} file(s): ${snapped_from_tip} from ${BASE_REF} tip, ${snapped_from_base} from merge-base."
+          echo "Skipped ${skipped} new file(s) (no version exists in target branch)."
 
-          # ── Build sfdx-git-delta package.xml for the base-branch state ────
-          # Run delta FROM HEAD (current) TO BASE (stable) to get re-deploy package
+          # ── Build sfdx-git-delta package.xml for the target-branch state ──
+          # Run delta FROM HEAD (current) TO target tip (stable) to get re-deploy package
           sf sgd:source:delta \
-            --to   "${BASE_SHA}" \
+            --to   "${TARGET_TIP}" \
             --from "${HEAD_SHA}" \
             --output-dir "${SNAPSHOT_DIR}/delta/" \
             --source-dir force-app/ \
@@ -415,6 +437,7 @@ jobs:
           cat "${SNAPSHOT_DIR}/delta/destructiveChanges/destructiveChanges.xml" 2>/dev/null || echo "(none)"
 
           # ── Write provenance manifest ─────────────────────────────────────
+          export TARGET_TIP
           pr_info=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
             --jq '{title:.title, body:.body, author:.user.login, created_at:.created_at, html_url:.html_url, base_branch:.base.ref, head_branch:.head.ref}' \
             2>/dev/null || echo '{}')
@@ -431,7 +454,7 @@ jobs:
 
           manifest = {
             "snapshot_created_at": datetime.datetime.utcnow().isoformat() + "Z",
-            "description":         "Pre-PR stable versions from base branch. Use for rollback.",
+            "description":         "Stable versions captured from target branch at PR validation time. Use for rollback.",
             "pr": {
               "number":       int(os.environ["PR_NUMBER"]),
               "title":        pr_info.get("title", os.environ.get("PR_TITLE", "")),
@@ -440,21 +463,23 @@ jobs:
               "created_at":   pr_info.get("created_at", ""),
             },
             "commits": {
-              "base_branch":  os.environ["BASE_REF"],
-              "base_sha":     os.environ["BASE_SHA"],
-              "head_branch":  os.environ["HEAD_REF"],
-              "head_sha":     os.environ["HEAD_SHA"],
+              "target_branch":    os.environ["BASE_REF"],
+              "target_tip_sha":   os.environ["TARGET_TIP"],
+              "pr_merge_base_sha": os.environ["BASE_SHA"],
+              "feature_branch":   os.environ["HEAD_REF"],
+              "feature_sha":      os.environ["HEAD_SHA"],
             },
             "snapshot": {
-              "total_files_snapped":  snapped,
+              "source":                  f"{os.environ['BASE_REF']} tip ({os.environ['TARGET_TIP'][:10]})",
+              "total_files_snapped":     snapped,
               "total_new_files_skipped": skipped,
-              "snapped_files": snapped_files,
+              "snapped_files":           snapped_files,
             },
             "rollback_instructions": {
               "step1": "Download this artifact: rollback-snapshot-pr-${PR_NUMBER}",
-              "step2": "Deploy rollback-snapshot/delta/package/package.xml to restore stable versions",
+              "step2": "Deploy rollback-snapshot/delta/package/package.xml to restore stable versions from " + os.environ["BASE_REF"],
               "step3": "Deploy rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml to remove PR-added metadata",
-              "step4": "Or trigger the manual rollback workflow_dispatch with rollback_commit_sha=" + os.environ["BASE_SHA"],
+              "step4": "Or trigger the manual rollback workflow_dispatch with rollback_commit_sha=" + os.environ["TARGET_TIP"] + " rollback_pr_number=${PR_NUMBER}",
             }
           }
 
@@ -465,8 +490,8 @@ jobs:
           print(json.dumps(manifest, indent=2))
           PYEOF
 
-          echo "snapshot_files=${snapped}" >> "$GITHUB_OUTPUT"
-          echo "base_sha=${BASE_SHA}"       >> "$GITHUB_OUTPUT"
+          echo "snapshot_files=${snapped}"     >> "$GITHUB_OUTPUT"
+          echo "target_tip_sha=${TARGET_TIP}"  >> "$GITHUB_OUTPUT"
 
       - name: Upload rollback snapshot artifact
         if: github.event_name == 'pull_request' && steps.snapshot.outputs.snapshot_files != '0'
