@@ -8,7 +8,7 @@ This runbook guides the approver through the PR review and deployment process fo
 
 The automated pipeline handles all checks and gates. Human action is only required to:
 1. **Review and approve the PR** in GitHub (triggers merge + deploy)
-2. **Trigger a rollback** if a deployed change needs reverting
+2. **Monitor and verify** the deployment after it completes
 
 > ℹ️ The `ReleaseGate` manual approval step has been removed. The PR review approval (`ss10del` / `chorevathi-deloitte`) is the single human gate before deployment.
 
@@ -16,13 +16,12 @@ The automated pipeline handles all checks and gates. Human action is only requir
 
 | # | Job | Depends On | Description |
 |---|-----|------------|-------------|
-| 2 | `salesforce-validation` | `setup` | Requests reviewers (`ss10del`, `chorevathi-deloitte`), validates delta, runs SF Code Analyzer |
-| 3 | `sca-sast-stage` | `setup` | npm dependency audit (runs in **parallel** with Job 2) |
-| 4 | `automated-governance` | `salesforce-validation` | Apex coverage + destructive changes guard |
-| 5 | `checkmarx-sast` | `setup` | CheckMarx SAST (runs in **parallel** with Jobs 2 & 3) |
-| 6 | `fortify-sast-dast` | `setup` | Fortify SAST/DAST (runs in **parallel** with Jobs 2, 3 & 5) |
+| 1 | `setup` | — | Evaluates which security scanners to run; outputs `run-checkmarx` / `run-fortify` flags |
+| 2 | `salesforce-validation` | *(none — starts immediately)* | Requests reviewers (`ss10del`, `chorevathi-deloitte`), validates delta, runs SF Code Analyzer |
+| 3 | `checkmarx-sast` | `setup` | CheckMarx SAST (runs in **parallel** with Job 4, conditional on `CX_CLIENT_SECRET`) |
+| 4 | `fortify-sast-dast` | `setup` | Fortify SAST/DAST (runs in **parallel** with Job 3, conditional on `FOD_CLIENT_SECRET`) |
 
-> Jobs 2, 3, 5, and 6 all run in **parallel** from Job 1 (`setup`). Job 4 runs after Job 2. Once all pass, the PR is ready for human review/approval.
+> Jobs 2, 3, and 4 all run in **parallel** on PR open/update. Once all pass, the PR is ready for human review/approval.
 
 ---
 
@@ -114,90 +113,14 @@ After the deploy completes (Job 8), verify in UAT:
 
 ---
 
-## Rollback Procedure
+## Rollback / Reverting a Deployment
 
-If a deployment needs to be reverted after merging to UAT, follow these steps.
+The pipeline no longer has an automated rollback job. If a deployment needs reverting after merging to UAT, it must be done **manually in the Salesforce org**:
 
-### When to Rollback
-
-- CRT smoke tests fail after deployment
-- Post-deployment defect found in UAT org
-- Deployment caused an unexpected regression
-- Business decision to revert a feature
-
-### How It Works
-
-The rollback job **inverts the forward delta**:
-
-| What the PR did | What rollback does |
-|---|---|
-| **Added** new Apex classes, triggers, objects, fields | **Deletes** them (destructive change) |
-| **Modified** existing components | **Re-deploys** the prior version from rollback commit |
-| **Deleted** components | **Re-deploys** them from rollback commit |
-| **Created new metadata** (custom objects, fields, etc.) | **Deleted** — treated as destructive |
-
-### Step-by-Step Rollback
-
-**1. Find the rollback-to commit SHA**
-
-This is the last known-good commit — the state of the `uat` branch **before** the PR was merged.
-
-```bash
-# In your local repo
-git log --oneline uat | head -10
-# Pick the commit BEFORE the PR merge commit
-```
-
-Or find it in GitHub: `uat` branch → **Commits** → the commit just before the merge.
-
-**2. Trigger the rollback workflow**
-
-Go to: **Actions** → **UAT End-to-End Pipeline** → **Run workflow**
-
-Fill in:
-| Field | Value |
-|-------|-------|
-| **Action** | `rollback` |
-| **rollback_commit_sha** | The commit SHA from step 1 (e.g. `a1b2c3d4`) |
-| **rollback_pr_number** | *(Optional)* PR number that was deployed — for the comment |
-
-Click **Run workflow**.
-
-**3. Monitor the rollback**
-
-The **🔄 Rollback Deployment** job will:
-1. Build reverse delta (what was added → becomes destructive)
-2. Display the rollback package.xml and destructiveChanges.xml before executing
-3. Deploy to the UAT org with `--pre-destructive-changes` to delete new metadata first
-4. Run `RunLocalTests` if Apex was involved
-5. Post a PR comment and Step Summary with the result
-
-**4. Verify**
-
-After rollback completes:
-- [ ] Check Salesforce Setup → Deployment Status in UAT
-- [ ] Smoke test the reverted components
-- [ ] Confirm new metadata (custom objects/fields) have been removed from the org
-- [ ] Notify QA team to re-test
-
-### Rollback Artifact
-
-Every successful deployment uploads a `rollback-manifest-<run_id>` artifact (retained 30 days) containing:
-
-| File | Content |
-|------|---------|
-| `deployed-commit.txt` | The SHA that was deployed |
-| `rollback-to-commit.txt` | The SHA to revert to (HEAD^) |
-| `forward-package.xml` | Components that were deployed |
-| `forward-destructive.xml` | Components that were deleted by the PR |
-
-Download this artifact from the original deploy run to confirm the correct rollback target.
-
-### Rollback Limitations
-
-- Rollback **cannot restore data** — if the deployment changed object structure (e.g. removed a required field), records may be affected
-- Rollback of **sharing rules, permission sets, and profiles** should be reviewed manually after execution
-- If multiple PRs were merged after the target PR, rolling back one may conflict with later deployments — coordinate with the team
+1. Go to **Salesforce Setup → Deployment Status** in the UAT org
+2. Identify the deployment to revert
+3. Manually redeploy the previous known-good version using the Salesforce CLI or Workbench
+4. Notify QA team to re-test after the manual revert
 
 ---
 

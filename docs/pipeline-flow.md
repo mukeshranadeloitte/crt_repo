@@ -11,7 +11,6 @@ The `UAT End-to-End Pipeline` automates the full lifecycle of a Salesforce chang
 | `pull_request` → `uat` | Runs validation + security scans + reviewer notification |
 | `pull_request_review` (approved) | Merges PR + deploys + triggers CRT tests |
 | `workflow_dispatch` (deploy) | Manual security scan trigger |
-| `workflow_dispatch` (rollback) | Reverts last deployment |
 
 ---
 
@@ -20,17 +19,14 @@ The `UAT End-to-End Pipeline` automates the full lifecycle of a Salesforce chang
 ```mermaid
 flowchart TD
     START([🚀 PR opened / pushed to UAT branch]) --> SETUP
+    START --> SF_VAL
 
     subgraph JOB1["JOB 1 — Evaluate Scanner Availability"]
         SETUP["⚙️ setup\nCheck if CX_CLIENT_SECRET / FOD_CLIENT_SECRET exist\nOutput: run-checkmarx, run-fortify flags"]
     end
 
-    SETUP --> PARALLEL_START
-
-    PARALLEL_START((" ")) --> SF_VAL
-    PARALLEL_START --> SCA_SAST
-    PARALLEL_START --> CX
-    PARALLEL_START --> FORTIFY
+    SETUP --> CX
+    SETUP --> FORTIFY
 
     subgraph JOB2["JOB 2 — Salesforce PR Validation"]
         SF_VAL["🔵 salesforce-validation
@@ -48,45 +44,23 @@ flowchart TD
         Output: has_delta"]
     end
 
-    subgraph JOB3["JOB 3 — SCA/SAST Stage (npm dependency audit)"]
-        SCA_SAST["🟡 sca-sast-stage
-        1. Checkout + npm install
-        2. npm audit (high/critical vulnerabilities)
-        3. Check .github/sca-waivers.json for active waivers
-        4. FAIL if unwaived or expired vulnerabilities found"]
-    end
-
-    subgraph JOB5["JOB 5 — CheckMarx SAST (if CX secret present)"]
+    subgraph JOB3["JOB 3 — CheckMarx SAST (if CX secret present)"]
         CX["🔴 checkmarx-sast
         Checkmarx/ast-github-action
         SAST + KICS scan → SARIF
         Upload to GitHub Code Scanning"]
     end
 
-    subgraph JOB6["JOB 6 — Fortify FoD SAST + DAST (if FOD secret present)"]
+    subgraph JOB4["JOB 4 — Fortify FoD SAST + DAST (if FOD secret present)"]
         FORTIFY["🟠 fortify-sast-dast
         fortify/github-action SAST → SARIF
         Optional DAST scan via fcli if FOD_DAST_SCAN_URL set
         Upload to GitHub Code Scanning"]
     end
 
-    SF_VAL --> HARD_GATES
-
-    subgraph JOB4["JOB 4 — Automated Hard Gates (if has_delta)"]
-        HARD_GATES["🟢 automated-governance
-        1. Authenticate UAT org
-        2. Run ALL Apex tests with coverage
-        3. Enforce >= COVERAGE_THRESHOLD% (default 85%)
-        4. Check for destructive changes XML
-        5. Post PR warning if destructive changes found
-        6. Run Salesforce Code Analyzer on changed files"]
-    end
-
     SF_VAL --> FAN_IN
-    SCA_SAST --> FAN_IN
     CX --> FAN_IN
     FORTIFY --> FAN_IN
-    HARD_GATES --> FAN_IN
 
     FAN_IN(("All pass?"))
     FAN_IN -->|"❌ Any job failed"| PIPELINE_FAIL(["❌ Pipeline fails\nNo merge or deploy"])
@@ -94,7 +68,7 @@ flowchart TD
 
     REVIEW_TRIGGER --> MERGE_GATE
 
-    subgraph JOB7["JOB 7 — Approval + Merge Gate"]
+    subgraph JOB5["JOB 5 — Approval + Merge Gate"]
         MERGE_GATE["🔒 approval-merge-gate
         1. Verify approval is for latest commit SHA (not stale)
         2. Confirm all required checks passed on this SHA
@@ -104,40 +78,28 @@ flowchart TD
 
     MERGE_GATE -->|"✅ Merged"| DEPLOY
 
-    subgraph JOB8["JOB 8 — Deploy After Merge"]
+    subgraph JOB6["JOB 6 — Deploy After Merge"]
         DEPLOY["🚀 deploy-after-merge
         1. Checkout merge commit
-        2. Rebuild delta (HEAD^1 → HEAD)
-        3. Deploy to UAT org (async with live status table)
-        4. Run specified/inferred Apex tests
-        5. Show per-class coverage
-        6. Save rollback manifest artifacts
-        7. Build deployment package (zip + metadata)
-        8. Commit package to pr_packages branch
-        9. Auto-update DELTA_FROM_COMMIT variable to deployed SHA"]
+        2. Install SF CLI
+        3. Authenticate org
+        4. Install sfdx-git-delta
+        5. Build delta (HEAD^1 → HEAD)
+        6. Display & upload delta artifacts
+        7. Prepare deploy manifests (check package.xml / destructiveChanges.xml)
+        8. Deploy with NoTestRun (tests already run in PR validation)
+        9. Update DELTA_FROM_COMMIT (git rev-parse HEAD)
+        10. Merge pull request"]
     end
 
     DEPLOY -->|"✅ Deployed"| CRT
 
-    subgraph JOB9["JOB 9 — CRT Smoke Tests"]
+    subgraph JOB7["JOB 7 — CRT Smoke Tests"]
         CRT["🤖 trigger-crt-tests
         1. Trigger Copado Robotic Testing job via GraphQL API
         2. Poll build status every 30s until pass/fail/timeout
-        3. Print Job Summary box (PR, raiser, approver, build ID, result)
-        4. Post deployment comment to PR
-        5. Write CRT dashboard link to GitHub Step Summary"]
-    end
-
-    ROLLBACK_TRIGGER(["🔧 workflow_dispatch\naction = rollback"]) --> ROLLBACK
-
-    subgraph JOB10["JOB 10 — Rollback"]
-        ROLLBACK["🔄 rollback
-        1. Validate rollback_commit_sha provided
-        2. Build forward delta (what was deployed by the PR)
-        3. Build reverse delta (what to deploy to revert)
-        4. Deploy reverse delta with pre-destructive changes
-        5. RunLocalTests if Apex involved, else NoTestRun
-        6. Post rollback status comment to PR"]
+        3. CRT Job Summary: print console box AND write GitHub Step Summary
+        4. Post deployment comment to PR"]
     end
 ```
 
@@ -182,7 +144,7 @@ flowchart LR
         BASE["github.event.pull_request.base.sha\nUAT branch tip when PR opened"] -->|"delta FROM"| HEAD1["github.event.pull_request.head.sha\nLatest PR commit"]
     end
 
-    subgraph Deploy["Deploy After Merge — Job 9"]
+    subgraph Deploy["Deploy After Merge — Job 6"]
         PARENT["HEAD^1\nUAT tip just before this PR merged"] -->|"delta FROM"| MERGED["HEAD\nMerge commit"]
     end
 
@@ -198,15 +160,12 @@ flowchart LR
 | # | Job Name | Event Trigger | Depends On | Key Condition |
 |---|----------|--------------|------------|---------------|
 | 1 | Evaluate Scanner Availability | PR, dispatch | — | Not pull_request_review |
-| 2 | Salesforce PR Validation | PR | setup | pull_request event |
-| 3 | SCA/SAST Stage | PR, dispatch | setup | pull_request or workflow_dispatch (parallel with Job 2) |
-| 4 | Automated Hard Gates | PR | salesforce-validation | pull_request + has_delta=true |
-| 5 | CheckMarx AST Scan | PR, dispatch | setup | run-checkmarx=true (CX secret present, parallel) |
-| 6 | Fortify FoD Scan | PR, dispatch | setup | run-fortify=true (FOD secret present, parallel) |
-| 7 | Approval + Merge Gate | PR review | — | pull_request_review + approved |
-| 8 | Deploy After Merge | PR review | approval-merge-gate | merged=true |
-| 9 | Trigger CRT Tests | PR review | deploy-after-merge | deploy result=success |
-| 10 | Rollback | dispatch | — | action=rollback |
+| 2 | Salesforce PR Validation | PR | *(none)* | pull_request event |
+| 3 | CheckMarx AST Scan | PR, dispatch | setup | run-checkmarx=true (CX secret present, parallel) |
+| 4 | Fortify FoD Scan | PR, dispatch | setup | run-fortify=true (FOD secret present, parallel) |
+| 5 | Approval + Merge Gate | PR review | — | pull_request_review + approved |
+| 6 | Deploy After Merge | PR review | approval-merge-gate | merged=true |
+| 7 | Trigger CRT Tests | PR review | deploy-after-merge | deploy result=success |
 
 ---
 

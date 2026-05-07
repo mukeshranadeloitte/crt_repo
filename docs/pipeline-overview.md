@@ -9,35 +9,25 @@ This document describes the CI/CD pipeline defined in `.github/workflows/e2e-uat
 ```
 pull_request (force-app/**)
         │
-        └──► [1] setup
-                   │ (outputs: run-checkmarx, run-fortify)
-                   │
-         ┌─────────┼──────────────────────────────────────┐
-         ▼         ▼            ▼                  ▼       │
-   [2] salesforce  [3] sca-sast [5] checkmarx-sast [6] fortify-sast-dast
-       -validation     -stage       (if CX secret)    (if FOD secret)
-         │                │
-         ▼                │  (reviewer auto-request + notify on every PR event)
-   [4] automated-         │
-       governance         │
-         │                │
-         └────────┬────────┘
-                  ▼
-           PR reviewer approves → pull_request_review event fires
+        ├──► [1] setup
+        │         │ (outputs: run-checkmarx, run-fortify)
+        │         │
+        │    ┌────┴──────────────────────┐
+        │    ▼                           ▼
+        │  [3] checkmarx-sast      [4] fortify-sast-dast
+        │      (if CX secret)          (if FOD secret)
+        │
+        └──► [2] salesforce-validation  (starts immediately — no dependency on setup)
 
 pull_request_review (APPROVED)
         │
-        └──► [7] approval-merge-gate
+        └──► [5] approval-merge-gate
                         │
                         ▼
-                [8] deploy-after-merge
+                [6] deploy-after-merge
                         │
                         ▼
-                [9] trigger-crt-tests
-
-workflow_dispatch (action=rollback)
-        │
-        └──► [10] rollback
+                [7] trigger-crt-tests
 ```
 
 ---
@@ -47,15 +37,12 @@ workflow_dispatch (action=rollback)
 | # | Job | Trigger | Depends On | Purpose |
 |---|-----|---------|------------|---------|
 | 1 | `setup` | PR / dispatch | — | Evaluate which security scanners to run |
-| 2 | `salesforce-validation` | PR | `setup` | Request reviewers, check-only validate delta + Salesforce Code Analyzer |
-| 3 | `sca-sast-stage` | PR / dispatch | `setup` | `npm audit` dependency vulnerability gate |
-| 4 | `automated-governance` | PR | `salesforce-validation` | Apex coverage (≥ COVERAGE_THRESHOLD, default 85%) + destructive-changes guard |
-| 5 | `checkmarx-sast` | PR / dispatch | `setup` | CheckMarx AST SAST scan (conditional on `CX_CLIENT_SECRET`) |
-| 6 | `fortify-sast-dast` | PR / dispatch | `setup` | Fortify SAST + optional DAST (conditional on `FOD_CLIENT_SECRET`) |
-| 7 | `approval-merge-gate` | PR review APPROVED | — | Stale-approval guard + required-checks gate + auto-merge |
-| 8 | `deploy-after-merge` | PR review APPROVED | `approval-merge-gate` | Real deploy from merge commit to UAT org |
-| 9 | `trigger-crt-tests` | PR review APPROVED | `deploy-after-merge` | Trigger Copado Robotic Testing job |
-| 10 | `rollback` | `workflow_dispatch` (action=rollback) | — | Revert last deployment via reverse delta |
+| 2 | `salesforce-validation` | PR | *(none — starts immediately)* | Request reviewers, check-only validate delta + Salesforce Code Analyzer |
+| 3 | `checkmarx-sast` | PR / dispatch | `setup` | CheckMarx AST SAST scan (conditional on `CX_CLIENT_SECRET`) |
+| 4 | `fortify-sast-dast` | PR / dispatch | `setup` | Fortify SAST + optional DAST (conditional on `FOD_CLIENT_SECRET`) |
+| 5 | `approval-merge-gate` | PR review APPROVED | — | Stale-approval guard + required-checks gate + auto-merge |
+| 6 | `deploy-after-merge` | PR review APPROVED | `approval-merge-gate` | Real deploy from merge commit to UAT org |
+| 7 | `trigger-crt-tests` | PR review APPROVED | `deploy-after-merge` | Trigger Copado Robotic Testing job |
 
 ---
 
@@ -63,9 +50,9 @@ workflow_dispatch (action=rollback)
 
 | Event | Condition | Jobs Activated |
 |-------|-----------|----------------|
-| `pull_request` | Opened/updated/synchronised targeting `uat`; files under `force-app/**` or workflow/waivers changed | 1–6 |
-| `pull_request_review` | Review submitted with state `APPROVED` | 7–9 |
-| `workflow_dispatch` | Manual run; `scanner` input (`checkmarx / fortify / all`), `action` input (`deploy / rollback`) | 1, 3, 5, 6 (or 10 for rollback) |
+| `pull_request` | Opened/updated/synchronised targeting `uat`; files under `force-app/**` or workflow/waivers changed | 1–4 |
+| `pull_request_review` | Review submitted with state `APPROVED` | 5–7 |
+| `workflow_dispatch` | Manual run; `scanner` input (`checkmarx / fortify / all`) | 1, 3, 4 |
 
 ---
 
@@ -73,13 +60,11 @@ workflow_dispatch (action=rollback)
 
 | Gate | Tool | Condition |
 |------|------|-----------|
-| Dependency SCA | `npm audit --audit-level=high` | Always on PR (Job 3) |
 | SF Code Analyzer | `sf scanner run` + waiver check | PR with delta (Job 2); `SCA_ENFORCEMENT_MODE` controls failure behaviour |
-| SAST | CheckMarx AST (`sast + kics`) | `CX_CLIENT_SECRET` set + scanner includes `checkmarx` (Job 5) |
-| SAST | Fortify FoD | `FOD_CLIENT_SECRET` set + scanner includes `fortify` (Job 6) |
-| DAST | Fortify FoD | `FOD_DAST_SCAN_URL` secret set (Job 6) |
-| Apex code coverage | Salesforce platform | Any Apex change; threshold = `COVERAGE_THRESHOLD` (default 85%) |
-| Hard gates | Apex test run in UAT org | PR with delta (Job 4) |
+| SAST | CheckMarx AST (`sast + kics`) | `CX_CLIENT_SECRET` set + scanner includes `checkmarx` (Job 3) |
+| SAST | Fortify FoD | `FOD_CLIENT_SECRET` set + scanner includes `fortify` (Job 4) |
+| DAST | Fortify FoD | `FOD_DAST_SCAN_URL` secret set (Job 4) |
+| Apex code coverage | Salesforce platform | Any Apex change; threshold = `COVERAGE_THRESHOLD` (default 85%); enforced during PR validation (Job 2) |
 
 ---
 
