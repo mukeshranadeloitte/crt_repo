@@ -119,6 +119,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   salesforce-validation:
     name: Salesforce PR validation
+    needs: [setup]
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
