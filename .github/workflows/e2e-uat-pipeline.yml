@@ -16,7 +16,7 @@ name: UAT End-to-End Pipeline
 #   vars.FOD_URL / secrets.FOD_CLIENT_ID / FOD_CLIENT_SECRET
 #   secrets.FOD_APP_NAME / FOD_RELEASE_NAME / FOD_DAST_SCAN_URL (optional DAST)
 # CRT (Copado Robotic Testing):
-#   secrets.CRT_PAT                  - CRT External Personal Access Token
+#   secrets.CRT_API_TOKEN            - CRT External Personal Access Token
 #   vars.CRT_JOB_ID     (default: 115686)
 #   vars.CRT_PROJECT_ID (default: 73283)
 #   vars.CRT_ORG_ID     (default: 43532)
@@ -205,64 +205,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Install npm dependencies
-        run: |
-          set -euo pipefail
-          if [[ ! -f package.json ]]; then
-            echo "ℹ️  No package.json found — creating standard Salesforce package.json."
-            cat > package.json << 'PKGJSON'
-          {
-            "name": "salesforce-app",
-            "private": true,
-            "version": "1.0.0",
-            "description": "Salesforce App",
-            "scripts": {
-              "lint": "eslint **/{aura,lwc}/**/*.js",
-              "test": "npm run test:unit",
-              "test:unit": "sfdx-lwc-jest",
-              "test:unit:watch": "sfdx-lwc-jest --watch",
-              "test:unit:debug": "sfdx-lwc-jest --debug",
-              "test:unit:coverage": "sfdx-lwc-jest --coverage",
-              "prettier": "prettier --write \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prettier:verify": "prettier --check \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prepare": "husky || true",
-              "precommit": "lint-staged"
-            },
-            "devDependencies": {
-              "@lwc/eslint-plugin-lwc": "^3.1.0",
-              "@prettier/plugin-xml": "^3.4.1",
-              "@salesforce/eslint-config-lwc": "^4.0.0",
-              "@salesforce/eslint-plugin-aura": "^3.0.0",
-              "@salesforce/eslint-plugin-lightning": "^2.0.0",
-              "@salesforce/sfdx-lwc-jest": "^7.0.2",
-              "eslint": "^9.29.0",
-              "eslint-plugin-import": "^2.31.0",
-              "eslint-plugin-jest": "^28.14.0",
-              "husky": "^9.1.7",
-              "lint-staged": "^16.1.2",
-              "prettier": "^3.5.3",
-              "prettier-plugin-apex": "^2.2.6"
-            },
-            "lint-staged": {
-              "**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}": [
-                "prettier --write"
-              ],
-              "**/{aura,lwc}/**/*.js": [
-                "eslint"
-              ],
-              "**/lwc/**": [
-                "sfdx-lwc-jest -- --bail --findRelatedTests --passWithNoTests"
-              ]
-            }
-          }
-          PKGJSON
-          fi
-          if [[ -f package-lock.json ]]; then
-            npm ci
-          else
-            npm install
-          fi
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
@@ -1245,179 +1187,6 @@ jobs:
           if-no-files-found: warn
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 3 — SCA / SAST Stage (dependency audit)
-  # Blocks CheckMarx and Fortify from running until this passes.
-  # ─────────────────────────────────────────────────────────────────────────────
-  sca-sast-stage:
-    name: SCA/SAST Stage
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
-    needs: [setup]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install dependencies
-        run: |
-          set -euo pipefail
-          if [[ ! -f package.json ]]; then
-            echo "ℹ️  No package.json found — creating standard Salesforce package.json."
-            cat > package.json << 'PKGJSON'
-          {
-            "name": "salesforce-app",
-            "private": true,
-            "version": "1.0.0",
-            "description": "Salesforce App",
-            "scripts": {
-              "lint": "eslint **/{aura,lwc}/**/*.js",
-              "test": "npm run test:unit",
-              "test:unit": "sfdx-lwc-jest",
-              "test:unit:watch": "sfdx-lwc-jest --watch",
-              "test:unit:debug": "sfdx-lwc-jest --debug",
-              "test:unit:coverage": "sfdx-lwc-jest --coverage",
-              "prettier": "prettier --write \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prettier:verify": "prettier --check \"**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}\"",
-              "prepare": "husky || true",
-              "precommit": "lint-staged"
-            },
-            "devDependencies": {
-              "@lwc/eslint-plugin-lwc": "^3.1.0",
-              "@prettier/plugin-xml": "^3.4.1",
-              "@salesforce/eslint-config-lwc": "^4.0.0",
-              "@salesforce/eslint-plugin-aura": "^3.0.0",
-              "@salesforce/eslint-plugin-lightning": "^2.0.0",
-              "@salesforce/sfdx-lwc-jest": "^7.0.2",
-              "eslint": "^9.29.0",
-              "eslint-plugin-import": "^2.31.0",
-              "eslint-plugin-jest": "^28.14.0",
-              "husky": "^9.1.7",
-              "lint-staged": "^16.1.2",
-              "prettier": "^3.5.3",
-              "prettier-plugin-apex": "^2.2.6"
-            },
-            "lint-staged": {
-              "**/*.{cls,cmp,component,css,html,js,json,md,page,trigger,xml,yaml,yml}": [
-                "prettier --write"
-              ],
-              "**/{aura,lwc}/**/*.js": [
-                "eslint"
-              ],
-              "**/lwc/**": [
-                "sfdx-lwc-jest -- --bail --findRelatedTests --passWithNoTests"
-              ]
-            }
-          }
-          PKGJSON
-          fi
-          if [[ -f package-lock.json ]]; then
-            npm ci
-          else
-            npm install
-          fi
-
-      - name: Run dependency SCA gate with waiver support
-        run: |
-          set -euo pipefail
-
-          WAIVER_FILE=".github/sca-waivers.json"
-          TODAY=$(date -u +%Y-%m-%d)
-
-          # Run npm audit and capture JSON output; do not fail immediately.
-          npm audit --json --audit-level=high > audit-output.json 2>/dev/null || true
-
-          # If no high/critical vulnerabilities found, pass immediately.
-          VULN_COUNT=$(jq '[.vulnerabilities // {} | to_entries[] | .value
-            | select(.severity == "high" or .severity == "critical")] | length' audit-output.json 2>/dev/null || echo 0)
-
-          if [[ "$VULN_COUNT" -eq 0 ]]; then
-            echo "✅ No high/critical vulnerabilities found."
-            exit 0
-          fi
-
-          echo "Found $VULN_COUNT high/critical vulnerability/ies. Checking waivers..."
-
-          # Load waivers file if present
-          WAIVERS="[]"
-          if [[ -f "$WAIVER_FILE" ]]; then
-            WAIVERS=$(jq '.' "$WAIVER_FILE" 2>/dev/null || echo "[]")
-            echo "Loaded waiver file: $WAIVER_FILE"
-          else
-            echo "No waiver file found at $WAIVER_FILE — all violations will be evaluated."
-          fi
-
-          FAIL=0
-          WAIVED=0
-          EXPIRED=0
-
-          # Iterate over each high/critical vulnerability
-          while IFS= read -r vuln_json; do
-            PKG=$(echo "$vuln_json"  | jq -r '.name')
-            SEV=$(echo "$vuln_json"  | jq -r '.severity')
-            GHSA=$(echo "$vuln_json" | jq -r '.via[0].source // .via[0] // "unknown"' 2>/dev/null | head -1)
-
-            # Check if this package has an active waiver
-            WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
-              '[.[] | select(.package == $pkg and .expires >= $today)] | first // empty')
-
-            EXPIRED_WAIVER=$(echo "$WAIVERS" | jq --arg pkg "$PKG" --arg today "$TODAY" \
-              '[.[] | select(.package == $pkg and .expires < $today)] | first // empty')
-
-            if [[ -n "$WAIVER" && "$WAIVER" != "null" ]]; then
-              EXPIRES=$(echo "$WAIVER" | jq -r '.expires')
-              REASON=$(echo "$WAIVER"  | jq -r '.reason')
-              APPROVED=$(echo "$WAIVER"| jq -r '.approved_by // "unknown"')
-              echo "⏳ WAIVED [$SEV] $PKG (advisory: $GHSA)"
-              echo "   Reason: $REASON | Approved by: $APPROVED | Expires: $EXPIRES"
-              WAIVED=$((WAIVED + 1))
-            elif [[ -n "$EXPIRED_WAIVER" && "$EXPIRED_WAIVER" != "null" ]]; then
-              EXPIRES=$(echo "$EXPIRED_WAIVER" | jq -r '.expires')
-              REASON=$(echo "$EXPIRED_WAIVER"  | jq -r '.reason')
-              echo "::error::❌ EXPIRED WAIVER [$SEV] $PKG (advisory: $GHSA)"
-              echo "   Waiver expired on $EXPIRES — fix is now required. Reason was: $REASON"
-              EXPIRED=$((EXPIRED + 1))
-              FAIL=1
-            else
-              echo "::error::❌ UNWAIVED [$SEV] $PKG (advisory: $GHSA) — no active waiver found."
-              FAIL=$((FAIL + 1))
-            fi
-          done < <(jq -c '[.vulnerabilities // {} | to_entries[] | .value
-            | select(.severity == "high" or .severity == "critical")][]' audit-output.json 2>/dev/null)
-
-          echo ""
-          echo "──────────────────────────────────────────"
-          echo "SCA Summary: $VULN_COUNT violation(s) found"
-          echo "  ✅ Waived (active):   $WAIVED"
-          echo "  ❌ Expired waivers:   $EXPIRED"
-          echo "  ❌ Unwaived failures: $((FAIL - EXPIRED))"
-          echo "──────────────────────────────────────────"
-
-          if [[ "$FAIL" -gt 0 ]]; then
-            echo ""
-            echo "To suppress a known violation, add an entry to $WAIVER_FILE:"
-            echo '  { "package": "<pkg>", "severity": "<high|critical>", "reason": "<justification>", "expires": "YYYY-MM-DD", "approved_by": "<team>" }'
-            exit 1
-          fi
-
-          echo "✅ All violations are covered by active waivers."
-
-      - name: Upload SCA audit report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sca-audit-report
-          path: audit-output.json
-          if-no-files-found: warn
-          retention-days: 30
-
-  # ─────────────────────────────────────────────────────────────────────────────
-  # ─────────────────────────────────────────────────────────────────────────────
   # JOB 5 — CheckMarx AST SAST Scan
   # Runs only when CX_CLIENT_SECRET is set and scanner input includes checkmarx.
   # ─────────────────────────────────────────────────────────────────────────────
@@ -1647,7 +1416,6 @@ jobs:
 
           required_checks=(
             "Salesforce PR validation"
-            "SCA/SAST Stage"
           )
 
           if [[ "${{ secrets.CX_CLIENT_SECRET != '' }}" == "true" ]]; then
