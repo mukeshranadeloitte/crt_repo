@@ -120,7 +120,6 @@ jobs:
   salesforce-validation:
     name: Salesforce PR validation
     if: ${{ github.event_name == 'pull_request' }}
-    needs: [setup]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -2008,8 +2007,12 @@ jobs:
           echo "crt_status=$FINAL_STATUS" >> "$GITHUB_OUTPUT"
           echo "Final CRT result: $FINAL_STATUS"
 
-      - name: Print Job Summary
+      - name: CRT Job Summary
         if: always() && steps.pr_meta.outputs.has_pr == 'true'
+        env:
+          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
+          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
+          CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
         run: |
           echo ""
           echo "╔══════════════════════════════════════════╗"
@@ -2023,28 +2026,16 @@ jobs:
           echo "  Test Result     : ${{ steps.crt_poll.outputs.crt_status }}"
           echo "╚══════════════════════════════════════════╝"
           echo ""
-      - name: Post CRT deployment comment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: "🤖 Deployed to UAT: CRT robotic tests have been triggered via Copado EU Robotic Testing."
-            });
-      - name: CRT Test Execution Summary
-        if: always()
-        env:
-          CRT_JOB_ID:     ${{ vars.CRT_JOB_ID     || '115686' }}
-          CRT_PROJECT_ID: ${{ vars.CRT_PROJECT_ID  || '73283'  }}
-          CRT_ORG_ID:     ${{ vars.CRT_ORG_ID      || '43532'  }}
-        run: |
           {
             echo "## 🧪 CRT Test Execution Summary"
             echo ""
             echo "| Detail | Value |"
             echo "|--------|-------|"
+            echo "| **PR Number** | #${{ steps.pr_meta.outputs.pr_number }} |"
+            echo "| **PR Raiser** | ${{ steps.pr_meta.outputs.pr_raiser }} |"
+            echo "| **PR Approver** | ${{ steps.pr_meta.outputs.pr_approver }} |"
+            echo "| **Test Build ID** | ${{ steps.crt.outputs.build_id }} |"
+            echo "| **Test Result** | ${{ steps.crt_poll.outputs.crt_status }} |"
             echo "| **Instance** | https://eu-robotic.copado.com |"
             echo "| **Org ID** | ${CRT_ORG_ID} |"
             echo "| **Project ID** | ${CRT_PROJECT_ID} |"
