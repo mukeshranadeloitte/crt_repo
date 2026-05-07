@@ -66,7 +66,11 @@ on:
         required: false
         type: string
       rollback_pr_number:
-        description: "Rollback: PR number that was deployed (used to fetch test classes). Optional."
+        description: "Rollback: PR number that was deployed (fetches pre-built snapshot artifact). Optional."
+        required: false
+        type: string
+      rollback_files:
+        description: "Rollback: comma-separated list of specific Salesforce files/classes to rollback (e.g. CoverageDemoService.cls, AccountUtilityService.cls). Leave blank to rollback the entire PR."
         required: false
         type: string
 
@@ -331,6 +335,176 @@ jobs:
             destructiveChanges/destructiveChanges.xml
           if-no-files-found: warn
           retention-days: 7
+
+      # ── Snapshot: capture the pre-PR (base-branch) versions of every changed
+      #    Salesforce file so a future rollback has a ready-made stable package.
+      #    Artifact: rollback-snapshot-pr-<N>  (retained 90 days)
+      #    Manifest: rollback-snapshot/snapshot-manifest.json
+      - name: Snapshot pre-PR stable versions from base branch
+        id: snapshot
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA:   ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA:   ${{ github.event.pull_request.head.sha }}
+          BASE_REF:   ${{ github.event.pull_request.base.ref }}
+          HEAD_REF:   ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER:  ${{ github.event.pull_request.number }}
+          PR_TITLE:   ${{ github.event.pull_request.title }}
+          PR_AUTHOR:  ${{ github.event.pull_request.user.login }}
+          REPO:       ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # ── Use the latest tip of the target (base) branch ───────────────
+          # BASE_SHA = github.event.pull_request.base.sha is the merge-base commit
+          # (where the PR branched from). The target branch may have new commits
+          # since then. We resolve the current tip of BASE_REF to always snapshot
+          # the most up-to-date stable version of each file.
+          TARGET_TIP=$(git rev-parse "origin/${BASE_REF}" 2>/dev/null || echo "${BASE_SHA}")
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  ROLLBACK SNAPSHOT — capturing target-branch stable versions"
+          echo "  Target branch:  ${BASE_REF}"
+          echo "  Target tip SHA: ${TARGET_TIP:0:10}  (latest commit on ${BASE_REF})"
+          echo "  PR base SHA:    ${BASE_SHA:0:10}  (merge-base when PR was opened)"
+          echo "  Head: ${HEAD_REF} (${HEAD_SHA:0:10})"
+          echo "════════════════════════════════════════════════════════════════"
+
+          SNAPSHOT_DIR="rollback-snapshot"
+          mkdir -p "$SNAPSHOT_DIR"
+
+          # ── Collect all changed Salesforce source files ───────────────────
+          changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null \
+            || git diff --name-only HEAD~1 HEAD)
+
+          sf_changed=$(echo "$changed_files" | grep -E '^force-app/' || true)
+
+          if [[ -z "$sf_changed" ]]; then
+            echo "ℹ️  No force-app files changed — no snapshot needed."
+            echo "snapshot_files=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ── For each changed file, restore from the target branch tip ─────
+          # Priority: target branch tip (most current stable) → PR merge-base fallback
+          snapped=0
+          skipped=0
+          snapped_list=""
+          snapped_from_tip=0
+          snapped_from_base=0
+
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+
+            # Try target branch tip first (latest stable version on UAT/target)
+            if git show "${TARGET_TIP}:${file}" &>/dev/null; then
+              dest="${SNAPSHOT_DIR}/${file}"
+              mkdir -p "$(dirname "$dest")"
+              git show "${TARGET_TIP}:${file}" > "$dest"
+              snapped=$((snapped + 1))
+              snapped_from_tip=$((snapped_from_tip + 1))
+              snapped_list="${snapped_list}${file}\n"
+              echo "  ✅ snapped from ${BASE_REF} tip: ${file}"
+            # Fallback: PR merge-base (for files that existed when PR was opened but were removed from target since)
+            elif git show "${BASE_SHA}:${file}" &>/dev/null; then
+              dest="${SNAPSHOT_DIR}/${file}"
+              mkdir -p "$(dirname "$dest")"
+              git show "${BASE_SHA}:${file}" > "$dest"
+              snapped=$((snapped + 1))
+              snapped_from_base=$((snapped_from_base + 1))
+              snapped_list="${snapped_list}${file}\n"
+              echo "  ✅ snapped from merge-base (fallback): ${file}"
+            else
+              skipped=$((skipped + 1))
+              echo "  ⚠️  new file (not in ${BASE_REF}): ${file}"
+            fi
+          done <<< "$sf_changed"
+
+          echo ""
+          echo "Snapped ${snapped} file(s): ${snapped_from_tip} from ${BASE_REF} tip, ${snapped_from_base} from merge-base."
+          echo "Skipped ${skipped} new file(s) (no version exists in target branch)."
+
+          # ── Build sfdx-git-delta package.xml for the target-branch state ──
+          # Run delta FROM HEAD (current) TO target tip (stable) to get re-deploy package
+          sf sgd:source:delta \
+            --to   "${TARGET_TIP}" \
+            --from "${HEAD_SHA}" \
+            --output-dir "${SNAPSHOT_DIR}/delta/" \
+            --source-dir force-app/ \
+            2>/dev/null || true
+
+          echo ""
+          echo "===== Rollback package.xml (re-deploy stable base state) ====="
+          cat "${SNAPSHOT_DIR}/delta/package/package.xml" 2>/dev/null || echo "(none generated)"
+          echo ""
+          echo "===== Rollback destructiveChanges.xml (remove PR-added metadata) ====="
+          cat "${SNAPSHOT_DIR}/delta/destructiveChanges/destructiveChanges.xml" 2>/dev/null || echo "(none)"
+
+          # ── Write provenance manifest ─────────────────────────────────────
+          export TARGET_TIP
+          pr_info=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '{title:.title, body:.body, author:.user.login, created_at:.created_at, html_url:.html_url, base_branch:.base.ref, head_branch:.head.ref}' \
+            2>/dev/null || echo '{}')
+
+          python3 - <<PYEOF
+          import json, os, datetime
+
+          pr_info   = json.loads('''${pr_info}''')
+          snapped   = ${snapped}
+          skipped   = ${skipped}
+
+          files_raw = """${snapped_list}"""
+          snapped_files = [f for f in files_raw.strip().split('\n') if f.strip()]
+
+          manifest = {
+            "snapshot_created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "description":         "Stable versions captured from target branch at PR validation time. Use for rollback.",
+            "pr": {
+              "number":       int(os.environ["PR_NUMBER"]),
+              "title":        pr_info.get("title", os.environ.get("PR_TITLE", "")),
+              "author":       pr_info.get("author", os.environ.get("PR_AUTHOR", "")),
+              "html_url":     pr_info.get("html_url", ""),
+              "created_at":   pr_info.get("created_at", ""),
+            },
+            "commits": {
+              "target_branch":    os.environ["BASE_REF"],
+              "target_tip_sha":   os.environ["TARGET_TIP"],
+              "pr_merge_base_sha": os.environ["BASE_SHA"],
+              "feature_branch":   os.environ["HEAD_REF"],
+              "feature_sha":      os.environ["HEAD_SHA"],
+            },
+            "snapshot": {
+              "source":                  f"{os.environ['BASE_REF']} tip ({os.environ['TARGET_TIP'][:10]})",
+              "total_files_snapped":     snapped,
+              "total_new_files_skipped": skipped,
+              "snapped_files":           snapped_files,
+            },
+            "rollback_instructions": {
+              "step1": "Download this artifact: rollback-snapshot-pr-${PR_NUMBER}",
+              "step2": "Deploy rollback-snapshot/delta/package/package.xml to restore stable versions from " + os.environ["BASE_REF"],
+              "step3": "Deploy rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml to remove PR-added metadata",
+              "step4": "Or trigger the manual rollback workflow_dispatch with rollback_commit_sha=" + os.environ["TARGET_TIP"] + " rollback_pr_number=${PR_NUMBER}",
+            }
+          }
+
+          os.makedirs("rollback-snapshot", exist_ok=True)
+          with open("rollback-snapshot/snapshot-manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+
+          print(json.dumps(manifest, indent=2))
+          PYEOF
+
+          echo "snapshot_files=${snapped}"     >> "$GITHUB_OUTPUT"
+          echo "target_tip_sha=${TARGET_TIP}"  >> "$GITHUB_OUTPUT"
+
+      - name: Upload rollback snapshot artifact
+        if: github.event_name == 'pull_request' && steps.snapshot.outputs.snapshot_files != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-snapshot-pr-${{ github.event.pull_request.number }}
+          path: rollback-snapshot/
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Extract test classes from PR description and comments
         id: pr-tests
@@ -2616,6 +2790,84 @@ jobs:
           rm -f sfdxAuthUrl.txt
           sf org display --target-org "$ORG_ALIAS"
 
+      - name: Download pre-built rollback snapshot (if available)
+        id: snapshot-dl
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.inputs.rollback_pr_number }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${PR_NUMBER:-}" ]]; then
+            echo "ℹ️  No rollback_pr_number provided — will compute delta from git history."
+            echo "use_snapshot=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ARTIFACT_NAME="rollback-snapshot-pr-${PR_NUMBER}"
+          echo "Looking for snapshot artifact: ${ARTIFACT_NAME}"
+
+          # Find the most recent run that has this artifact
+          RUN_ID=$(gh api \
+            "repos/${{ github.repository }}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=1" \
+            --jq '.artifacts[0].workflow_run.id // empty' 2>/dev/null || true)
+
+          if [[ -z "${RUN_ID}" ]]; then
+            echo "⚠️  Snapshot artifact '${ARTIFACT_NAME}' not found — will compute delta from git history."
+            echo "use_snapshot=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found snapshot from run ${RUN_ID}. Downloading..."
+          gh run download "${RUN_ID}" \
+            --name "${ARTIFACT_NAME}" \
+            --dir "rollback-snapshot/" \
+            --repo "${{ github.repository }}"
+
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  SNAPSHOT MANIFEST"
+          echo "════════════════════════════════════════════════════════════════"
+          cat rollback-snapshot/snapshot-manifest.json 2>/dev/null || echo "(manifest not found)"
+          echo ""
+
+          # Print summary from manifest
+          python3 - <<'PYEOF'
+          import json, sys
+          try:
+              m = json.load(open("rollback-snapshot/snapshot-manifest.json"))
+              pr = m.get("pr", {})
+              c  = m.get("commits", {})
+              s  = m.get("snapshot", {})
+              print(f"  PR #{pr.get('number')}  —  {pr.get('title','')}")
+              print(f"  Author:     {pr.get('author','')}")
+              print(f"  Base:       {c.get('base_branch','')} ({c.get('base_sha','')[:10]})")
+              print(f"  Head:       {c.get('head_branch','')} ({c.get('head_sha','')[:10]})")
+              print(f"  PR URL:     {pr.get('html_url','')}")
+              print(f"  Snapped:    {s.get('total_files_snapped',0)} file(s)")
+              print(f"  New files:  {s.get('total_new_files_skipped',0)} (no base version — will be deleted in rollback)")
+              print("")
+              print("  Files in snapshot:")
+              for f in s.get("snapped_files", []):
+                  print(f"    → {f}")
+          except Exception as e:
+              print(f"Could not parse manifest: {e}", file=sys.stderr)
+          PYEOF
+
+          echo "use_snapshot=true" >> "$GITHUB_OUTPUT"
+
+          # Check if delta package.xml exists in snapshot
+          if [[ -f "rollback-snapshot/delta/package/package.xml" ]] && grep -q '<members>' rollback-snapshot/delta/package/package.xml; then
+            echo "snapshot_deploy_manifest=rollback-snapshot/delta/package/package.xml" >> "$GITHUB_OUTPUT"
+          else
+            echo "snapshot_deploy_manifest=" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -f "rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml" ]] && grep -q '<members>' rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml; then
+            echo "snapshot_destructive_manifest=rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml" >> "$GITHUB_OUTPUT"
+          else
+            echo "snapshot_destructive_manifest=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build rollback delta (HEAD → rollback commit)
         id: rollback-delta
         env:
@@ -2690,17 +2942,210 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Filter rollback to selected files (selective rollback)
+        id: file-filter
+        env:
+          ROLLBACK_FILES:   ${{ github.event.inputs.rollback_files }}
+          USE_SNAPSHOT:     ${{ steps.snapshot-dl.outputs.use_snapshot }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ROLLBACK_FILES:-}" ]]; then
+            echo "ℹ️  No rollback_files specified — rolling back entire PR delta."
+            echo "filtered=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  SELECTIVE ROLLBACK — filtering to specified files only"
+          echo "  Files: ${ROLLBACK_FILES}"
+          echo "════════════════════════════════════════════════════════════════"
+
+          # Determine which manifest set to filter (snapshot preferred over git delta)
+          if [[ "${USE_SNAPSHOT}" == "true" && -d "rollback-snapshot/delta" ]]; then
+            SOURCE_PKG="rollback-snapshot/delta/package/package.xml"
+            SOURCE_DESTR="rollback-snapshot/delta/destructiveChanges/destructiveChanges.xml"
+            SOURCE_DIR="rollback-snapshot/force-app"
+            echo "📦 Filtering pre-built snapshot manifest"
+          else
+            SOURCE_PKG="rollback-delta/package/package.xml"
+            SOURCE_DESTR="rollback-delta/destructiveChanges/destructiveChanges.xml"
+            SOURCE_DIR="rollback-delta/source"
+            echo "🔧 Filtering git-computed delta manifest"
+          fi
+
+          mkdir -p filtered-rollback/package filtered-rollback/destructiveChanges
+
+          python3 - <<'PYEOF'
+          import os, re, sys
+
+          raw = os.environ.get("ROLLBACK_FILES", "")
+          # Accept: comma-separated class names or file basenames
+          # Normalise: strip paths, extensions, whitespace → match on basename
+          requested = []
+          for entry in raw.split(","):
+              entry = entry.strip()
+              if not entry:
+                  continue
+              # Strip path prefix if user typed a full path
+              entry = os.path.basename(entry)
+              # Strip .cls / .trigger / .js / .html etc. to get bare name
+              bare = re.sub(r'\.[a-zA-Z]+$', '', entry)
+              requested.append(bare.lower())
+
+          print(f"Requested bare names: {requested}")
+
+          def filter_xml(src_path, dest_path, label):
+              if not os.path.exists(src_path):
+                  print(f"  {label}: not found — skipping")
+                  return False
+
+              with open(src_path) as f:
+                  content = f.read()
+
+              # Parse <types> blocks and keep only those whose <members> match
+              # Uses regex to stay shell-friendly (no lxml dependency)
+              types_pattern = re.compile(
+                  r'(<types>.*?</types>)', re.DOTALL)
+              member_pattern = re.compile(
+                  r'<members>(.*?)</members>', re.DOTALL)
+              name_pattern   = re.compile(
+                  r'<name>(.*?)</name>', re.DOTALL)
+
+              kept_types = []
+              removed_members = []
+
+              for types_block in types_pattern.findall(content):
+                  type_name = name_pattern.search(types_block)
+                  type_name = type_name.group(1).strip() if type_name else ""
+                  members = member_pattern.findall(types_block)
+
+                  filtered_members = []
+                  for m in members:
+                      m_bare = os.path.basename(m.strip()).lower()
+                      m_bare_no_ext = re.sub(r'\.[a-zA-Z]+$', '', m_bare)
+                      if any(r in m_bare_no_ext or m_bare_no_ext in r for r in requested):
+                          filtered_members.append(m.strip())
+                      else:
+                          removed_members.append(f"{type_name}/{m.strip()}")
+
+                  if filtered_members:
+                      new_block = types_block
+                      # Remove all existing <members> lines
+                      new_block = member_pattern.sub('', new_block)
+                      # Re-insert filtered members before </types>
+                      members_xml = ''.join(f'    <members>{m}</members>\n' for m in filtered_members)
+                      new_block = new_block.replace('</types>', f'{members_xml}    </types>')
+                      kept_types.append(new_block)
+
+              if not kept_types:
+                  print(f"  {label}: no matching members found — nothing to deploy for these files")
+                  return False
+
+              # Rebuild XML preserving header
+              header = re.match(r'(.*?)<types>', content, re.DOTALL)
+              header = header.group(1) if header else '<?xml version="1.0" encoding="UTF-8"?>\n<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+              api_version = re.search(r'<version>.*?</version>', content)
+              api_version = api_version.group(0) if api_version else '<version>63.0</version>'
+
+              os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+              with open(dest_path, 'w') as f:
+                  f.write(header)
+                  for t in kept_types:
+                      f.write(t + '\n')
+                  f.write(f'    {api_version}\n</Package>\n')
+
+              print(f"  {label}: kept {len(kept_types)} type block(s)")
+              if removed_members:
+                  print(f"  {label}: excluded {len(removed_members)} member(s) not in filter:")
+                  for r in removed_members:
+                      print(f"    ✂️  {r}")
+              return True
+
+          pkg_ok   = filter_xml(os.environ["SOURCE_PKG"],   "filtered-rollback/package/package.xml",                       "package.xml")
+          destr_ok = filter_xml(os.environ["SOURCE_DESTR"], "filtered-rollback/destructiveChanges/destructiveChanges.xml", "destructiveChanges.xml")
+
+          print()
+          print("Filtered manifest results:")
+          print(f"  package.xml:            {'✅ written' if pkg_ok   else '⬜ empty/skipped'}")
+          print(f"  destructiveChanges.xml: {'✅ written' if destr_ok else '⬜ empty/skipped'}")
+
+          if not pkg_ok and not destr_ok:
+              print()
+              print("::warning::None of the specified rollback_files were found in the delta manifests.")
+              print("Check the file names match those changed in the original PR.")
+          PYEOF
+
+          # Show filtered manifests
+          echo ""
+          echo "===== filtered package.xml ====="
+          cat filtered-rollback/package/package.xml 2>/dev/null || echo "(empty)"
+          echo ""
+          echo "===== filtered destructiveChanges.xml ====="
+          cat filtered-rollback/destructiveChanges/destructiveChanges.xml 2>/dev/null || echo "(empty)"
+
+          # Check has_apex for the filtered set only
+          filtered_has_apex=false
+          if [[ -f "filtered-rollback/package/package.xml" ]] && grep -qE '<name>ApexClass|ApexTrigger</name>' filtered-rollback/package/package.xml; then
+            filtered_has_apex=true
+          fi
+
+          echo "filtered=true"                               >> "$GITHUB_OUTPUT"
+          echo "filtered_has_apex=${filtered_has_apex}"      >> "$GITHUB_OUTPUT"
+
+          pkg=""
+          [[ -f "filtered-rollback/package/package.xml" ]] && grep -q '<members>' filtered-rollback/package/package.xml && pkg="filtered-rollback/package/package.xml"
+          destr=""
+          [[ -f "filtered-rollback/destructiveChanges/destructiveChanges.xml" ]] && grep -q '<members>' filtered-rollback/destructiveChanges/destructiveChanges.xml && destr="filtered-rollback/destructiveChanges/destructiveChanges.xml"
+
+          echo "filtered_deploy_manifest=${pkg}"             >> "$GITHUB_OUTPUT"
+          echo "filtered_destructive_manifest=${destr}"      >> "$GITHUB_OUTPUT"
+
       - name: Execute rollback deployment
         id: rollback-deploy
         env:
+          # Priority: filtered (selective) > snapshot > git-computed delta
+          FILTERED:                      ${{ steps.file-filter.outputs.filtered }}
+          FILTERED_DEPLOY_MANIFEST:      ${{ steps.file-filter.outputs.filtered_deploy_manifest }}
+          FILTERED_DESTRUCTIVE_MANIFEST: ${{ steps.file-filter.outputs.filtered_destructive_manifest }}
+          FILTERED_HAS_APEX:             ${{ steps.file-filter.outputs.filtered_has_apex }}
+          USE_SNAPSHOT:                  ${{ steps.snapshot-dl.outputs.use_snapshot }}
+          SNAPSHOT_DEPLOY_MANIFEST:      ${{ steps.snapshot-dl.outputs.snapshot_deploy_manifest }}
+          SNAPSHOT_DESTRUCTIVE_MANIFEST: ${{ steps.snapshot-dl.outputs.snapshot_destructive_manifest }}
           ROLLBACK_DEPLOY_MANIFEST:      ${{ steps.rollback-delta.outputs.rollback_deploy_manifest }}
           ROLLBACK_DESTRUCTIVE_MANIFEST: ${{ steps.rollback-delta.outputs.rollback_destructive_manifest }}
           HAS_APEX:                      ${{ steps.rollback-delta.outputs.has_apex }}
           ROLLBACK_SHA:                  ${{ steps.rollback-delta.outputs.rollback_sha }}
+          ROLLBACK_FILES:                ${{ github.event.inputs.rollback_files }}
         run: |
           set -euo pipefail
 
-          if [[ -z "${ROLLBACK_DEPLOY_MANIFEST}" && -z "${ROLLBACK_DESTRUCTIVE_MANIFEST}" ]]; then
+          # ── Select manifest set by priority ───────────────────────────────
+          if [[ "${FILTERED}" == "true" ]]; then
+            DEPLOY_MANIFEST="${FILTERED_DEPLOY_MANIFEST}"
+            DESTRUCTIVE_MANIFEST="${FILTERED_DESTRUCTIVE_MANIFEST}"
+            HAS_APEX="${FILTERED_HAS_APEX}"
+            echo "✂️  SELECTIVE ROLLBACK — deploying filtered manifests for: ${ROLLBACK_FILES}"
+          elif [[ "${USE_SNAPSHOT}" == "true" ]]; then
+            DEPLOY_MANIFEST="${SNAPSHOT_DEPLOY_MANIFEST}"
+            DESTRUCTIVE_MANIFEST="${SNAPSHOT_DESTRUCTIVE_MANIFEST}"
+            echo "📦 Using pre-built rollback snapshot (captured at PR validation time)"
+            cat rollback-snapshot/snapshot-manifest.json 2>/dev/null | python3 -c "
+          import json,sys
+          m=json.load(sys.stdin)
+          pr=m.get('pr',{})
+          c=m.get('commits',{})
+          print(f'  PR #{pr.get(\"number\")} by {pr.get(\"author\")} — {pr.get(\"title\",\"\")}')
+          print(f'  Stable base: {c.get(\"target_branch\",c.get(\"base_branch\",\"\"))} @ {c.get(\"target_tip_sha\",c.get(\"base_sha\",\"\"))[:10]}')
+          print(f'  PR URL: {pr.get(\"html_url\",\"\")}')
+          " 2>/dev/null || true
+          else
+            DEPLOY_MANIFEST="${ROLLBACK_DEPLOY_MANIFEST}"
+            DESTRUCTIVE_MANIFEST="${ROLLBACK_DESTRUCTIVE_MANIFEST}"
+            echo "🔧 Using git-computed rollback delta (no snapshot artifact found)"
+          fi
+
+          if [[ -z "${DEPLOY_MANIFEST}" && -z "${DESTRUCTIVE_MANIFEST}" ]]; then
             echo "::error::Nothing to rollback — no delta found between HEAD and ${ROLLBACK_SHA}."
             echo "This may mean the PR only had non-Salesforce changes, or the commit SHA is incorrect."
             exit 1
@@ -2708,13 +3153,13 @@ jobs:
 
           rollback_cmd=(sf project deploy start --target-org "$ORG_ALIAS" --wait 60 --json)
 
-          if [[ -n "${ROLLBACK_DEPLOY_MANIFEST}" ]]; then
-            rollback_cmd+=(--manifest "${ROLLBACK_DEPLOY_MANIFEST}")
+          if [[ -n "${DEPLOY_MANIFEST}" ]]; then
+            rollback_cmd+=(--manifest "${DEPLOY_MANIFEST}")
           fi
 
-          if [[ -n "${ROLLBACK_DESTRUCTIVE_MANIFEST}" ]]; then
+          if [[ -n "${DESTRUCTIVE_MANIFEST}" ]]; then
             # Pre-destructive: delete new metadata BEFORE re-deploying old state
-            rollback_cmd+=(--pre-destructive-changes "${ROLLBACK_DESTRUCTIVE_MANIFEST}")
+            rollback_cmd+=(--pre-destructive-changes "${DESTRUCTIVE_MANIFEST}")
           fi
 
           if [[ "${HAS_APEX}" == "true" ]]; then
@@ -2788,9 +3233,12 @@ jobs:
       - name: Rollback Step Summary
         if: always()
         env:
-          ROLLBACK_SHA:  ${{ steps.rollback-delta.outputs.rollback_sha }}
-          CURRENT_HEAD:  ${{ steps.rollback-delta.outputs.current_head }}
-          HAS_APEX:      ${{ steps.rollback-delta.outputs.has_apex }}
+          ROLLBACK_SHA:   ${{ steps.rollback-delta.outputs.rollback_sha }}
+          CURRENT_HEAD:   ${{ steps.rollback-delta.outputs.current_head }}
+          HAS_APEX:       ${{ steps.rollback-delta.outputs.has_apex }}
+          FILTERED:       ${{ steps.file-filter.outputs.filtered }}
+          ROLLBACK_FILES: ${{ github.event.inputs.rollback_files }}
+          PR_NUMBER:      ${{ github.event.inputs.rollback_pr_number }}
         run: |
           case "${{ job.status }}" in
             success) ICON="✅" ;;
@@ -2808,9 +3256,23 @@ jobs:
             echo "| **Rolled back TO** | \`${ROLLBACK_SHA:0:10}\` |"
             echo "| **Org** | ${ORG_ALIAS} |"
             echo "| **Apex tests run** | ${HAS_APEX} |"
+            if [[ -n "${PR_NUMBER:-}" ]]; then
+              echo "| **PR** | #${PR_NUMBER} |"
+            fi
             echo ""
-            echo "### What was rolled back"
-            echo "- Components **added** by the PR were **deleted** (treated as destructive)"
-            echo "- Components **deleted** by the PR were **re-deployed** from the rollback commit"
-            echo "- Any **new metadata** created by the PR was **removed** from the org"
+            if [[ "${FILTERED}" == "true" && -n "${ROLLBACK_FILES:-}" ]]; then
+              echo "### ✂️ Selective rollback — only these files were reverted"
+              echo ""
+              IFS=',' read -ra FILES <<< "${ROLLBACK_FILES}"
+              for f in "${FILES[@]}"; do
+                echo "- \`${f// /}\`"
+              done
+              echo ""
+              echo "> ℹ️ Other files changed in the same PR were **not** rolled back."
+            else
+              echo "### What was rolled back"
+              echo "- Components **added** by the PR were **deleted** (treated as destructive)"
+              echo "- Components **deleted** by the PR were **re-deployed** from the rollback commit"
+              echo "- Any **new metadata** created by the PR was **removed** from the org"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

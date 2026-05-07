@@ -12,7 +12,7 @@ public with sharing class AccountUtilityService {
             ORDER BY Name
         ];
     }
-
+// test rollback
     public static Integer updateAccountDescriptions(Set<Id> accountIds, String appendText) {
         if (accountIds == null || accountIds.isEmpty() || String.isBlank(appendText)) {
             return 0;
