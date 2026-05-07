@@ -25,3 +25,4 @@ rule,file_pattern,message_contains,severity_threshold,expiry,reason,approved_by,
 #   7. Critical violations (severity 1–2) require Security/DevOps approval; max 7-day waiver,,,,,,,,,
 # --------------------------------------------------------------------------------------------------------------,,,,,,,,,
 ApexDoc,CoverageDemoService.cls,,3,25-05-2026,Missing ApexDoc on public methods - comments will be added by April 15 2026. Tracked in PROJ-001.,mukeshranadeloitte,10-03-2026,PROJ-001,ACTIVE
+*,*,,3,25-05-2026,Missing ApexDoc on public methods - comments will be added by April 15 2026. Tracked in PROJ-001.,mukeshranadeloitte,10-03-2026,PROJ-001,ACTIVE
