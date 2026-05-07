@@ -1543,74 +1543,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Build test class set
+      - name: Prepare deploy manifests
         id: tests
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-
-          changed_files=$(git diff --name-only "${{ needs.approval-merge-gate.outputs.base_sha }}" HEAD)
-
-          apex_changed_classes=""
-          changed_test_classes=""
-
-          while IFS= read -r file; do
-            [[ "$file" =~ ^force-app/main/default/classes/.*\.cls$ ]] || continue
-            class_name=$(basename "$file" .cls)
-            if [[ "$file" =~ (Test|Tests)\.cls$ ]]; then
-              case ",${changed_test_classes}," in
-                *,"$class_name",*) ;;
-                *) changed_test_classes="${changed_test_classes:+${changed_test_classes},}$class_name" ;;
-              esac
-              continue
-            fi
-            case ",${apex_changed_classes}," in
-              *,"$class_name",*) ;;
-              *) apex_changed_classes="${apex_changed_classes:+${apex_changed_classes},}$class_name" ;;
-            esac
-          done <<< "$changed_files"
-
-          comments=$(gh api \
-            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
-            --jq '.[].body' 2>/dev/null || echo "")
-
-          full_text="$PR_BODY
-          $comments"
-          line=$(echo "$full_text" | grep -iE '^\s*(tests?(\s+classes?)?)\s*:' | head -1 || true)
-          pr_test_classes=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//' | tr ',' '\n' | xargs -n1 | paste -sd ',' -)
-
-          inferred_test_classes="$changed_test_classes"
-          if [[ -n "$apex_changed_classes" ]]; then
-            for class_name in $(echo "$apex_changed_classes" | tr ',' ' '); do
-              for suffix in Test Tests TestClass; do
-                candidate="${class_name}${suffix}"
-                if [[ -f "force-app/main/default/classes/${candidate}.cls" ]] || echo ",$changed_test_classes," | grep -q ",${candidate},"; then
-                  case ",${inferred_test_classes}," in
-                    *,"$candidate",*) ;;
-                    *) inferred_test_classes="${inferred_test_classes:+${inferred_test_classes},}$candidate" ;;
-                  esac
-                fi
-              done
-            done
-          fi
-
-          all_test_classes=$(
-            printf '%s\n%s\n' "${pr_test_classes:-}" "${inferred_test_classes:-}" \
-            | tr ',' '\n' \
-            | sed '/^[[:space:]]*$/d' \
-            | awk '!seen[$0]++' \
-            | paste -sd ',' -
-          )
-
-          has_apex=false
-          if [[ -f package/package.xml ]] && grep -qE '<name>ApexClass|ApexTrigger</name>' package/package.xml; then
-            has_apex=true
-          fi
-          if [[ -n "$apex_changed_classes" ]]; then
-            has_apex=true
-          fi
 
           deploy_manifest=""
           if [[ -f package/package.xml ]] && grep -q '<members>' package/package.xml; then
@@ -1622,9 +1558,7 @@ jobs:
             destructive_manifest="destructiveChanges/destructiveChanges.xml"
           fi
 
-          echo "all_test_classes=${all_test_classes:-}" >> "$GITHUB_OUTPUT"
-          echo "has_apex=$has_apex" >> "$GITHUB_OUTPUT"
-          echo "deploy_manifest=$deploy_manifest" >> "$GITHUB_OUTPUT"
+          echo "deploy_manifest=$deploy_manifest"           >> "$GITHUB_OUTPUT"
           echo "destructive_manifest=$destructive_manifest" >> "$GITHUB_OUTPUT"
 
           if [[ -n "$deploy_manifest" || -n "$destructive_manifest" ]]; then
