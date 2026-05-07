@@ -943,12 +943,12 @@ jobs:
 
       - name: Salesforce Code Analyzer
         if: steps.sca-targets.outputs.has_targets == 'true' && vars.SCA_ENFORCEMENT_MODE != 'off'
+        continue-on-error: true
         run: |
           sf scanner run \
             --target "${{ steps.sca-targets.outputs.targets }}" \
             --format "csv" \
-            --outfile "sfdx-report.csv" \
-            --severity-threshold 3
+            --outfile "sfdx-report.csv"
 
       - name: Check scanner results against waivers
         id: waiver-check
@@ -1031,6 +1031,13 @@ jobs:
                   severity  = row.get("Severity", row.get("severity", "")).strip()
                   problem   = row.get("Problem",  row.get("Description", row.get("problem", ""))).strip()
                   line      = row.get("Line",     row.get("line", "")).strip()
+
+                  # Only enforce severity 3 and above (1=critical, 2=high, 3=medium)
+                  try:
+                      if int(severity) > 3:
+                          continue
+                  except (ValueError, TypeError):
+                      pass  # If severity is non-numeric, include it
 
                   print(f"  Checking violation: rule='{rule}' file='{os.path.basename(file_path)}'")
 
