@@ -24,4 +24,4 @@ rule,file_pattern,message_contains,severity_threshold,expiry,reason,approved_by,
 #   6. Once fixed, update status to REVOKED (do NOT delete - preserves audit trail),,,,,,,,
 #   7. Critical violations (severity 1–2) require Security/DevOps approval; max 7-day waiver,,,,,,,,,
 # --------------------------------------------------------------------------------------------------------------,,,,,,,,,
-
+*,*,,3,25-05-2026,waiving off until 25 May, 2026. Tracked in PROJ-001.,mukeshranadeloitte,10-03-2026,PROJ-001,ACTIVE
