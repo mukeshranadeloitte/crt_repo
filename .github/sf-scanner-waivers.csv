@@ -5,28 +5,15 @@ rule,file_pattern,message_contains,severity_threshold,expiry,reason,approved_by,
 # --------------------------------------------------------------------------------------------------------------,,,,,,,,,
 # SCHEMA,,,,,,,,,
 #   rule              REQUIRED  Rule name as reported in SF Scanner CSV output (substring match),,,,,,,,,
-#                               Use blank or '*' to waive ALL rules for the file (component-level global waiver),,,,,,,,
 #   file_pattern      REQUIRED  Filename as reported in SF Scanner CSV output (substring match, e.g. MyClass.cls),,,,,,,,
-#                               Use blank or '*' to waive this rule across ALL files (rule-level global waiver),,,,,,,,,
 #   message_contains  OPTIONAL  Substring of the violation message to narrow the match (leave blank = match all messages),,,,,,,,,
 #   severity_threshold OPTIONAL  Only waive violations at this severity or above (leave blank = match any severity),,,,,,,,,
-#   expiry            REQUIRED  Hard deadline DD-MM-YYYY - pipeline FAILS after this date if violation persists,,,,,,,,,
+#   expiry            REQUIRED  Hard deadline YYYY-MM-DD - pipeline FAILS after this date if violation persists,,,,,,,,,
 #   reason            REQUIRED  Business justification. Include Jira/ticket reference.,,,,,,,,,
 #   approved_by       REQUIRED  GitHub username of approver (Tech Lead / DevOps / Security team),,,,,,,,,
 #   approved_date     REQUIRED  Date approval was granted YYYY-MM-DD,,,,,,,,,
 #   ticket            REQUIRED  Jira or GitHub issue tracking the fix (e.g. PROJ-123),,,,,,,,,
 #   status            REQUIRED  ACTIVE = waiver in force | REVOKED = waiver cancelled (row kept for audit),,,,,,,,,
-# --------------------------------------------------------------------------------------------------------------,,,,,,,,,
-# WAIVER TYPES,,,,,,,,,
-#  SPECIFIC waiver  — rule=ApexDoc        file_pattern=MyClass.cls  → waive ApexDoc for MyClass.cls only,,,,,,,,,
-#  GLOBAL COMPONENT — rule=* (or blank)   file_pattern=MyClass.cls  → waive ALL rules for MyClass.cls,,,,,,,,,
-#  GLOBAL RULE      — rule=ApexDoc        file_pattern=* (or blank) → waive ApexDoc for ALL files,,,,,,,,,
-#  GLOBAL ALL       — rule=* (or blank)   file_pattern=* (or blank) → waive ALL rules for ALL files (use with extreme caution),,,,,,,,,
-# --------------------------------------------------------------------------------------------------------------,,,,,,,,,
-# EXAMPLES,,,,,,,,,
-#   Specific:          ApexDoc,CoverageDemoService.cls,,3,30-06-2026,reason,approver,2026-04-17,PROJ-001,ACTIVE,,,,,,,,,
-#   Global component:  *,MyLegacyClass.cls,,3,30-06-2026,Legacy class pending rewrite,devlead,2026-04-17,PROJ-002,ACTIVE,,,,,,,,,
-#   Global rule:       ApexDoc,*,,3,30-06-2026,ApexDoc enforcement deferred for sprint,devlead,2026-04-17,PROJ-003,ACTIVE,,,,,,,,,
 # --------------------------------------------------------------------------------------------------------------,,,,,,,,,
 # GOVERNANCE,,,,,,,,,
 #   1. Developer identifies a violation that cannot be fixed immediately,,,,,,,,,
@@ -37,10 +24,5 @@ rule,file_pattern,message_contains,severity_threshold,expiry,reason,approved_by,
 #   6. Once fixed, update status to REVOKED (do NOT delete - preserves audit trail),,,,,,,,
 #   7. Critical violations (severity 1–2) require Security/DevOps approval; max 7-day waiver,,,,,,,,,
 # --------------------------------------------------------------------------------------------------------------,,,,,,,,,
-ApexDoc,CoverageDemoService.cls,,3,25-04-2026,Missing ApexDoc on public methods - comments will be added by April 15 2026. Tracked in PROJ-001.,mukeshranadeloitte,10-03-2026,PROJ-001,ACTIVE
-ApexDoc,DeploySmokeCheck.cls,,3,25-04-2026,Missing ApexDoc on public methods - comments will be added by April 15 2026. Tracked in PROJ-002.,mukeshranadeloitte,07-03-2026,PROJ-002,ACTIVE
-ApexCRUDViolation,AccountUtilityService.cls,,3,25-04-2026,Missing ApexDoc on public methods - comments will be added by April 17 2026. Tracked in PROJ-003.,chorevathi-deloitte,07-03-2026,PROJ-003,ACTIVE
-IfStmtsMustUseBraces,CoverageDemoService.cls,,3,2026-05-25,Violation waived,mukeshranadeloitte,2026-04-14,JIRA-0004,ACTIVE
-ApexAssertionsShouldIncludeMessage,CoverageDemoServiceTest.cls,,3,2026-05-25,Violation waived,mukeshranadeloitte,2026-04-14,JIRA-005,ACTIVE
-ApexAssertionsShouldIncludeMessage,SmokeTestPingResourceTest.cls,,3,2026-05-25,Temp Waiver,chorevathi-deloitte,2026-04-14,JIRA-006,ACTIVE
-
+ApexDoc,CoverageDemoService.cls,,3,25-05-2026,Missing ApexDoc on public methods - comments will be added by April 15 2026. Tracked in PROJ-001.,mukeshranadeloitte,10-03-2026,PROJ-001,ACTIVE
+*,*,,3,25-05-2026,Missing ApexDoc on public methods - comments will be added by April 15 2026. Tracked in PROJ-001.,mukeshranadeloitte,10-03-2026,PROJ-001,ACTIVE
