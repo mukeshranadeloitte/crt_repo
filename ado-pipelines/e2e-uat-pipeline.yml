@@ -1,0 +1,1320 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Azure DevOps — UAT End-to-End Pipeline
+# Equivalent to: .github/workflows/e2e-uat-pipeline.yml (GitHub Actions)
+#
+# ─── REQUIRED PIPELINE VARIABLES (Library → Variable Group: "salesforce-uat") ──
+# Salesforce:
+#   ORG_ALIAS                  - SF org alias (default: uat)
+#   DELTA_FROM_COMMIT          - Baseline commit SHA for delta calculation
+#   COVERAGE_THRESHOLD         - Apex coverage threshold % (default: 85)
+#   SOURCE_DIR                 - Apex source directory (default: force-app/main/default)
+#   SCA_ENFORCEMENT_MODE       - enforce | warn | off (default: enforce)
+#   CRT_UAT_AUTHURL (secret)   - SFDX auth URL for the UAT org
+# CheckMarx:
+#   CX_BASE_URI (secret)       - CheckMarx base URI
+#   CX_TENANT (secret)         - CheckMarx tenant
+#   CX_CLIENT_ID (secret)      - CheckMarx client ID
+#   CX_CLIENT_SECRET (secret)  - CheckMarx client secret
+#   CX_PROJECT_NAME            - CheckMarx project name (optional)
+# Fortify:
+#   FOD_URL                    - Fortify on Demand URL
+#   FOD_CLIENT_ID (secret)     - Fortify client ID
+#   FOD_CLIENT_SECRET (secret) - Fortify client secret
+#   FOD_APP_NAME (secret)      - Fortify application name
+#   FOD_RELEASE_NAME (secret)  - Fortify release name
+# CRT (Copado Robotic Testing):
+#   CRT_API_TOKEN (secret)     - CRT External Personal Access Token
+#   CRT_JOB_ID                 - CRT job ID (default: 115686)
+#   CRT_PROJECT_ID             - CRT project ID (default: 73283)
+#   CRT_ORG_ID                 - CRT org ID (default: 43532)
+# ADO:
+#   ADO_PAT (secret)           - Personal Access Token with repo scope (for variable updates, PR operations)
+#   SYSTEM_ACCESSTOKEN         - Automatically available in ADO pipelines
+# ═══════════════════════════════════════════════════════════════════════════════
+
+trigger: none   # Manual and PR triggers only — no CI on push
+
+# ─── PR Validation trigger ───────────────────────────────────────────────────
+pr:
+  branches:
+    include:
+      - uat
+      - main
+  paths:
+    include:
+      - force-app/**
+      - ado-pipelines/e2e-uat-pipeline.yml
+      - .github/sf-scanner-waivers.csv
+
+# ─── Manual trigger ──────────────────────────────────────────────────────────
+parameters:
+  - name: scanner
+    displayName: "Scanner to run"
+    type: string
+    default: all
+    values:
+      - all
+      - checkmarx
+      - fortify
+
+# ─── Variable groups and pipeline-level defaults ─────────────────────────────
+variables:
+  - group: salesforce-uat            # Library variable group containing all secrets + vars
+  - name: ORG_ALIAS
+    value: $[coalesce(variables['ORG_ALIAS'], 'uat')]
+  - name: COVERAGE_THRESHOLD
+    value: $[coalesce(variables['COVERAGE_THRESHOLD'], '85')]
+  - name: SOURCE_DIR
+    value: $[coalesce(variables['SOURCE_DIR'], 'force-app/main/default')]
+  - name: SCA_ENFORCEMENT_MODE
+    value: $[coalesce(variables['SCA_ENFORCEMENT_MODE'], 'enforce')]
+  - name: CRT_JOB_ID
+    value: $[coalesce(variables['CRT_JOB_ID'], '115686')]
+  - name: CRT_PROJECT_ID
+    value: $[coalesce(variables['CRT_PROJECT_ID'], '73283')]
+  - name: CRT_ORG_ID
+    value: $[coalesce(variables['CRT_ORG_ID'], '43532')]
+
+pool:
+  vmImage: ubuntu-22.04
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — PR VALIDATION
+# Runs on every pull_request event to uat or main.
+# ═══════════════════════════════════════════════════════════════════════════════
+stages:
+  - stage: pr_validation
+    displayName: "PR Validation"
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    jobs:
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # JOB 1 — Evaluate Scanner Availability
+      # ─────────────────────────────────────────────────────────────────────────
+      - job: setup
+        displayName: "Evaluate Scanner Availability"
+        steps:
+          - bash: |
+              set -euo pipefail
+              run_checkmarx=false
+              run_fortify=false
+              SCANNER="${{ parameters.scanner }}"
+
+              if [[ -n "${CX_CLIENT_SECRET:-}" && ("$SCANNER" == "checkmarx" || "$SCANNER" == "all") ]]; then
+                run_checkmarx=true
+              fi
+              if [[ -n "${FOD_CLIENT_SECRET:-}" && ("$SCANNER" == "fortify" || "$SCANNER" == "all") ]]; then
+                run_fortify=true
+              fi
+
+              echo "##vso[task.setvariable variable=run_checkmarx;isOutput=true]$run_checkmarx"
+              echo "##vso[task.setvariable variable=run_fortify;isOutput=true]$run_fortify"
+              echo "run-checkmarx=$run_checkmarx  run-fortify=$run_fortify"
+            name: eval
+            displayName: "Determine which scanners to run"
+            env:
+              CX_CLIENT_SECRET: $(CX_CLIENT_SECRET)
+              FOD_CLIENT_SECRET: $(FOD_CLIENT_SECRET)
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # JOB 2 — Salesforce PR Validation
+      # ─────────────────────────────────────────────────────────────────────────
+      - job: salesforce_validation
+        displayName: "Salesforce PR validation"
+        dependsOn: setup
+        timeoutInMinutes: 30
+        variables:
+          run_checkmarx: $[ dependencies.setup.outputs['eval.run_checkmarx'] ]
+          run_fortify: $[ dependencies.setup.outputs['eval.run_fortify'] ]
+        steps:
+
+          - checkout: self
+            fetchDepth: 0
+            displayName: "Checkout repository (full history)"
+
+          - bash: |
+              set -euo pipefail
+              REPO_ID="$(System.TeamProjectId)"
+              PR_NUMBER="$(System.PullRequest.PullRequestId)"
+              PR_AUTHOR="$(Build.RequestedFor)"
+              COLLECTION_URI="$(System.CollectionUri)"
+              PROJECT="$(System.TeamProject)"
+              ADO_ORG=$(echo "$COLLECTION_URI" | sed 's|https://dev.azure.com/||;s|/||g')
+
+              REVIEWERS=("ss10del" "chorevathi-deloitte")
+              ELIGIBLE=()
+              for r in "${REVIEWERS[@]}"; do
+                # Skip the PR author to avoid self-review request
+                if [[ "$r" != "$PR_AUTHOR" ]]; then
+                  ELIGIBLE+=("$r")
+                fi
+              done
+
+              if [[ "${#ELIGIBLE[@]}" -eq 0 ]]; then
+                echo "All designated reviewers are the PR author — skipping reviewer request."
+                exit 0
+              fi
+
+              # Store eligible reviewers for post-validation notification
+              printf '%s\n' "${ELIGIBLE[@]}" > "$(Agent.TempDirectory)/eligible-reviewers.txt"
+
+              # Resolve each reviewer's ADO identity ID and add as reviewer
+              for reviewer in "${ELIGIBLE[@]}"; do
+                echo "Requesting review from: $reviewer"
+                # Resolve user identity via ADO API
+                IDENTITY_RESP=$(curl -sSL \
+                  -H "Authorization: Basic $(echo -n ":$ADO_PAT" | base64)" \
+                  -H "Content-Type: application/json" \
+                  "https://vssps.dev.azure.com/${ADO_ORG}/_apis/identities?searchFilter=AccountName&filterValue=${reviewer}&api-version=6.0")
+
+                REVIEWER_ID=$(echo "$IDENTITY_RESP" | python3 -c "
+              import json,sys
+              data=json.load(sys.stdin)
+              ids=data.get('value',[])
+              print(ids[0]['id'] if ids else '')
+              " 2>/dev/null || echo "")
+
+                if [[ -n "$REVIEWER_ID" ]]; then
+                  curl -sSL -X PUT \
+                    -H "Authorization: Basic $(echo -n ":$ADO_PAT" | base64)" \
+                    -H "Content-Type: application/json" \
+                    "https://dev.azure.com/${ADO_ORG}/${PROJECT}/_apis/git/repositories/$(Build.Repository.ID)/pullRequests/${PR_NUMBER}/reviewers/${REVIEWER_ID}?api-version=7.0" \
+                    -d "{\"vote\": 0, \"id\": \"${REVIEWER_ID}\"}" > /dev/null
+                  echo "✅ Reviewer request sent to: $reviewer ($REVIEWER_ID)"
+                else
+                  echo "::warning:: Could not resolve ADO identity for: $reviewer"
+                fi
+              done
+            displayName: "Request PR reviewers"
+            env:
+              ADO_PAT: $(ADO_PAT)
+
+          - task: NodeTool@0
+            displayName: "Setup Node.js 20"
+            inputs:
+              versionSpec: '20.x'
+
+          - bash: npm install --global @salesforce/cli
+            displayName: "Install Salesforce CLI"
+
+          - bash: |
+              set -euo pipefail
+              if [[ -z "${SFDX_AUTH_URL:-}" ]]; then
+                echo "##vso[task.logissue type=error]Required secret CRT_UAT_AUTHURL is missing or empty."
+                exit 1
+              fi
+              printf '%s' "$SFDX_AUTH_URL" > sfdxAuthUrl.txt
+              sf org login sfdx-url --sfdx-url-file sfdxAuthUrl.txt --alias "$ORG_ALIAS" --set-default
+              rm -f sfdxAuthUrl.txt
+              sf org display --target-org "$ORG_ALIAS"
+            displayName: "Authenticate target org"
+            env:
+              SFDX_AUTH_URL: $(CRT_UAT_AUTHURL)
+              ORG_ALIAS: $(ORG_ALIAS)
+
+          - bash: |
+              set -euo pipefail
+              echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
+              git config --global --add safe.directory "$BUILD_SOURCESDIRECTORY"
+            displayName: "Install sfdx-git-delta plugin"
+
+          - bash: |
+              set -euo pipefail
+              # Use the PR target branch tip as the delta base
+              BASE_SHA=$(git rev-parse "origin/$(System.PullRequest.TargetBranch)" 2>/dev/null \
+                || git merge-base HEAD "origin/$(System.PullRequest.TargetBranch)" 2>/dev/null \
+                || echo "")
+
+              if [[ -z "$BASE_SHA" ]]; then
+                echo "##vso[task.logissue type=error]Cannot determine PR base SHA."
+                exit 1
+              fi
+
+              echo "Delta FROM: $BASE_SHA"
+              echo "Delta TO:   HEAD ($(git rev-parse HEAD))"
+              echo "##vso[task.setvariable variable=PR_BASE_SHA]$BASE_SHA"
+
+              sf sgd:source:delta \
+                --to   "HEAD" \
+                --from "$BASE_SHA" \
+                --output-dir "." \
+                --source-dir force-app/
+            displayName: "Build delta package (PR head vs target branch)"
+            name: delta_build
+
+          - bash: |
+              echo "===== package/package.xml ====="
+              cat package/package.xml 2>/dev/null || echo "(not generated)"
+              echo ""
+              echo "===== destructiveChanges/destructiveChanges.xml ====="
+              cat destructiveChanges/destructiveChanges.xml 2>/dev/null || echo "(not generated)"
+            displayName: "Display generated packages"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Upload delta artifacts"
+            condition: always()
+            inputs:
+              targetPath: |
+                package/package.xml
+                destructiveChanges/destructiveChanges.xml
+              artifact: salesforce-delta-validation
+              publishLocation: pipeline
+
+          - bash: |
+              set -euo pipefail
+
+              # Read PR description from ADO environment
+              PR_BODY="${BUILD_REPOSITORY_PULLREQUEST_DESCRIPTION:-}"
+
+              echo "════════════════════════════════════════════════════════════════"
+              echo "  TEST CLASS EXTRACTION — PR description"
+              echo "════════════════════════════════════════════════════════════════"
+              echo "Looking for lines matching:  'Tests: ClassName1, ClassName2'"
+
+              line=$(echo "$PR_BODY" | grep -iE '^\s*(tests?(\s+classes?)?)\s*:' | head -1 || true)
+
+              if [[ -z "$line" ]]; then
+                echo "ℹ️  No 'Tests:' line found in PR description."
+                echo "   → Will attempt to infer test classes from changed Apex files."
+                echo "##vso[task.setvariable variable=TEST_LEVEL]none"
+                echo "##vso[task.setvariable variable=PR_TEST_CLASSES]"
+              else
+                echo "✅ Found test line: $line"
+                raw_classes=$(echo "$line" | sed 's/^[^:]*:[[:space:]]*//')
+                extracted=$(echo "$raw_classes" | tr ',' ' ' | xargs || true)
+                echo "   Extracted classes: $extracted"
+                echo "##vso[task.setvariable variable=TEST_LEVEL]RunSpecifiedTests"
+                echo "##vso[task.setvariable variable=PR_TEST_CLASSES]$extracted"
+              fi
+            displayName: "Extract test classes from PR description"
+            name: pr_tests
+            env:
+              BUILD_REPOSITORY_PULLREQUEST_DESCRIPTION: $(System.PullRequest.Description)
+
+          - bash: |
+              set -euo pipefail
+
+              BASE_SHA="$(PR_BASE_SHA)"
+              HEAD_SHA=$(git rev-parse HEAD)
+              changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+
+              has_apex=false
+              if [[ -f package/package.xml ]] && grep -qE '<name>ApexClass|ApexTrigger</name>' package/package.xml; then
+                has_apex=true
+              fi
+
+              apex_changed_classes=""
+              changed_test_classes=""
+
+              while IFS= read -r file; do
+                [[ "$file" =~ ^force-app/main/default/classes/.*\.cls$ ]] || continue
+                class_name=$(basename "$file" .cls)
+                is_test=false
+                if [[ "$class_name" =~ (Test|Tests|TestClass|_Test)$ ]] || [[ "$class_name" =~ ^Test ]]; then
+                  is_test=true
+                fi
+                if [[ "$is_test" == "false" && -f "$file" ]]; then
+                  if grep -qi '@istest' "$file" 2>/dev/null; then
+                    is_test=true
+                  fi
+                fi
+                if [[ "$is_test" == "true" ]]; then
+                  case ",${changed_test_classes}," in
+                    *,"$class_name",*) ;;
+                    *) changed_test_classes="${changed_test_classes:+${changed_test_classes},}$class_name" ;;
+                  esac
+                else
+                  case ",${apex_changed_classes}," in
+                    *,"$class_name",*) ;;
+                    *) apex_changed_classes="${apex_changed_classes:+${apex_changed_classes},}$class_name" ;;
+                  esac
+                fi
+              done <<< "$changed_files"
+
+              inferred_test_classes="$changed_test_classes"
+              if [[ -n "$apex_changed_classes" ]]; then
+                for class_name in $(echo "$apex_changed_classes" | tr ',' ' '); do
+                  for suffix in Test Tests TestClass; do
+                    candidate="${class_name}${suffix}"
+                    if [[ -f "force-app/main/default/classes/${candidate}.cls" ]]; then
+                      case ",${inferred_test_classes}," in
+                        *,"$candidate",*) ;;
+                        *) inferred_test_classes="${inferred_test_classes:+${inferred_test_classes},}$candidate" ;;
+                      esac
+                    fi
+                  done
+                done
+              fi
+
+              deploy_manifest=""
+              [[ -f package/package.xml ]] && grep -q '<members>' package/package.xml && deploy_manifest="package/package.xml"
+              destructive_manifest=""
+              [[ -f destructiveChanges/destructiveChanges.xml ]] && grep -q '<members>' destructiveChanges/destructiveChanges.xml && destructive_manifest="destructiveChanges/destructiveChanges.xml"
+
+              apex_required=false
+              [[ "$has_apex" == "true" || -n "$apex_changed_classes" ]] && apex_required=true
+
+              has_delta=false
+              [[ -n "$deploy_manifest" || -n "$destructive_manifest" ]] && has_delta=true
+
+              echo "##vso[task.setvariable variable=INFERRED_TEST_CLASSES]$inferred_test_classes"
+              echo "##vso[task.setvariable variable=PROD_CLASSES]$apex_changed_classes"
+              echo "##vso[task.setvariable variable=DEPLOY_MANIFEST]$deploy_manifest"
+              echo "##vso[task.setvariable variable=DESTRUCTIVE_MANIFEST]$destructive_manifest"
+              echo "##vso[task.setvariable variable=APEX_REQUIRED]$apex_required"
+              echo "##vso[task.setvariable variable=HAS_DELTA]$has_delta"
+
+              echo ""
+              echo "════════════════════════════════════════════════════════════════"
+              echo "  DELTA ANALYSIS SUMMARY"
+              echo "════════════════════════════════════════════════════════════════"
+              echo "Changed Apex classes (non-test): ${apex_changed_classes:-<none>}"
+              echo "Changed test classes (direct):   ${changed_test_classes:-<none>}"
+              echo "Inferred test classes:           ${inferred_test_classes:-<none>}"
+              echo "Apex required:                   $apex_required"
+              echo "Has delta:                       $has_delta"
+            displayName: "Compute Apex delta and infer tests"
+            name: delta
+
+          - bash: |
+              set -euo pipefail
+              APEX_REQUIRED="$(APEX_REQUIRED)"
+              TEST_LEVEL="$(TEST_LEVEL)"
+              INFERRED_TESTS="$(INFERRED_TEST_CLASSES)"
+              if [[ "$APEX_REQUIRED" == "true" && "$TEST_LEVEL" != "RunSpecifiedTests" && -z "$INFERRED_TESTS" ]]; then
+                echo "##vso[task.logissue type=error]Apex changed but no tests were specified or inferred."
+                exit 1
+              fi
+            displayName: "Validate test requirements"
+
+          - bash: |
+              set -euo pipefail
+
+              HAS_DELTA="$(HAS_DELTA)"
+              if [[ "$HAS_DELTA" != "true" ]]; then
+                echo "ℹ️  No delta detected — skipping validation deploy."
+                exit 0
+              fi
+
+              APEX_REQUIRED="$(APEX_REQUIRED)"
+              PR_TEST_CLASSES="$(PR_TEST_CLASSES)"
+              INFERRED_TEST_CLASSES="$(INFERRED_TEST_CLASSES)"
+              DEPLOY_MANIFEST="$(DEPLOY_MANIFEST)"
+              DESTRUCTIVE_MANIFEST="$(DESTRUCTIVE_MANIFEST)"
+              ORG_ALIAS="$(ORG_ALIAS)"
+
+              all_test_classes=$(
+                printf '%s\n%s\n' \
+                  "$(echo "${PR_TEST_CLASSES:-}" | tr ',' '\n')" \
+                  "$(echo "${INFERRED_TEST_CLASSES:-}" | tr ',' '\n')" \
+                | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++' | paste -sd ',' -
+              )
+
+              deploy_cmd=(sf project deploy start --target-org "$ORG_ALIAS" --dry-run --json)
+
+              [[ -n "${DEPLOY_MANIFEST:-}" ]] && deploy_cmd+=(--manifest "$DEPLOY_MANIFEST") || deploy_cmd+=(--source-dir "$(SOURCE_DIR)")
+              [[ -n "${DESTRUCTIVE_MANIFEST:-}" ]] && deploy_cmd+=(--post-destructive-changes "$DESTRUCTIVE_MANIFEST")
+
+              if [[ -n "${all_test_classes:-}" ]]; then
+                deploy_cmd+=(--test-level RunSpecifiedTests)
+                while IFS= read -r test_class; do
+                  [[ -z "$test_class" ]] && continue
+                  deploy_cmd+=(--tests "$(echo "$test_class" | xargs)")
+                done <<< "$(echo "$all_test_classes" | tr ',' '\n')"
+              elif [[ "$APEX_REQUIRED" == "true" ]]; then
+                echo "##vso[task.logissue type=error]Apex changed but no tests were specified or inferred."
+                exit 1
+              fi
+
+              deploy_cmd+=(--async)
+              echo "▶ Running: ${deploy_cmd[*]}"
+              echo ""
+
+              set +e
+              "${deploy_cmd[@]}" > deploy-start.json 2>deploy-stderr.log
+              start_rc=$?
+              set -e
+
+              if [[ $start_rc -ne 0 ]]; then
+                echo "##vso[task.logissue type=error]Failed to start deploy validation."
+                cat deploy-stderr.log || true
+                exit 1
+              fi
+
+              JOB_ID=$(python3 -c "import json; d=json.load(open('deploy-start.json')); print(d.get('result',{}).get('id',''))" 2>/dev/null || echo "")
+
+              if [[ -z "$JOB_ID" ]]; then
+                cp deploy-start.json deploy-output.json
+                STATUS=$(python3 -c "import json; d=json.load(open('deploy-output.json')); print(d.get('result',{}).get('status','Unknown'))" 2>/dev/null || echo "Unknown")
+              else
+                echo "🚀 Validation job started — ID: ${JOB_ID}"
+                echo ""
+                echo "  Time  │ Status         │ Components        │ Tests"
+                echo "────────┼────────────────┼───────────────────┼──────────────────────"
+
+                ELAPSED=0
+                MAX_WAIT=1800
+                STATUS="Pending"
+
+                while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+                  REPORT=$(sf project deploy report --job-id "$JOB_ID" --json 2>/dev/null || echo '{}')
+                  STATUS=$(echo "$REPORT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('result',{}).get('status','Unknown'))" 2>/dev/null || echo "Unknown")
+                  DEPLOYED=$(echo "$REPORT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('result',{}).get('numberComponentsDeployed',0))" 2>/dev/null || echo 0)
+                  TOTAL=$(echo "$REPORT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('result',{}).get('numberComponentsTotal',0))" 2>/dev/null || echo 0)
+
+                  printf "  %3ds  │ %-14s │ %4d/%-4d\n" "$ELAPSED" "$STATUS" "$DEPLOYED" "$TOTAL"
+
+                  case "$STATUS" in
+                    Succeeded|Failed|Canceled|SucceededPartial|Error) break ;;
+                  esac
+
+                  sleep 15
+                  ELAPSED=$((ELAPSED + 15))
+                done
+
+                echo "$REPORT" > deploy-output.json
+              fi
+
+              if [[ "$STATUS" == "Failed" || "$STATUS" == "Canceled" || "$STATUS" == "Error" ]]; then
+                echo "##vso[task.logissue type=error]Deploy validation failed (status: $STATUS)."
+                cat deploy-stderr.log || true
+                exit 1
+              fi
+
+              echo "✅ Validation succeeded (status: $STATUS)"
+            displayName: "Validate deploy to target org (check-only)"
+            env:
+              ORG_ALIAS: $(ORG_ALIAS)
+
+          - bash: |
+              set -euo pipefail
+              if [[ "$(APEX_REQUIRED)" != "true" ]]; then
+                echo "No Apex changes — coverage check skipped."
+                exit 0
+              fi
+              [[ -f deploy-output.json ]] || { echo "##vso[task.logissue type=error]deploy-output.json not found."; exit 1; }
+
+              python3 << 'PYEOF'
+              import json, sys, os
+
+              COVERAGE_THRESHOLD = int(os.environ.get('COVERAGE_THRESHOLD', '85'))
+              PROD_CLASSES = os.environ.get('PROD_CLASSES', '')
+
+              with open('deploy-output.json', 'r') as f:
+                  raw = f.read()
+              start = raw.find('{')
+              result = json.loads(raw[start:])
+
+              run_test_result = result.get('result', {}).get('details', {}).get('runTestResult', {})
+              code_coverage = run_test_result.get('codeCoverage', [])
+              coverage_warnings = run_test_result.get('codeCoverageWarnings', [])
+
+              if coverage_warnings:
+                  print("\n⚠️  Coverage Warnings:")
+                  for w in coverage_warnings:
+                      print(f"  {w.get('message', w)}")
+
+              print(f"\n{'─'*62}")
+              print(f"{'Class':<50} {'Coverage':>10}")
+              print(f"{'─'*62}")
+              coverage_map = {}
+              for cov in code_coverage:
+                  name = cov.get('name', 'Unknown')
+                  total = cov.get('numLocations', 0)
+                  not_covered = cov.get('numLocationsNotCovered', 0)
+                  pct = round(((total - not_covered) / total) * 100, 1) if total > 0 else 0.0
+                  coverage_map[name] = pct
+                  icon = "✅" if pct >= COVERAGE_THRESHOLD else "❌"
+                  print(f"{icon} {name:<48} {pct:>9.1f}%")
+              print(f"{'─'*62}")
+
+              prod_classes = [c.strip() for c in PROD_CLASSES.split(',') if c.strip()]
+              failed_classes = []
+              for cls in prod_classes:
+                  if cls in coverage_map:
+                      pct = coverage_map[cls]
+                      icon = "✅" if pct >= COVERAGE_THRESHOLD else "❌"
+                      print(f"  {icon} {cls}: {pct:.1f}%")
+                      if pct < COVERAGE_THRESHOLD:
+                          failed_classes.append((cls, pct))
+
+              if failed_classes:
+                  print(f"\n❌ COVERAGE GATE FAILED — below {COVERAGE_THRESHOLD}%:")
+                  for cls, pct in failed_classes:
+                      print(f"     • {cls}: {pct:.1f}%")
+                  sys.exit(1)
+              print(f"\n✅ Coverage gate passed.")
+              PYEOF
+            displayName: "Check Apex test coverage"
+            env:
+              COVERAGE_THRESHOLD: $(COVERAGE_THRESHOLD)
+              PROD_CLASSES: $(PROD_CLASSES)
+
+          - bash: |
+              if [[ "$(HAS_DELTA)" != "true" || "$(SCA_ENFORCEMENT_MODE)" == "off" ]]; then
+                echo "Skipping SCA scanner installation (no delta or SCA off)."
+                exit 0
+              fi
+              echo y | sf plugins install @salesforce/sfdx-scanner || npm install -g @salesforce/sfdx-scanner
+            displayName: "Install Salesforce Code Analyzer"
+            env:
+              SCA_ENFORCEMENT_MODE: $(SCA_ENFORCEMENT_MODE)
+
+          - bash: |
+              if [[ "$(HAS_DELTA)" != "true" || "$(SCA_ENFORCEMENT_MODE)" == "off" ]]; then
+                exit 0
+              fi
+              # Warn if waiver CSV was modified in this PR branch (waivers always read from main)
+              MODIFIED=$(git diff --name-only "origin/$(System.PullRequest.TargetBranch)...HEAD" \
+                | grep -c 'sf-scanner-waivers.csv' || true)
+              if [[ "${MODIFIED}" -gt "0" ]]; then
+                echo "##vso[task.logissue type=warning]⚠️  .github/sf-scanner-waivers.csv was modified in this PR."
+                echo "##vso[task.logissue type=warning]   Waivers are always read from the main branch — local changes are IGNORED."
+              fi
+            displayName: "Detect waiver file tampering"
+
+          - bash: |
+              if [[ "$(HAS_DELTA)" != "true" || "$(SCA_ENFORCEMENT_MODE)" == "off" ]]; then
+                exit 0
+              fi
+
+              WAIVER_PATH=".github/sf-scanner-waivers.csv"
+              ADO_ORG=$(echo "$(System.CollectionUri)" | sed 's|https://dev.azure.com/||;s|/||g')
+              PROJECT="$(System.TeamProject)"
+              REPO_NAME="$(Build.Repository.Name)"
+
+              # Fetch waivers from main branch via ADO REST API
+              HTTP=$(curl -sSL -w "%{http_code}" -o waiver-response.json \
+                -H "Authorization: Basic $(echo -n ":$ADO_PAT" | base64)" \
+                "https://dev.azure.com/${ADO_ORG}/${PROJECT}/_apis/git/repositories/${REPO_NAME}/items?path=${WAIVER_PATH}&versionDescriptor.version=main&api-version=7.0")
+
+              if [[ "$HTTP" == "200" ]]; then
+                cp waiver-response.json fetched-waivers.csv
+                ROWS=$(wc -l < fetched-waivers.csv)
+                echo "✅ Waivers loaded: $ROWS rows"
+              else
+                echo "##vso[task.logissue type=warning]Could not fetch waiver file (HTTP $HTTP). Proceeding with empty waivers."
+                echo "Component,Rule,Description,ExpiryDate,Status" > fetched-waivers.csv
+              fi
+            displayName: "Fetch SCA waivers from main branch"
+            env:
+              ADO_PAT: $(ADO_PAT)
+
+          - bash: |
+              if [[ "$(HAS_DELTA)" != "true" || "$(SCA_ENFORCEMENT_MODE)" == "off" ]]; then
+                exit 0
+              fi
+              sf scanner run \
+                --target "./force-app" \
+                --format "csv" \
+                --outfile "sfdx-report.csv" \
+                --severity-threshold 3 || true   # continue-on-error — we evaluate below
+            displayName: "Run Salesforce Code Analyzer"
+            continue-on-error: true
+
+          - bash: |
+              if [[ "$(HAS_DELTA)" != "true" || "$(SCA_ENFORCEMENT_MODE)" == "off" ]]; then
+                echo "SCA evaluation skipped."
+                exit 0
+              fi
+
+              python3 << 'PYEOF'
+              import csv, sys, os
+              from datetime import date, datetime
+
+              ENFORCEMENT = os.environ.get('SCA_ENFORCEMENT_MODE', 'enforce')
+              today = date.today()
+
+              # Load waivers
+              waivers = []
+              try:
+                  with open('fetched-waivers.csv', newline='', encoding='utf-8') as f:
+                      for row in csv.DictReader(r for r in f if not r.startswith('#')):
+                          waivers.append(row)
+              except FileNotFoundError:
+                  pass
+
+              # Load scanner results
+              violations = []
+              try:
+                  with open('sfdx-report.csv', newline='', encoding='utf-8') as f:
+                      for row in csv.DictReader(f):
+                          violations.append(row)
+              except FileNotFoundError:
+                  print("No sfdx-report.csv found — no violations to evaluate.")
+                  sys.exit(0)
+
+              waived_active = 0
+              expiring_soon = 0
+              expired = 0
+              unwaived = 0
+              fail_reasons = []
+
+              for v in violations:
+                  file_path = v.get('File', v.get('FileName', ''))
+                  rule = v.get('Rule', v.get('RuleName', ''))
+                  desc = v.get('Description', v.get('Message', ''))
+
+                  matched_waiver = None
+                  for w in waivers:
+                      if w.get('Status', '').upper() in ('ACTIVE', ''):
+                          comp_match = w.get('Component', '') in file_path or not w.get('Component', '')
+                          rule_match = w.get('Rule', '').lower() in rule.lower() or not w.get('Rule', '')
+                          if comp_match and rule_match:
+                              matched_waiver = w
+                              break
+
+                  if matched_waiver:
+                      expiry_str = matched_waiver.get('ExpiryDate', '')
+                      try:
+                          expiry = datetime.strptime(expiry_str.strip(), '%Y-%m-%d').date()
+                          days_left = (expiry - today).days
+                          if days_left < 0:
+                              expired += 1
+                              fail_reasons.append(f"EXPIRED waiver [{rule}] in {file_path} (expired {expiry})")
+                          elif days_left <= 30:
+                              expiring_soon += 1
+                          else:
+                              waived_active += 1
+                      except ValueError:
+                          waived_active += 1
+                  else:
+                      unwaived += 1
+                      fail_reasons.append(f"UNWAIVED violation [{rule}] in {file_path}: {desc[:80]}")
+
+              print("\n════════════════════════════════════════════════════════════════")
+              print("  SCA GOVERNANCE SUMMARY")
+              print("════════════════════════════════════════════════════════════════")
+              print(f"  ✅ Waived (active)   : {waived_active}")
+              print(f"  ⏰ Expiring ≤30 days : {expiring_soon}")
+              print(f"  ❌ Expired waivers   : {expired}")
+              print(f"  ⚠️  Unwaived violations: {unwaived}")
+              print("════════════════════════════════════════════════════════════════")
+
+              if ENFORCEMENT == 'enforce' and (expired > 0 or unwaived > 0):
+                  print("\n❌ SCA GATE FAILED:")
+                  for r in fail_reasons:
+                      print(f"   • {r}")
+                  sys.exit(1)
+              elif ENFORCEMENT == 'warn' and (expired > 0 or unwaived > 0):
+                  print(f"\n⚠️  Violations present but SCA_ENFORCEMENT_MODE=warn — continuing.")
+              else:
+                  print("\n✅ SCA governance passed.")
+              PYEOF
+            displayName: "Evaluate SCA results against waivers"
+            env:
+              SCA_ENFORCEMENT_MODE: $(SCA_ENFORCEMENT_MODE)
+
+          - bash: |
+              if [[ ! -f sfdx-report.csv ]]; then
+                echo "No report to post — skipping."
+                exit 0
+              fi
+
+              ADO_ORG=$(echo "$(System.CollectionUri)" | sed 's|https://dev.azure.com/||;s|/||g')
+              PROJECT="$(System.TeamProject)"
+              PR_NUMBER="$(System.PullRequest.PullRequestId)"
+              REPO_NAME="$(Build.Repository.Name)"
+              BUILD_URL="$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+
+              WAIVED=$(python3 -c "
+              import csv, datetime
+              today = datetime.date.today()
+              waived=expiring=expired=unwaived=0
+              try:
+                w=list(csv.DictReader(open('fetched-waivers.csv')))
+              except:
+                w=[]
+              try:
+                for row in csv.DictReader(open('sfdx-report.csv')):
+                  matched=any((m.get('Component','') in row.get('File','') or not m.get('Component','')) for m in w)
+                  if matched: waived+=1
+                  else: unwaived+=1
+              except:
+                pass
+              print(f'{waived}|{expiring}|{expired}|{unwaived}')
+              " 2>/dev/null || echo "0|0|0|0")
+
+              python3 -c "
+              import json, os
+              waived_parts = os.environ.get('WAIVED','0|0|0|0').split('|')
+              build_url = os.environ.get('BUILD_URL','')
+              pr = os.environ.get('PR_NUMBER','')
+              body = f'''## 🔍 Salesforce Code Analyzer — SCA Governance Report
+
+              | Status | Count |
+              |--------|-------|
+              | ✅ Waived (active) | {waived_parts[0]} |
+              | ⏰ Expiring ≤30 days | {waived_parts[1]} |
+              | ❌ Expired waivers | {waived_parts[2]} |
+              | ⚠️ Unwaived violations | {waived_parts[3]} |
+
+              [📊 View full pipeline run]({build_url})
+              '''
+              print(json.dumps({'comments': [{'parentCommentId': 0, 'content': body, 'commentType': 1}], 'status': 1}))
+              " > pr-comment.json
+
+              ADO_PAT="$1"
+              curl -sSL -X POST \
+                -H "Authorization: Basic $(echo -n ":$(ADO_PAT)" | base64)" \
+                -H "Content-Type: application/json" \
+                -d @pr-comment.json \
+                "https://dev.azure.com/${ADO_ORG}/${PROJECT}/_apis/git/repositories/${REPO_NAME}/pullRequests/${PR_NUMBER}/threads?api-version=7.0" > /dev/null
+
+              echo "✅ SCA PR comment posted."
+            displayName: "Post SCA governance report as PR comment"
+            continue-on-error: true
+            env:
+              ADO_PAT: $(ADO_PAT)
+              PR_NUMBER: $(System.PullRequest.PullRequestId)
+              BUILD_URL: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Upload scanner reports"
+            condition: always()
+            inputs:
+              targetPath: .
+              artifact: sfdx-scanner-reports
+              publishLocation: pipeline
+
+          - bash: |
+              set -euo pipefail
+              ADO_ORG=$(echo "$(System.CollectionUri)" | sed 's|https://dev.azure.com/||;s|/||g')
+              PROJECT="$(System.TeamProject)"
+              PR_NUMBER="$(System.PullRequest.PullRequestId)"
+              REPO_NAME="$(Build.Repository.Name)"
+              BUILD_URL="$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+              PR_AUTHOR="$(Build.RequestedFor)"
+              PR_TITLE="$(System.PullRequest.Title)"
+              SOURCE_BRANCH="$(System.PullRequest.SourceBranch)"
+              TARGET_BRANCH="$(System.PullRequest.TargetBranch)"
+
+              if [[ ! -f "$(Agent.TempDirectory)/eligible-reviewers.txt" ]]; then
+                echo "No eligible reviewers file — skipping notification."
+                exit 0
+              fi
+
+              ELIGIBLE_REVIEWERS=$(cat "$(Agent.TempDirectory)/eligible-reviewers.txt" | tr '\n' ' ')
+              REVIEWER_MENTIONS=""
+              for r in $ELIGIBLE_REVIEWERS; do
+                REVIEWER_MENTIONS="$REVIEWER_MENTIONS@<$r> "
+              done
+
+              python3 -c "
+              import json, os
+              reviewers = os.environ.get('REVIEWER_MENTIONS','')
+              body = f'''✅ **All automated checks passed — PR is ready for review!**
+
+              👋 {reviewers} — validation completed successfully. Please review at your earliest convenience.
+
+              | Detail | Value |
+              |--------|-------|
+              | **PR** | #{os.environ.get('PR_NUMBER','')} — {os.environ.get('PR_TITLE','')} |
+              | **Author** | {os.environ.get('PR_AUTHOR','')} |
+              | **Branch** | \`{os.environ.get('SOURCE_BRANCH','').replace('refs/heads/','')}\` → \`{os.environ.get('TARGET_BRANCH','').replace('refs/heads/','')}\` |
+              | **Pipeline run** | [Build #{os.environ.get('BUILD_ID','')}]({os.environ.get('BUILD_URL','')}) |'''
+              print(json.dumps({'comments': [{'parentCommentId': 0, 'content': body, 'commentType': 1}], 'status': 1}))
+              " > validation-passed-comment.json
+
+              curl -sSL -X POST \
+                -H "Authorization: Basic $(echo -n ":$ADO_PAT" | base64)" \
+                -H "Content-Type: application/json" \
+                -d @validation-passed-comment.json \
+                "https://dev.azure.com/${ADO_ORG}/${PROJECT}/_apis/git/repositories/${REPO_NAME}/pullRequests/${PR_NUMBER}/threads?api-version=7.0" > /dev/null
+
+              echo "✅ Post-validation reviewer notification posted."
+            displayName: "Notify reviewers — validation passed"
+            condition: succeeded()
+            env:
+              ADO_PAT: $(ADO_PAT)
+              REVIEWER_MENTIONS: ""
+              PR_NUMBER: $(System.PullRequest.PullRequestId)
+              PR_TITLE: $(System.PullRequest.Title)
+              PR_AUTHOR: $(Build.RequestedFor)
+              SOURCE_BRANCH: $(System.PullRequest.SourceBranch)
+              TARGET_BRANCH: $(System.PullRequest.TargetBranch)
+              BUILD_ID: $(Build.BuildId)
+              BUILD_URL: $(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # JOB 3 — CheckMarx AST SAST Scan
+      # ─────────────────────────────────────────────────────────────────────────
+      - job: checkmarx_sast
+        displayName: "CheckMarx AST Scan"
+        dependsOn: setup
+        condition: |
+          and(
+            succeeded(),
+            eq(dependencies.setup.outputs['eval.run_checkmarx'], 'true')
+          )
+        variables:
+          run_checkmarx: $[ dependencies.setup.outputs['eval.run_checkmarx'] ]
+        steps:
+          - checkout: self
+
+          - bash: |
+              set -euo pipefail
+              # Install FCLI (Fortify CLI — also used for CX bootstrap)
+              curl -fsSL "https://github.com/fortify/fcli/releases/download/v3.16.0/fcli-linux.tgz" | tar -xzC /usr/local/bin/
+              fcli --version
+            displayName: "Install FCLI"
+
+          - bash: |
+              set -euo pipefail
+              # Authenticate and run CheckMarx AST scan
+              fcli cx session login \
+                --url "$CX_BASE_URI" \
+                --tenant "$CX_TENANT" \
+                --client-id "$CX_CLIENT_ID" \
+                --client-secret "$CX_CLIENT_SECRET"
+
+              PROJECT_NAME="${CX_PROJECT_NAME:-$(Build.Repository.Name)}"
+
+              fcli cx scan create \
+                --project "$PROJECT_NAME" \
+                --wait \
+                -s . \
+                --report-file checkmarx-results.sarif
+
+              echo "✅ CheckMarx scan completed."
+            displayName: "Run CheckMarx AST SAST Scan"
+            env:
+              CX_BASE_URI: $(CX_BASE_URI)
+              CX_TENANT: $(CX_TENANT)
+              CX_CLIENT_ID: $(CX_CLIENT_ID)
+              CX_CLIENT_SECRET: $(CX_CLIENT_SECRET)
+              CX_PROJECT_NAME: $(CX_PROJECT_NAME)
+
+          - bash: fcli cx session logout || true
+            displayName: "Logout CheckMarx session"
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Upload CheckMarx SARIF report"
+            condition: always()
+            inputs:
+              targetPath: checkmarx-results.sarif
+              artifact: checkmarx-sarif-report
+              publishLocation: pipeline
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # JOB 4 — Fortify on Demand SAST/DAST Scan
+      # ─────────────────────────────────────────────────────────────────────────
+      - job: fortify_sast_dast
+        displayName: "Fortify on Demand Scan"
+        dependsOn: setup
+        condition: |
+          and(
+            succeeded(),
+            eq(dependencies.setup.outputs['eval.run_fortify'], 'true')
+          )
+        steps:
+          - checkout: self
+
+          - bash: |
+              set -euo pipefail
+              curl -fsSL "https://github.com/fortify/fcli/releases/download/v3.16.0/fcli-linux.tgz" | tar -xzC /usr/local/bin/
+              fcli --version
+            displayName: "Install FCLI"
+
+          - bash: |
+              set -euo pipefail
+              fcli fod session login \
+                --url "$FOD_URL" \
+                --client-id "$FOD_CLIENT_ID" \
+                --client-secret "$FOD_CLIENT_SECRET"
+
+              fcli fod scan start-sast \
+                --app "$FOD_APP_NAME" \
+                --release "$FOD_RELEASE_NAME" \
+                --source . \
+                --wait \
+                --report-file fortify-sast-results.sarif
+
+              echo "✅ Fortify SAST scan completed."
+            displayName: "Run Fortify SAST Scan"
+            env:
+              FOD_URL: $(FOD_URL)
+              FOD_CLIENT_ID: $(FOD_CLIENT_ID)
+              FOD_CLIENT_SECRET: $(FOD_CLIENT_SECRET)
+              FOD_APP_NAME: $(FOD_APP_NAME)
+              FOD_RELEASE_NAME: $(FOD_RELEASE_NAME)
+
+          - bash: fcli fod session logout || true
+            displayName: "Logout Fortify session"
+            condition: always()
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Upload Fortify SARIF report"
+            condition: always()
+            inputs:
+              targetPath: fortify-sast-results.sarif
+              artifact: fortify-sast-sarif-report
+              publishLocation: pipeline
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 2 — DEPLOYMENT
+# Triggered manually or via a PR approval event.
+# Uses ADO Environment with approval gates to require architect sign-off.
+# ═══════════════════════════════════════════════════════════════════════════════
+  - stage: deployment
+    displayName: "Deployment"
+    # Only run after PR validation stage; skip if triggered by a PR (use manual trigger for deploy)
+    dependsOn: pr_validation
+    condition: |
+      and(
+        succeeded('pr_validation'),
+        ne(variables['Build.Reason'], 'PullRequest')
+      )
+    jobs:
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # JOB 5 — Approval + Merge Gate
+      # Uses ADO environment approval to enforce architect-only approval.
+      # Configure the 'uat-deployment' environment in ADO with:
+      #   - Required approvers: chorevathi-deloitte, mukeshranadeloitte
+      # ─────────────────────────────────────────────────────────────────────────
+      - deployment: approval_merge_gate
+        displayName: "Approval + Merge Gate"
+        environment: uat-deployment    # ← Configure approval gates on this environment in ADO
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - bash: |
+                    set -euo pipefail
+
+                    echo "════════════════════════════════════════════════════════════════"
+                    echo "  ARCHITECT APPROVAL GATE"
+                    echo "  Approved by: $(Build.RequestedFor)"
+                    echo "════════════════════════════════════════════════════════════════"
+
+                    # Check if target is main branch — enforce architect gate
+                    TARGET_BRANCH="$(Build.SourceBranch)"
+                    APPROVER="$(Build.RequestedFor)"
+
+                    # Only enforce architect gate for main branch deployments
+                    if [[ "$TARGET_BRANCH" == "refs/heads/main" || "$TARGET_BRANCH" == "main" ]]; then
+                      ARCHITECTS=("chorevathi-deloitte" "mukeshranadeloitte")
+                      IS_ARCHITECT=false
+                      for arch in "${ARCHITECTS[@]}"; do
+                        if [[ "$APPROVER" == "$arch" ]]; then
+                          IS_ARCHITECT=true
+                          break
+                        fi
+                      done
+
+                      if [[ "$IS_ARCHITECT" != "true" ]]; then
+                        echo "##vso[task.logissue type=error]❌ Approval from '$APPROVER' is not sufficient for main branch deployment."
+                        echo "##vso[task.logissue type=error]Only Architects can approve: ${ARCHITECTS[*]}"
+                        exit 1
+                      fi
+
+                      echo "✅ Architect approval confirmed for main: $APPROVER"
+                    else
+                      echo "ℹ️  Target branch is not main — architect gate skipped. Approver: $APPROVER"
+                    fi
+
+                    echo "✅ Approval gate passed."
+                  displayName: "Validate architect approval"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # JOB 6 — Deploy merged commit to UAT org
+      # ─────────────────────────────────────────────────────────────────────────
+      - job: deploy_after_merge
+        displayName: "Deploy merged commit to target org"
+        dependsOn: approval_merge_gate
+        condition: succeeded('approval_merge_gate')
+        timeoutInMinutes: 35
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            displayName: "Checkout repository (full history)"
+
+          - task: NodeTool@0
+            displayName: "Setup Node.js 20"
+            inputs:
+              versionSpec: '20.x'
+
+          - bash: npm install --global @salesforce/cli
+            displayName: "Install Salesforce CLI"
+
+          - bash: |
+              set -euo pipefail
+              printf '%s' "$SFDX_AUTH_URL" > sfdxAuthUrl.txt
+              sf org login sfdx-url --sfdx-url-file sfdxAuthUrl.txt --alias "$ORG_ALIAS" --set-default
+              rm -f sfdxAuthUrl.txt
+            displayName: "Authenticate target org"
+            env:
+              SFDX_AUTH_URL: $(CRT_UAT_AUTHURL)
+              ORG_ALIAS: $(ORG_ALIAS)
+
+          - bash: |
+              echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
+              git config --global --add safe.directory "$BUILD_SOURCESDIRECTORY"
+            displayName: "Install sfdx-git-delta plugin"
+
+          - bash: |
+              set -euo pipefail
+              # Use DELTA_FROM_COMMIT variable as the FROM reference (last deployed SHA on UAT)
+              MERGE_BASE="${DELTA_FROM_COMMIT:-}"
+
+              if [[ -z "$MERGE_BASE" ]]; then
+                echo "##vso[task.logissue type=error]DELTA_FROM_COMMIT is not set. Cannot compute delta."
+                exit 1
+              fi
+
+              echo "Delta FROM: $MERGE_BASE"
+              echo "Delta TO:   HEAD ($(git rev-parse HEAD))"
+
+              sf sgd:source:delta \
+                --to   "HEAD" \
+                --from "$MERGE_BASE" \
+                --output-dir "." \
+                --source-dir force-app/
+            displayName: "Build delta package from merged HEAD"
+            env:
+              DELTA_FROM_COMMIT: $(DELTA_FROM_COMMIT)
+
+          - bash: |
+              echo "===== package/package.xml ====="
+              cat package/package.xml 2>/dev/null || echo "(not generated)"
+              echo ""
+              echo "===== destructiveChanges/destructiveChanges.xml ====="
+              cat destructiveChanges/destructiveChanges.xml 2>/dev/null || echo "(not generated)"
+            displayName: "Display generated packages"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Upload delta artifacts"
+            condition: always()
+            inputs:
+              targetPath: .
+              artifact: salesforce-delta-deploy
+              publishLocation: pipeline
+
+          - bash: |
+              set -euo pipefail
+              deploy_manifest=""
+              [[ -f package/package.xml ]] && grep -q '<members>' package/package.xml && deploy_manifest="package/package.xml"
+              destructive_manifest=""
+              [[ -f destructiveChanges/destructiveChanges.xml ]] && grep -q '<members>' destructiveChanges/destructiveChanges.xml && destructive_manifest="destructiveChanges/destructiveChanges.xml"
+              has_delta=false
+              [[ -n "$deploy_manifest" || -n "$destructive_manifest" ]] && has_delta=true
+
+              echo "##vso[task.setvariable variable=DEPLOY_MANIFEST]$deploy_manifest"
+              echo "##vso[task.setvariable variable=DESTRUCTIVE_MANIFEST]$destructive_manifest"
+              echo "##vso[task.setvariable variable=HAS_DELTA]$has_delta"
+              echo "has_delta=$has_delta  deploy=$deploy_manifest  destructive=$destructive_manifest"
+            displayName: "Prepare deploy manifests"
+            name: manifests
+
+          - bash: |
+              set -euo pipefail
+
+              if [[ "$(HAS_DELTA)" != "true" ]]; then
+                echo "ℹ️  No delta to deploy — skipping."
+                exit 0
+              fi
+
+              ORG_ALIAS="$(ORG_ALIAS)"
+              DEPLOY_MANIFEST="$(DEPLOY_MANIFEST)"
+              DESTRUCTIVE_MANIFEST="$(DESTRUCTIVE_MANIFEST)"
+
+              # Tests already ran during PR validation — use NoTestRun for deployment
+              deploy_cmd=(sf project deploy start --target-org "$ORG_ALIAS" --test-level NoTestRun --json)
+
+              [[ -n "$DEPLOY_MANIFEST" ]] && deploy_cmd+=(--manifest "$DEPLOY_MANIFEST") || deploy_cmd+=(--source-dir "$(SOURCE_DIR)")
+              [[ -n "$DESTRUCTIVE_MANIFEST" ]] && deploy_cmd+=(--post-destructive-changes "$DESTRUCTIVE_MANIFEST")
+
+              deploy_cmd+=(--async)
+              echo "▶ Running: ${deploy_cmd[*]}"
+
+              set +e
+              "${deploy_cmd[@]}" > deploy-start.json 2>deploy-stderr.log
+              start_rc=$?
+              set -e
+
+              if [[ $start_rc -ne 0 ]]; then
+                echo "##vso[task.logissue type=error]Failed to start deployment."
+                cat deploy-stderr.log
+                exit 1
+              fi
+
+              JOB_ID=$(python3 -c "import json; d=json.load(open('deploy-start.json')); print(d.get('result',{}).get('id',''))" || echo "")
+
+              if [[ -z "$JOB_ID" ]]; then
+                cp deploy-start.json deploy-output.json
+              else
+                echo "🚀 Deploy job ID: $JOB_ID — polling for completion..."
+                echo "  Time  │ Status         │ Components"
+                echo "────────┼────────────────┼───────────────────"
+                ELAPSED=0
+                MAX_WAIT=2100
+                STATUS="Pending"
+                while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+                  REPORT=$(sf project deploy report --job-id "$JOB_ID" --json 2>/dev/null || echo '{}')
+                  STATUS=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('result',{}).get('status','Unknown'))" <<< "$REPORT")
+                  DEPLOYED=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('result',{}).get('numberComponentsDeployed',0))" <<< "$REPORT")
+                  TOTAL=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('result',{}).get('numberComponentsTotal',0))" <<< "$REPORT")
+                  printf "  %3ds  │ %-14s │ %4d/%-4d\n" "$ELAPSED" "$STATUS" "$DEPLOYED" "$TOTAL"
+                  case "$STATUS" in Succeeded|Failed|Canceled|SucceededPartial|Error) break ;; esac
+                  sleep 15
+                  ELAPSED=$((ELAPSED + 15))
+                done
+                echo "$REPORT" > deploy-output.json
+              fi
+
+              if [[ "$STATUS" == "Failed" || "$STATUS" == "Canceled" || "$STATUS" == "Error" ]]; then
+                echo "##vso[task.logissue type=error]Deployment failed (status: $STATUS)."
+                cat deploy-stderr.log || true
+                exit 1
+              fi
+
+              echo "✅ Deployment succeeded (status: $STATUS)"
+            displayName: "Deploy to target org (NoTestRun)"
+            env:
+              ORG_ALIAS: $(ORG_ALIAS)
+
+          - bash: |
+              set -euo pipefail
+              DEPLOY_SHA=$(git rev-parse HEAD)
+              ADO_ORG=$(echo "$(System.CollectionUri)" | sed 's|https://dev.azure.com/||;s|/||g')
+              PROJECT_ID="$(System.TeamProjectId)"
+
+              echo "Updating DELTA_FROM_COMMIT → $DEPLOY_SHA"
+
+              # Update pipeline variable via ADO REST API
+              # Note: Variables must exist in the pipeline definition first
+              HTTP=$(curl -sSL -o /tmp/var_resp.json -w "%{http_code}" \
+                -X PATCH \
+                -H "Authorization: Basic $(echo -n ":$ADO_PAT" | base64)" \
+                -H "Content-Type: application/json" \
+                "https://dev.azure.com/${ADO_ORG}/${PROJECT_ID}/_apis/pipelines/$(System.DefinitionId)/configurations?api-version=7.0-preview.1" \
+                -d "{\"variables\":{\"DELTA_FROM_COMMIT\":{\"value\":\"$DEPLOY_SHA\",\"isSecret\":false}}}")
+
+              if [[ "$HTTP" == "200" || "$HTTP" == "204" ]]; then
+                echo "✅ DELTA_FROM_COMMIT updated to $DEPLOY_SHA"
+              else
+                echo "##vso[task.logissue type=warning]Could not auto-update DELTA_FROM_COMMIT (HTTP $HTTP)."
+                echo "##vso[task.logissue type=warning]Manually update DELTA_FROM_COMMIT to: $DEPLOY_SHA"
+                cat /tmp/var_resp.json || true
+              fi
+
+              echo "Next PR delta will be calculated from: $DEPLOY_SHA"
+            displayName: "Update DELTA_FROM_COMMIT variable to deployed commit"
+            env:
+              ADO_PAT: $(ADO_PAT)
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # JOB 7 — Trigger CRT Tests
+      # ─────────────────────────────────────────────────────────────────────────
+      - job: trigger_crt_tests
+        displayName: "Trigger CRT Test Job"
+        dependsOn: deploy_after_merge
+        condition: succeeded('deploy_after_merge')
+        steps:
+          - bash: |
+              set -euo pipefail
+
+              CRT_JOB_ID="${CRT_JOB_ID:-115686}"
+              CRT_PROJECT_ID="${CRT_PROJECT_ID:-73283}"
+              CRT_ORG_ID="${CRT_ORG_ID:-43532}"
+
+              echo "🚀 Triggering CRT job $CRT_JOB_ID..."
+
+              TRIGGER_RESP=$(curl -sSL -X POST \
+                -H "Authorization: Bearer $CRT_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.copado.com/automations/v1/testjobs" \
+                -d "{\"jobId\":\"$CRT_JOB_ID\",\"projectId\":\"$CRT_PROJECT_ID\",\"orgId\":\"$CRT_ORG_ID\"}")
+
+              RUN_ID=$(echo "$TRIGGER_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || echo "")
+
+              if [[ -z "$RUN_ID" ]]; then
+                echo "##vso[task.logissue type=error]Failed to trigger CRT job. Response: $TRIGGER_RESP"
+                exit 1
+              fi
+
+              echo "✅ CRT run triggered — ID: $RUN_ID"
+              echo "##vso[task.setvariable variable=CRT_RUN_ID]$RUN_ID"
+            displayName: "Trigger CRT job"
+            env:
+              CRT_API_TOKEN: $(CRT_API_TOKEN)
+              CRT_JOB_ID: $(CRT_JOB_ID)
+              CRT_PROJECT_ID: $(CRT_PROJECT_ID)
+              CRT_ORG_ID: $(CRT_ORG_ID)
+
+          - bash: |
+              set -euo pipefail
+              RUN_ID="$(CRT_RUN_ID)"
+              MAX_WAIT=1800
+              ELAPSED=0
+
+              echo "Polling CRT run $RUN_ID..."
+              echo "  Time  │ Status"
+              echo "────────┼───────────────────"
+
+              while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+                STATUS_RESP=$(curl -sSL \
+                  -H "Authorization: Bearer $CRT_API_TOKEN" \
+                  "https://api.copado.com/automations/v1/testjobs/$RUN_ID")
+
+                STATUS=$(echo "$STATUS_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status','Unknown'))" 2>/dev/null || echo "Unknown")
+                printf "  %3ds  │ %s\n" "$ELAPSED" "$STATUS"
+
+                case "$STATUS" in
+                  Completed|Passed|Failed|Error|Cancelled) break ;;
+                esac
+
+                sleep 30
+                ELAPSED=$((ELAPSED + 30))
+              done
+
+              echo "##vso[task.setvariable variable=CRT_STATUS]$STATUS"
+              echo "##vso[task.setvariable variable=CRT_FINAL_RESP]$STATUS_RESP"
+
+              if [[ "$STATUS" == "Failed" || "$STATUS" == "Error" ]]; then
+                echo "##vso[task.logissue type=warning]⚠️  CRT tests completed with status: $STATUS"
+              fi
+            displayName: "Poll CRT job status"
+            env:
+              CRT_API_TOKEN: $(CRT_API_TOKEN)
+
+          - bash: |
+              set -euo pipefail
+
+              CRT_STATUS="$(CRT_STATUS)"
+              RUN_ID="$(CRT_RUN_ID)"
+              BUILD_ID="$(Build.BuildId)"
+              PR_NUMBER="$(System.PullRequest.PullRequestId)"
+              PR_AUTHOR="$(Build.RequestedFor)"
+              CRT_DASHBOARD="https://app.copado.com/testjobs/$RUN_ID"
+
+              echo ""
+              echo "════════════════════════════════════════════════════════════════"
+              echo "  CRT JOB SUMMARY"
+              echo "════════════════════════════════════════════════════════════════"
+              echo "  PR Number  : #$PR_NUMBER"
+              echo "  PR Author  : $PR_AUTHOR"
+              echo "  Build ID   : $BUILD_ID"
+              echo "  CRT Run ID : $RUN_ID"
+              echo "  Test Result: $CRT_STATUS"
+              echo "  Dashboard  : $CRT_DASHBOARD"
+              echo "════════════════════════════════════════════════════════════════"
+
+              # Write pipeline summary (ADO equivalent of GITHUB_STEP_SUMMARY)
+              cat > crt-summary.md << EOF
+              ## 🤖 CRT Test Execution Summary
+
+              | Field | Value |
+              |-------|-------|
+              | **PR** | #${PR_NUMBER} |
+              | **Author** | ${PR_AUTHOR} |
+              | **Build ID** | ${BUILD_ID} |
+              | **CRT Run ID** | ${RUN_ID} |
+              | **Test Result** | ${CRT_STATUS} |
+              | **CRT Dashboard** | [Open Dashboard](${CRT_DASHBOARD}) |
+              EOF
+
+              echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=CRT Test Summary]$(pwd)/crt-summary.md"
+            displayName: "CRT Job Summary"

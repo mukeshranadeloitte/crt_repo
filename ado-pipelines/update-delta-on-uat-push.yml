@@ -1,0 +1,119 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Azure DevOps — Update Delta Baseline on UAT Push
+# Equivalent to: .github/workflows/update-delta-on-uat-push.yml (GitHub Actions)
+#
+# Fires on every push to `uat` — direct commits AND PR merge commits.
+# Updates the DELTA_FROM_COMMIT pipeline variable to the pushed commit SHA
+# so the next PR's delta is always calculated from the exact UAT branch tip.
+#
+# Required:
+#   ADO_PAT (secret pipeline variable) — Personal Access Token with pipeline scope
+#   System.DefinitionId                — Auto-available (the pipeline definition ID)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+trigger:
+  branches:
+    include:
+      - uat
+  paths:
+    include:
+      - force-app/**
+      - ado-pipelines/e2e-uat-pipeline.yml
+      - .github/sf-scanner-waivers.csv
+
+pr: none   # This pipeline only runs on push, not on PRs
+
+variables:
+  - group: salesforce-uat
+
+pool:
+  vmImage: ubuntu-22.04
+
+jobs:
+  - job: update_delta_baseline
+    displayName: "Update DELTA_FROM_COMMIT to UAT tip"
+    steps:
+      - checkout: self
+        fetchDepth: 1
+
+      - bash: |
+          set -euo pipefail
+
+          PUSHED_SHA="$(Build.SourceVersion)"
+          PUSHER="$(Build.RequestedFor)"
+          REF="$(Build.SourceBranchName)"
+          ADO_ORG=$(echo "$(System.CollectionUri)" | sed 's|https://dev.azure.com/||;s|/||g')
+          PROJECT_ID="$(System.TeamProjectId)"
+          DEFINITION_ID="$(System.DefinitionId)"
+
+          echo "Push to '${REF}' by '${PUSHER}'"
+          echo "New UAT tip SHA: ${PUSHED_SHA}"
+
+          if [[ -z "${ADO_PAT:-}" ]]; then
+            echo "##vso[task.logissue type=warning]Secret ADO_PAT not set — cannot auto-update DELTA_FROM_COMMIT."
+            echo "##vso[task.logissue type=warning]Manually update DELTA_FROM_COMMIT to: ${PUSHED_SHA}"
+            exit 0
+          fi
+
+          # Update the pipeline variable via ADO REST API
+          # This updates the variable in the e2e-uat-pipeline definition (stored as DELTA_FROM_COMMIT)
+          # NOTE: The e2e-uat-pipeline definition ID must be set as DEPLOY_PIPELINE_ID variable
+          TARGET_PIPELINE_ID="${DEPLOY_PIPELINE_ID:-$DEFINITION_ID}"
+
+          HTTP=$(curl -sSL -o /tmp/var_resp.json -w "%{http_code}" \
+            -X PATCH \
+            -H "Authorization: Basic $(echo -n ":$ADO_PAT" | base64)" \
+            -H "Content-Type: application/json" \
+            "https://dev.azure.com/${ADO_ORG}/${PROJECT_ID}/_apis/pipelines/configurations/${TARGET_PIPELINE_ID}?api-version=7.0-preview.1" \
+            -d "{\"variables\":{\"DELTA_FROM_COMMIT\":{\"value\":\"${PUSHED_SHA}\",\"isSecret\":false}}}")
+
+          if [[ "$HTTP" == "200" || "$HTTP" == "204" ]]; then
+            echo "✅ DELTA_FROM_COMMIT updated to ${PUSHED_SHA} in pipeline ${TARGET_PIPELINE_ID}"
+          else
+            echo "##vso[task.logissue type=warning]Could not update DELTA_FROM_COMMIT via pipeline API (HTTP $HTTP)."
+            cat /tmp/var_resp.json || true
+
+            # Fallback: update via library variable group if pipeline API fails
+            echo "Attempting fallback via variable group update..."
+            # Variable group approach (requires variable group ID, set as VARIABLE_GROUP_ID)
+            if [[ -n "${VARIABLE_GROUP_ID:-}" ]]; then
+              # Get current group definition
+              GROUP=$(curl -sSL \
+                -H "Authorization: Basic $(echo -n ":$ADO_PAT" | base64)" \
+                "https://dev.azure.com/${ADO_ORG}/${PROJECT_ID}/_apis/distributedtask/variablegroups/${VARIABLE_GROUP_ID}?api-version=7.0")
+
+              # Update DELTA_FROM_COMMIT value in the group JSON
+              UPDATED=$(echo "$GROUP" | python3 -c "
+              import json,sys,os
+              sha = os.environ.get('PUSHED_SHA','')
+              d = json.load(sys.stdin)
+              d['variables']['DELTA_FROM_COMMIT'] = {'value': sha}
+              print(json.dumps(d))
+              " 2>/dev/null || echo "")
+
+              if [[ -n "$UPDATED" ]]; then
+                HTTP2=$(curl -sSL -o /dev/null -w "%{http_code}" \
+                  -X PUT \
+                  -H "Authorization: Basic $(echo -n ":$ADO_PAT" | base64)" \
+                  -H "Content-Type: application/json" \
+                  -d "$UPDATED" \
+                  "https://dev.azure.com/${ADO_ORG}/${PROJECT_ID}/_apis/distributedtask/variablegroups/${VARIABLE_GROUP_ID}?api-version=7.0")
+                if [[ "$HTTP2" == "200" ]]; then
+                  echo "✅ DELTA_FROM_COMMIT updated in variable group ${VARIABLE_GROUP_ID}"
+                else
+                  echo "##vso[task.logissue type=warning]Variable group update also failed (HTTP $HTTP2)."
+                  echo "##vso[task.logissue type=warning]Manually update DELTA_FROM_COMMIT to: ${PUSHED_SHA}"
+                fi
+              fi
+            else
+              echo "##vso[task.logissue type=warning]VARIABLE_GROUP_ID not set. Manually update DELTA_FROM_COMMIT to: ${PUSHED_SHA}"
+            fi
+          fi
+
+          echo "Next PR delta will be calculated from: ${PUSHED_SHA}"
+        displayName: "Update DELTA_FROM_COMMIT variable"
+        env:
+          ADO_PAT: $(ADO_PAT)
+          PUSHED_SHA: $(Build.SourceVersion)
+          DEPLOY_PIPELINE_ID: $(DEPLOY_PIPELINE_ID)
+          VARIABLE_GROUP_ID: $(VARIABLE_GROUP_ID)
