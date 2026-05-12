@@ -72,24 +72,24 @@ flowchart TD
         MERGE_GATE["🔒 approval-merge-gate
         1. Verify approval is for latest commit SHA (not stale)
         2. Confirm all required checks passed on this SHA
-        3. Merge PR via GitHub API (merge commit)
-        Output: merge_commit_sha"]
+        3. Architect gate — main branch only (architect list enforced)
+        4. Merge PR via GitHub API (merge commit)
+        Output: merge_sha, head_sha, base_sha, pr_number"]
     end
 
     MERGE_GATE -->|"✅ Merged"| DEPLOY
 
     subgraph JOB6["JOB 6 — Deploy After Merge"]
         DEPLOY["🚀 deploy-after-merge
-        1. Checkout merge commit
+        1. Checkout merge commit (merge_sha from gate)
         2. Install SF CLI
         3. Authenticate org
         4. Install sfdx-git-delta
-        5. Build delta (HEAD^1 → HEAD)
+        5. Build delta (base_sha → merge commit HEAD)
         6. Display & upload delta artifacts
         7. Prepare deploy manifests (check package.xml / destructiveChanges.xml)
         8. Deploy with NoTestRun (tests already run in PR validation)
-        9. Update DELTA_FROM_COMMIT (git rev-parse HEAD)
-        10. Merge pull request"]
+        9. Update DELTA_FROM_COMMIT (git rev-parse HEAD = merge commit)"]
     end
 
     DEPLOY -->|"✅ Deployed"| CRT
@@ -145,7 +145,7 @@ flowchart LR
     end
 
     subgraph Deploy["Deploy After Merge — Job 6"]
-        PARENT["HEAD^1\nUAT tip just before this PR merged"] -->|"delta FROM"| MERGED["HEAD\nMerge commit"]
+        PARENT["base_sha (PR base / UAT tip before merge)\nfrom approval-merge-gate outputs"] -->|"delta FROM"| MERGED["merge_sha (merge commit)\nchecked out in deploy job"]
     end
 
     Validation -.->|"Same set of components"| Deploy

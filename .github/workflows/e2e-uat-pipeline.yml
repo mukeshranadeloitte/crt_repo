@@ -1416,12 +1416,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: read
-      pull-requests: read
+      contents: write
+      pull-requests: write
     outputs:
       head_sha:  ${{ steps.validate.outputs.head_sha }}
       base_sha:  ${{ steps.validate.outputs.base_sha }}
       pr_number: ${{ steps.validate.outputs.pr_number }}
+      merge_sha: ${{ steps.merge.outputs.merge_sha }}
     steps:
       - name: Validate approval freshness and required checks
         id: validate
@@ -1508,11 +1509,38 @@ jobs:
           echo "base_sha=${BASE_SHA}"   >> "$GITHUB_OUTPUT"
           echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
 
+      - name: Merge pull request
+        id: merge
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          echo "Merging PR #${PR_NUMBER} (head: ${HEAD_SHA})..."
+          result=$(gh api \
+            --method PUT \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$REPO/pulls/$PR_NUMBER/merge" \
+            -f merge_method='merge' \
+            -f sha="$HEAD_SHA")
+          merged=$(echo "$result" | jq -r '.merged')
+          merge_sha=$(echo "$result" | jq -r '.sha')
+          if [[ "$merged" != "true" || -z "$merge_sha" || "$merge_sha" == "null" ]]; then
+            echo "::error::PR merge failed — checks passed but merge was rejected."
+            echo "$result"
+            exit 1
+          fi
+          echo "✅ PR #${PR_NUMBER} merged successfully (merge commit: ${merge_sha})"
+          echo "merge_sha=${merge_sha}" >> "$GITHUB_OUTPUT"
+
   # ─────────────────────────────────────────────────────────────────────────────
-  # JOB 9 — Deploy PR head to target org, then merge on success
-  # Checks out the PR head SHA (not a pre-merged commit), rebuilds delta using
-  # the PR base SHA as FROM, runs a real deploy (not validate), then merges the
-  # PR only if deployment succeeds. Includes destructive changes.
+  # JOB 9 — Deploy from merge commit to target org
+  # The PR is already merged by the approval-merge-gate job.
+  # Checks out the merge commit SHA, rebuilds delta using the PR base SHA as FROM,
+  # runs a real deploy (not validate) with NoTestRun (tests ran in PR validation).
+  # Updates DELTA_FROM_COMMIT to the merge commit SHA after successful deploy.
   # ─────────────────────────────────────────────────────────────────────────────
   deploy-after-merge:
     name: Deploy merged commit to target org
@@ -1524,11 +1552,11 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Checkout PR head
+      - name: Checkout merge commit
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ needs.approval-merge-gate.outputs.head_sha }}
+          ref: ${{ needs.approval-merge-gate.outputs.merge_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -1558,13 +1586,13 @@ jobs:
           echo y | sf plugins install sfdx-git-delta || npm install -g sfdx-git-delta@latest
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Build delta package from PR head
+      - name: Build delta package from merge commit
         id: delta_pkg
         run: |
           set -euo pipefail
-          # Use the PR base SHA (UAT branch tip the PR targets) as the FROM reference.
-          # This is the same reference used during PR validation, so exactly the same
-          # components are deployed as were validated.
+          # Use the PR base SHA (UAT branch tip before this PR merged) as the FROM reference.
+          # After merge, HEAD is the merge commit and HEAD^1 is the same as the PR base SHA.
+          # This ensures exactly the same components that were validated are deployed.
           BASE_SHA="${{ needs.approval-merge-gate.outputs.base_sha }}"
           if [[ -n "$BASE_SHA" ]]; then
             MERGE_BASE="$BASE_SHA"
@@ -1846,30 +1874,6 @@ jobs:
           fi
 
           echo "Next PR delta will be calculated from: ${DEPLOY_SHA}"
-
-      - name: Merge pull request
-        env:
-          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
-          REPO:       ${{ github.repository }}
-          PR_NUMBER:  ${{ needs.approval-merge-gate.outputs.pr_number }}
-          HEAD_SHA:   ${{ needs.approval-merge-gate.outputs.head_sha }}
-        run: |
-          set -euo pipefail
-          echo "Merging PR #${PR_NUMBER} (head: ${HEAD_SHA}) after successful deployment..."
-          result=$(gh api \
-            --method PUT \
-            -H "Accept: application/vnd.github+json" \
-            "repos/$REPO/pulls/$PR_NUMBER/merge" \
-            -f merge_method='merge' \
-            -f sha="$HEAD_SHA")
-          merged=$(echo "$result" | jq -r '.merged')
-          merge_sha=$(echo "$result" | jq -r '.sha')
-          if [[ "$merged" != "true" || -z "$merge_sha" || "$merge_sha" == "null" ]]; then
-            echo "::error::PR merge failed — deployment succeeded but merge was rejected."
-            echo "$result"
-            exit 1
-          fi
-          echo "✅ PR #${PR_NUMBER} merged successfully (merge commit: ${merge_sha})"
 
   # ─────────────────────────────────────────────────────────────────────────────
   # JOB 10 — Trigger CRT Smoke Tests

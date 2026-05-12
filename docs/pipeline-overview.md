@@ -74,9 +74,10 @@ When a PR review is submitted with state **APPROVED**:
 
 1. **Stale-approval check** — verifies `review.commit_id == pull_request.head.sha`
 2. **Required checks gate** — queries all check-runs for the head SHA; a check passes if **any** `completed + success` entry exists (not just the latest — avoids false failures from `skipped` entries created when `pull_request_review` fires)
-3. **Auto-merge** — creates a merge commit via GitHub API
-4. **Deploy** — checks out the merge commit SHA and runs `sf project deploy start`
-5. **CRT trigger** — fires the Copado Robotic Testing job
+3. **Architect gate** — for PRs targeting `main`, validates the approver is in the `ARCHITECTS` list; skipped for UAT and other branches
+4. **Auto-merge** — creates a merge commit via GitHub API immediately; outputs `merge_sha`
+5. **Deploy** — checks out the `merge_sha` and runs `sf project deploy start` with `NoTestRun` (tests already validated in Job 2)
+6. **CRT trigger** — fires the Copado Robotic Testing job
 
 ---
 

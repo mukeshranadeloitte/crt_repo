@@ -77,8 +77,8 @@ Once all automated checks are green:
 The `approval-merge-gate` job triggers automatically on your approval and will:
 - Verify the approval is for the latest commit SHA (stale approvals are rejected)
 - Confirm all required checks passed
-- Auto-merge the PR
-- Deploy to UAT org
+- **Immediately merge the PR** via GitHub API (merge commit created)
+- Deploy to UAT org from the merge commit
 - Trigger CRT smoke tests
 
 ---
