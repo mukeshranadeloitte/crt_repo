@@ -1,13 +1,56 @@
 # Azure DevOps — Salesforce UAT End-to-End Pipeline
 
-> **Purpose:** Step-by-step guide to set up the Salesforce CI/CD pipeline in your Azure DevOps project. Covers all prerequisites, variable configuration, pipeline registration, and branch protection rules.
+> **Purpose:** Guide to set up the Salesforce CI/CD pipeline in any Azure DevOps project.
+> Run the interactive setup script to generate a customised pipeline YAML for your project,
+> then follow the checklist to configure variables, secrets, and branch policies.
+
+---
+
+## How to Use This Guide
+
+### Option A — Interactive Setup Script _(Recommended)_
+
+The `setup.py` script asks you a series of questions (branches, org alias, reviewers, architects, etc.) and **generates a ready-to-use pipeline YAML** tailored to your project, plus a filled-in variable checklist.
+
+**Requirements:** Python 3.8 or later (standard library only — no pip install needed)
+
+```bash
+# 1. Clone this repo (or copy the ado-pipelines/ folder into your project)
+git clone https://github.com/mukeshranadeloitte/crt_repo.git
+cd crt_repo
+
+# 2. Run the setup script
+python3 ado-pipelines/setup.py
+
+# 3. The script will ask questions like:
+#    - Project name?
+#    - ADO organisation and project?
+#    - Which branches should the pipeline run on?  e.g. uat, main
+#    - Deployment branch?                          e.g. uat
+#    - Salesforce org alias?                       e.g. uat
+#    - Who are the PR reviewers?                   e.g. user1, user2
+#    - Who are the Architects?                     e.g. user1, user2
+#    - CRT job/project/org IDs?
+#    - Are you using CheckMarx or Fortify?
+#
+# 4. Generated files are written to:
+#    ado-pipelines/generated/e2e-pipeline.yml          ← copy to your repo
+#    ado-pipelines/generated/update-delta-on-push.yml  ← copy to your repo
+#    ado-pipelines/generated/variable-checklist.md     ← your personalised setup guide
+```
+
+After running, open `ado-pipelines/generated/variable-checklist.md` — it contains your project-specific variable values and a go-live checklist.
+
+### Option B — Manual Setup
+
+Use the manual steps in this document if you prefer not to run the script. The script just automates the find-and-replace of branch names, reviewer lists, and org aliases in the template YAML files.
 
 ---
 
 ## Table of Contents
 
 1. [Pipeline Overview](#1-pipeline-overview)
-2. [Prerequisites](#2-prerequisites)
+2. [Prerequisites — What You Need Before Starting](#2-prerequisites--what-you-need-before-starting)
 3. [Step 1 — Create the Variable Group](#3-step-1--create-the-variable-group)
 4. [Step 2 — Create the ADO Environment (Architect Approval Gate)](#4-step-2--create-the-ado-environment-architect-approval-gate)
 5. [Step 3 — Register the Pipelines in ADO](#5-step-3--register-the-pipelines-in-ado)
@@ -26,8 +69,8 @@ Two YAML pipeline files power this workflow:
 
 | File | Purpose | Trigger |
 |------|---------|---------|
-| `ado-pipelines/e2e-uat-pipeline.yml` | Main CI/CD pipeline — PR validation, security scans, deployment, CRT tests | PR to `uat`/`main`; manual |
-| `ado-pipelines/update-delta-on-uat-push.yml` | Keeps delta baseline current on every UAT push | Every push to `uat` |
+| `ado-pipelines/e2e-pipeline.yml` | Main CI/CD pipeline — PR validation, security scans, deployment, CRT tests | PR to `uat`/`main`; manual |
+| `ado-pipelines/update-delta-on-push.yml` | Keeps delta baseline current on every UAT push | Every push to `uat` |
 
 **Pipeline stages:**
 
@@ -54,8 +97,8 @@ Two YAML pipeline files power this workflow:
 │  │ approval_merge   │──▶│ deploy_after_    │──▶│ trigger_  │  │
 │  │ _gate            │   │ merge            │   │ crt_tests │  │
 │  │ (ADO Environment │   │ • Delta deploy   │   │           │  │
-│  │  approval gate)  │   │ • NoTestRun      │   │           │  │
-│  └──────────────────┘   │ • Update delta   │   └───────────┘  │
+│  │  approval gate)  │   │ • NoTestRun      │   └───────────┘  │
+│  └──────────────────┘   │ • Update delta   │                   │
 │                         │   baseline       │                   │
 │                         └──────────────────┘                   │
 └─────────────────────────────────────────────────────────────────┘
@@ -63,114 +106,145 @@ Two YAML pipeline files power this workflow:
 
 ---
 
-## 2. Prerequisites
+## 2. Prerequisites — What You Need Before Starting
 
-Ensure the following tools and access are in place before starting:
+Gather the following before running the setup script or starting manual setup.
 
-| Requirement | Details |
-|-------------|---------|
-| **Salesforce CLI** | Installed on build agents via `npm install --global @salesforce/cli` (pipeline handles this) |
-| **sfdx-git-delta** | Installed by pipeline via `sf plugins install sfdx-git-delta` |
-| **Salesforce Code Analyzer** | Installed by pipeline via `sf plugins install @salesforce/sfdx-scanner` |
-| **ADO Personal Access Token** | Scope: `Code (Read)`, `Build (Read & Execute)`, `Variable Groups (Read & Manage)`, `Pull Request Threads (Read & Write)` |
-| **SF SFDX Auth URL** | Generate via `sf org display --target-org <alias> --verbose` → copy the `Sfdx Auth Url` |
-| **CRT API Token** | Copado Robotic Testing External Personal Access Token from Copado settings |
+### Tools
+
+| Tool | Required | Notes |
+|------|----------|-------|
+| **Python 3.8+** | For running `setup.py` | `python3 --version` to check |
+| **Git** | Yes | To checkout full history (`fetch-depth: 0`) |
+| **Salesforce CLI** | Installed by pipeline | `npm install --global @salesforce/cli` runs in the pipeline agent |
+| **sfdx-git-delta** | Installed by pipeline | Pipeline installs via `sf plugins install sfdx-git-delta` |
+| **Salesforce Code Analyzer** | Installed by pipeline | Pipeline installs via `sf plugins install @salesforce/sfdx-scanner` |
+
+### Credentials / Tokens You Must Obtain
+
+#### 1. SFDX Auth URL (for Salesforce org authentication)
+
+```bash
+# Authenticate the target org locally first
+sf org login web --alias uat
+
+# Then retrieve the auth URL
+sf org display --target-org uat --verbose
+# Look for the line:  Sfdx Auth Url   force://...
+# Copy the full value starting with "force://"
+```
+
+Store this as the `CRT_UAT_AUTHURL` secret in the variable group.
+
+#### 2. Azure DevOps Personal Access Token (ADO_PAT)
+
+The pipeline uses this token to:
+- Add PR reviewers
+- Post PR comments
+- Update the `DELTA_FROM_COMMIT` variable after deployment
+
+**Required scopes when creating the PAT:**
+
+| Scope | Permission |
+|-------|-----------|
+| Code | Read |
+| Build | Read & Execute |
+| Variable Groups | Read & Manage |
+| Pull Request Threads | Read & Write |
+| Identity | Read |
+
+> Go to **ADO → User Settings (top right) → Personal access tokens → New Token**
+
+#### 3. CRT API Token _(if using Copado Robotic Testing)_
+
+Go to **Copado → Settings → External Personal Access Tokens → New Token**
+
+Copy the token value — it can only be seen once.
+
+#### 4. CheckMarx / Fortify credentials _(optional)_
+
+Only needed if your project uses these scanners. Obtain from your security team.
 
 ---
 
 ## 3. Step 1 — Create the Variable Group
 
-All secrets and configuration are stored in an ADO **Library Variable Group** named `salesforce-uat`.
-
-### 3.1 Create the Variable Group
+All pipeline configuration lives in an ADO **Library Variable Group**.
 
 1. Go to **Pipelines → Library → + Variable group**
 2. Name it exactly: `salesforce-uat`
-3. Add the following variables:
+3. Add the variables below (mark secrets as secret by clicking the lock icon)
 
-#### Salesforce Variables
+### Salesforce Variables
 
-| Variable Name | Value | Secret? |
-|---------------|-------|---------|
-| `ORG_ALIAS` | `uat` (or your org alias) | No |
-| `DELTA_FROM_COMMIT` | _(set in Step 5)_ | No |
-| `COVERAGE_THRESHOLD` | `85` | No |
-| `SOURCE_DIR` | `force-app/main/default` | No |
-| `SCA_ENFORCEMENT_MODE` | `enforce` | No |
-| `CRT_UAT_AUTHURL` | _(SFDX auth URL — see below)_ | **Yes** |
+| Variable | Example Value | Secret? | How to get it |
+|----------|--------------|---------|--------------|
+| `ORG_ALIAS` | `uat` | No | Your Salesforce org alias |
+| `DELTA_FROM_COMMIT` | _(set in Step 5)_ | No | SHA of last deployed commit to target branch |
+| `COVERAGE_THRESHOLD` | `85` | No | Minimum Apex code coverage % (1–100) |
+| `SOURCE_DIR` | `force-app/main/default` | No | Relative path to Salesforce source |
+| `SCA_ENFORCEMENT_MODE` | `enforce` | No | `enforce` / `warn` / `off` — see [SCA section](#10-sca-waivers) |
+| `CRT_UAT_AUTHURL` | `force://...` | **✅ Yes** | `sf org display --target-org <alias> --verbose` |
 
-> **How to get the SFDX Auth URL:**
-> ```bash
-> sf org display --target-org <your-uat-alias> --verbose
-> # Copy the value next to "Sfdx Auth Url"
-> ```
+### ADO Variables
 
-#### ADO Variables
+| Variable | Example Value | Secret? | Notes |
+|----------|--------------|---------|-------|
+| `ADO_PAT` | _(token)_ | **✅ Yes** | Personal Access Token — see [Prerequisites](#2-prerequisites--what-you-need-before-starting) |
+| `DEPLOY_PIPELINE_ID` | `42` | No | Fill after Step 3 — pipeline definition ID from ADO URL |
+| `VARIABLE_GROUP_ID` | `7` | No | Visible in URL after saving: `...variableGroups?groupId=7` |
 
-| Variable Name | Value | Secret? |
-|---------------|-------|---------|
-| `ADO_PAT` | _(your Personal Access Token)_ | **Yes** |
-| `DEPLOY_PIPELINE_ID` | _(set after Step 3 — pipeline definition ID)_ | No |
-| `VARIABLE_GROUP_ID` | _(ID of this variable group — visible in URL after saving)_ | No |
+### CRT Variables _(skip if not using CRT)_
 
-#### CRT Variables
+| Variable | Example Value | Secret? | How to get it |
+|----------|--------------|---------|--------------|
+| `CRT_API_TOKEN` | _(token)_ | **✅ Yes** | Copado → Settings → External Personal Access Tokens |
+| `CRT_JOB_ID` | `115686` | No | Copado CRT → your test job ID |
+| `CRT_PROJECT_ID` | `73283` | No | Copado CRT → project ID |
+| `CRT_ORG_ID` | `43532` | No | Copado CRT → org ID |
 
-| Variable Name | Value | Secret? |
-|---------------|-------|---------|
-| `CRT_API_TOKEN` | _(Copado Robotic Testing API token)_ | **Yes** |
-| `CRT_JOB_ID` | `115686` (or your job ID) | No |
-| `CRT_PROJECT_ID` | `73283` (or your project ID) | No |
-| `CRT_ORG_ID` | `43532` (or your org ID) | No |
+### CheckMarx Variables _(skip if not using CheckMarx)_
 
-#### CheckMarx Variables _(optional — skip if not using CheckMarx)_
+| Variable | Secret? |
+|----------|---------|
+| `CX_BASE_URI` | **✅ Yes** |
+| `CX_TENANT` | **✅ Yes** |
+| `CX_CLIENT_ID` | **✅ Yes** |
+| `CX_CLIENT_SECRET` | **✅ Yes** |
+| `CX_PROJECT_NAME` | No |
 
-| Variable Name | Value | Secret? |
-|---------------|-------|---------|
-| `CX_BASE_URI` | _(CheckMarx AST URL)_ | **Yes** |
-| `CX_TENANT` | _(CheckMarx tenant name)_ | **Yes** |
-| `CX_CLIENT_ID` | _(CheckMarx client ID)_ | **Yes** |
-| `CX_CLIENT_SECRET` | _(CheckMarx client secret)_ | **Yes** |
-| `CX_PROJECT_NAME` | _(project name — optional)_ | No |
+### Fortify Variables _(skip if not using Fortify)_
 
-#### Fortify Variables _(optional — skip if not using Fortify)_
+| Variable | Secret? |
+|----------|---------|
+| `FOD_URL` | No |
+| `FOD_CLIENT_ID` | **✅ Yes** |
+| `FOD_CLIENT_SECRET` | **✅ Yes** |
+| `FOD_APP_NAME` | **✅ Yes** |
+| `FOD_RELEASE_NAME` | **✅ Yes** |
 
-| Variable Name | Value | Secret? |
-|---------------|-------|---------|
-| `FOD_URL` | _(Fortify on Demand URL)_ | No |
-| `FOD_CLIENT_ID` | _(Fortify client ID)_ | **Yes** |
-| `FOD_CLIENT_SECRET` | _(Fortify client secret)_ | **Yes** |
-| `FOD_APP_NAME` | _(Fortify app name)_ | **Yes** |
-| `FOD_RELEASE_NAME` | _(Fortify release name)_ | **Yes** |
-
-4. Click **Save**
-5. Note the **Variable Group ID** from the URL: `.../_library/variableGroups?groupId=XX` → set `VARIABLE_GROUP_ID` to `XX`
+4. After saving, note the **Variable Group ID** from the URL: `...variableGroups?groupId=XX`
+   → Update `VARIABLE_GROUP_ID` in the group to this number.
 
 ---
 
 ## 4. Step 2 — Create the ADO Environment (Architect Approval Gate)
 
-The deployment stage uses an ADO **Environment** with required approvals to enforce that only Architects can approve a production/UAT deployment.
+The deployment stage requires an ADO **Environment** with approval gates so only architects can approve a deployment.
 
-### 4.1 Create the Environment
-
-1. Go to **Pipelines → Environments → New environment**
-2. **Name:** `uat-deployment`
-3. **Resource:** None (just the environment shell)
+1. **Pipelines → Environments → New environment**
+2. **Name:** `uat-deployment` _(or the name you chose in setup.py)_
+3. **Resource:** None
 4. Click **Create**
-
-### 4.2 Add Approval Gate
-
-1. Open `uat-deployment` environment
-2. Click **⋮ (More actions) → Approvals and checks → +**
-3. Select **Approvals**
-4. Add approvers:
+5. Open the environment → **⋮ → Approvals and checks → + → Approvals**
+6. **Add approvers** — add each architect's ADO username:
    - `chorevathi-deloitte`
    - `mukeshranadeloitte`
-5. Set **Instructions to approvers:** `Architect approval required. Verify PR has passed all checks before approving deployment.`
-6. **Timeout:** 7 days (or your preferred window)
-7. Click **Create**
+7. **Instructions to approvers:** `Architect approval required. Verify all PR checks passed before approving.`
+8. **Timeout:** 7 days
+9. Click **Create**
 
-> **Note:** The pipeline also enforces the architect list in code (for main-branch deployments). Both layers of protection are active.
+> **Note:** The pipeline YAML also enforces the architect list in code for `main`-branch deployments. Both layers of protection are active.
 
 ---
 
@@ -178,27 +252,26 @@ The deployment stage uses an ADO **Environment** with required approvals to enfo
 
 ### 5.1 Register the Main E2E Pipeline
 
-1. Go to **Pipelines → New pipeline**
-2. Select **Azure Repos Git** (or your source)
-3. Select your repository
-4. Select **Existing Azure Pipelines YAML file**
-5. Branch: `main` (or `uat`)
-6. Path: `/ado-pipelines/e2e-uat-pipeline.yml`
-7. Click **Continue → Save** (do not Run yet)
-8. **Rename** the pipeline to: `Salesforce UAT E2E Pipeline`
-9. Note the **Pipeline ID** from the URL: `.../_build?definitionId=XX` → set `DEPLOY_PIPELINE_ID` to `XX`
+1. **Pipelines → New pipeline**
+2. Select **Azure Repos Git** → select your repository
+3. Select **Existing Azure Pipelines YAML file**
+4. Branch: `main` | Path: `/ado-pipelines/e2e-pipeline.yml`
+   _(if you used setup.py, copy generated files to your repo first)_
+5. Click **Continue → Save** (do not Run yet)
+6. Rename the pipeline to: `Salesforce UAT E2E Pipeline`
+7. Note the **Pipeline Definition ID** from the URL: `.../_build?definitionId=42`
+   → Set `DEPLOY_PIPELINE_ID` to this number in the variable group
 
-### 5.2 Register the Delta Baseline Updater Pipeline
+### 5.2 Register the Delta Baseline Updater
 
-1. Go to **Pipelines → New pipeline**
-2. Same steps as above
-3. Path: `/ado-pipelines/update-delta-on-uat-push.yml`
-4. Click **Continue → Save**
-5. **Rename** to: `Update Delta Baseline on UAT Push`
+1. **Pipelines → New pipeline → Azure Repos Git → your repo**
+2. Path: `/ado-pipelines/update-delta-on-push.yml`
+3. Click **Continue → Save**
+4. Rename to: `Update Delta Baseline on UAT Push`
 
 ### 5.3 Link the Variable Group to Both Pipelines
 
-For each pipeline:
+For **each** pipeline:
 1. Open the pipeline → **Edit → Variables → Variable groups**
 2. Click **Link variable group** → select `salesforce-uat`
 3. Save
@@ -207,54 +280,41 @@ For each pipeline:
 
 ## 6. Step 4 — Configure Branch Policies
 
-Set branch policies on `uat` and `main` to require the pipeline to pass before PRs can be merged.
+Set branch policies on your target branches (`uat`, `main`) to require the pipeline to pass before merging.
 
-### 6.1 Add Build Validation Policy (uat branch)
-
-1. Go to **Project Settings → Repos → Branches**
+1. **Project Settings → Repos → Branches**
 2. Click `...` next to `uat` → **Branch policies**
-3. Under **Build validation → + Add build policy**:
+3. **Build validation → + Add build policy**:
    - **Build pipeline:** `Salesforce UAT E2E Pipeline`
    - **Trigger:** Automatic
    - **Policy requirement:** Required
    - **Display name:** `Salesforce PR Validation`
 4. Click **Save**
+5. Repeat for `main` branch
 
-### 6.2 Add the same policy to `main` branch
-
-Repeat the steps above for the `main` branch.
-
-### 6.3 Restrict direct pushes (recommended)
-
-On both `uat` and `main`:
-- Enable **Require a minimum number of reviewers:** 1
-- Enable **Check for linked work items** (optional)
-- Enable **Block direct pushes** to ensure all changes go through PRs
-
-> **Note:** The `update-delta-on-uat-push.yml` pipeline handles the case where direct pushes to `uat` are permitted by updating `DELTA_FROM_COMMIT` automatically.
+**Recommended additional policies (both branches):**
+- ✅ Require a minimum number of reviewers: 1
+- ✅ Block direct pushes to main
+- ✅ Check for linked work items (optional)
 
 ---
 
 ## 7. Step 5 — Set the Delta Baseline (First-Time Only)
 
-`DELTA_FROM_COMMIT` must point to the last commit that was deployed to UAT. On first setup, set it to the current `uat` branch tip.
-
-### 7.1 Get the current UAT branch tip SHA
+`DELTA_FROM_COMMIT` tells the pipeline where to start the delta calculation — it should be the SHA of the last commit that was deployed to the target org.
 
 ```bash
+# Get the current tip of your deployment branch
 git checkout uat
 git rev-parse HEAD
-# Example output: a1b2c3d4e5f6...
+# Example:  a1b2c3d4e5f6789012345678901234567890abcd
 ```
 
-### 7.2 Update the variable
+1. **Pipelines → Library → salesforce-uat**
+2. Find `DELTA_FROM_COMMIT` → set the value to the SHA above
+3. Save
 
-1. Go to **Pipelines → Library → salesforce-uat**
-2. Find `DELTA_FROM_COMMIT`
-3. Set the value to the SHA from Step 7.1
-4. Click **Save**
-
-> After this, every deployment automatically updates `DELTA_FROM_COMMIT` to the latest deployed SHA. Every push to `uat` (including direct pushes) also updates it via the delta baseline updater pipeline.
+> After first setup, every deployment automatically updates `DELTA_FROM_COMMIT` to the deployed SHA. The `update-delta-on-push.yml` pipeline also updates it on any direct push to the UAT branch.
 
 ---
 
@@ -262,20 +322,20 @@ git rev-parse HEAD
 
 ### Stage 1: PR Validation
 
-| Job | What it does | Condition |
+| Job | What it does | Runs when |
 |-----|-------------|-----------|
-| **Evaluate Scanner Availability** | Checks which security scanners are configured based on available secrets | Always |
-| **Salesforce PR validation** | Full SF check-only deploy: delta build → validate → coverage → SCA → reviewer notify | PR events only |
-| **CheckMarx AST Scan** | SAST scan using CheckMarx AST | Only if `CX_CLIENT_SECRET` is set |
-| **Fortify on Demand Scan** | SAST/DAST scan using Fortify on Demand | Only if `FOD_CLIENT_SECRET` is set |
+| **Evaluate Scanner Availability** | Checks which security scanners are configured | Every PR |
+| **Salesforce PR validation** | Delta build → check-only deploy → coverage check → SCA → reviewer notify | PR to target branches |
+| **CheckMarx AST Scan** | SAST scan | PR; only if `CX_CLIENT_SECRET` is set |
+| **Fortify on Demand Scan** | SAST/DAST scan | PR; only if `FOD_CLIENT_SECRET` is set |
 
 ### Stage 2: Deployment
 
-| Job | What it does | Condition |
+| Job | What it does | Runs when |
 |-----|-------------|-----------|
-| **Approval + Merge Gate** | Waits for architect approval via ADO Environment gate | Manual trigger / post-PR |
-| **Deploy merged commit** | Delta deploy to UAT org (`NoTestRun` — tests already ran in validation) | After gate approval |
-| **Trigger CRT Tests** | Triggers Copado Robotic Testing job and polls for result | After deployment succeeds |
+| **Approval + Merge Gate** | Waits for architect approval via ADO Environment | Manual trigger |
+| **Deploy merged commit** | Delta deploy (`NoTestRun` — tests ran in validation) | After gate approved |
+| **Trigger CRT Tests** | Runs CRT test job, polls for result, posts summary | After deployment succeeds |
 
 ---
 
@@ -284,68 +344,60 @@ git rev-parse HEAD
 ### PR Validation Flow
 
 ```
-Developer opens PR (feature → uat or uat → main)
+Developer opens PR (feature → uat  OR  uat → main)
         │
         ▼
 [Pipeline auto-triggers via branch policy]
         │
-        ├──▶ Request reviewers (ss10del, chorevathi-deloitte — excluding PR author)
-        ├──▶ Checkout full git history
-        ├──▶ Authenticate SF org (SFDX Auth URL)
-        ├──▶ Build delta: only changed components since last deploy
-        ├──▶ Check-only deploy to UAT org (--dry-run)
-        │       └── Poll for completion, show component/test table
-        ├──▶ Check Apex test coverage (threshold: COVERAGE_THRESHOLD %)
-        ├──▶ Run Salesforce Code Analyzer (sf scanner run)
-        ├──▶ Evaluate violations against sf-scanner-waivers.csv (from main branch)
-        ├──▶ Post SCA governance report as PR comment
-        └──▶ Notify reviewers: "✅ All checks passed — ready for review"
+        ├─ Request reviewers via ADO API (excluding PR author)
+        ├─ Checkout full git history
+        ├─ Authenticate Salesforce org (SFDX auth URL)
+        ├─ Build delta: changed components since DELTA_FROM_COMMIT
+        ├─ Check-only deploy to org (--dry-run)
+        │     └─ Poll for completion; show component/test progress table
+        ├─ Check Apex test coverage (threshold: COVERAGE_THRESHOLD %)
+        ├─ Run Salesforce Code Analyzer (sf scanner run)
+        ├─ Evaluate violations against sf-scanner-waivers.csv (from main)
+        ├─ Post SCA governance report as PR comment
+        └─ Notify reviewers: "✅ All checks passed — ready for review"
 ```
 
-### Test Class Resolution
+### Test Class Resolution Priority
 
-The pipeline resolves which test classes to run in this priority order:
+The pipeline resolves test classes in this order:
 
-1. **PR description** — Add `Tests: ClassName1, ClassName2` line in the PR body
-2. **Inferred by convention** — classes named `*Test`, `*Tests`, `*TestClass` matching changed classes
-3. **@isTest annotation** — scans changed `.cls` files for the annotation
+1. **PR description** — add `Tests: ClassName1, ClassName2` anywhere in the PR body
+2. **Inferred by naming convention** — classes matching `*Test`, `*Tests`, `*TestClass` for each changed class
+3. **`@isTest` annotation** — scans changed `.cls` files for the annotation
 4. **No Apex changed** — skips test execution (`NoTestRun`)
 
 ### Deployment Flow
 
 ```
-Architect approves PR in ADO (approval gate on uat-deployment environment)
+Architect approves the deployment request in ADO
         │
         ▼
 [Deployment stage triggers]
         │
-        ├──▶ Architect gate check (validates approver is in ARCHITECTS list for main)
-        ├──▶ Rebuild delta: DELTA_FROM_COMMIT → HEAD
-        ├──▶ Deploy to UAT org (--test-level NoTestRun — tests already validated)
-        │       └── Poll for completion
-        ├──▶ Update DELTA_FROM_COMMIT → deployed commit SHA
-        └──▶ Trigger CRT automated tests → poll → post summary
+        ├─ Architect gate: validate approver is in ARCHITECTS list (main branch only)
+        ├─ Rebuild delta: DELTA_FROM_COMMIT → HEAD
+        ├─ Deploy to org (--test-level NoTestRun — tests already validated)
+        │     └─ Poll for completion
+        ├─ Update DELTA_FROM_COMMIT → deployed commit SHA
+        └─ Trigger CRT automated tests → poll → post summary
 ```
-
-### SCA Enforcement Modes
-
-Control via `SCA_ENFORCEMENT_MODE` variable:
-
-| Mode | Behavior |
-|------|---------|
-| `enforce` | ❌ Fails if expired waivers or unwaived violations found |
-| `warn` | ⚠️ Reports violations as warnings; pipeline continues |
-| `off` | Skips all SCA steps entirely |
 
 ---
 
 ## 10. SCA Waivers
 
-Violations can be waived by adding entries to `.github/sf-scanner-waivers.csv`.
+Violations can be waived by editing `.github/sf-scanner-waivers.csv`.
 
-> **Important:** The pipeline always reads waivers from the `main` branch — changes in feature branches are ignored. Only commits to `main` take effect.
+> **Important:** The pipeline always reads waivers from the `main` branch — changes in feature branches are ignored. Only commits merged to `main` take effect.
 
 ### Waiver File Format
+
+File path: `.github/sf-scanner-waivers.csv`
 
 ```csv
 Component,Rule,Description,ExpiryDate,Status
@@ -354,18 +406,26 @@ force-app/main/default/classes/CoverageDemoService.cls,ApexDoc,Missing ApexDoc c
 
 | Column | Description |
 |--------|-------------|
-| `Component` | File path (partial match) or leave blank to match all files |
-| `Rule` | Rule name from the scanner (e.g. `ApexDoc`, `AvoidGlobalModifier`) |
+| `Component` | File path (partial match) — leave blank to match all files |
+| `Rule` | Scanner rule name e.g. `ApexDoc`, `AvoidGlobalModifier` |
 | `Description` | Human-readable reason for the waiver |
-| `ExpiryDate` | `YYYY-MM-DD` — waiver expires after this date |
-| `Status` | `ACTIVE` = active waiver; `REVOKED` = waiver removed |
+| `ExpiryDate` | `YYYY-MM-DD` — waiver expires on this date |
+| `Status` | `ACTIVE` = active; `REVOKED` = waiver removed |
 
-### Waiver States Reported by Pipeline
+### SCA Enforcement Modes
+
+| Mode | Behavior |
+|------|---------|
+| `enforce` | ❌ Fails if expired waivers or unwaived violations found |
+| `warn` | ⚠️ Reports violations as warnings; pipeline continues |
+| `off` | Skips all SCA steps |
+
+### Waiver Summary Table (in PR comment)
 
 | State | Meaning |
 |-------|---------|
 | ✅ Waived (active) | Valid waiver — violation suppressed |
-| ⏰ Expiring ≤30 days | Active but expiring soon — action needed |
+| ⏰ Expiring ≤30 days | Active but expiring soon — fix or renew |
 | ❌ Expired | Waiver date passed — **fails in enforce mode** |
 | ⚠️ Unwaived | No matching waiver — **fails in enforce mode** |
 
@@ -375,97 +435,90 @@ force-app/main/default/classes/CoverageDemoService.cls,ApexDoc,Missing ApexDoc c
 
 ### Pipeline doesn't trigger on PR
 
-**Check:**
-- Branch policy is set to **Required** on the target branch (`uat` / `main`)
-- PR paths include `force-app/**` — PRs that only change docs won't trigger
+- Check that the branch policy is **Required** on the target branch
+- Check that the PR touches `force-app/**` — PRs only changing docs won't trigger (by path filter design)
 
 ---
 
-### `DELTA_FROM_COMMIT` not found or empty
+### `DELTA_FROM_COMMIT` not set or empty
 
-**Fix:** Follow [Step 5](#7-step-5--set-the-delta-baseline-first-time-only) to set the initial baseline SHA.
+Follow [Step 5](#7-step-5--set-the-delta-baseline-first-time-only) to set the baseline SHA. This must be done once on first setup.
 
 ---
 
-### SF authentication fails
+### Salesforce authentication fails
 
-**Check:**
-- `CRT_UAT_AUTHURL` secret in the variable group is not empty
-- The SFDX auth URL hasn't expired (connected app session)
-- Re-generate: `sf org display --target-org <alias> --verbose`
+- Check `CRT_UAT_AUTHURL` secret is not empty in the variable group
+- The SFDX auth URL may have expired (connected app session). Re-generate:
+  ```bash
+  sf org display --target-org <alias> --verbose
+  ```
 
 ---
 
 ### Check-only deploy fails with component errors
 
-**Check:**
-- The changed components are valid in the UAT org's API version
-- Run locally: `sf project deploy start --dry-run --manifest package/package.xml --target-org <alias>`
+- Run locally to diagnose: `sf project deploy start --dry-run --manifest package/package.xml --target-org <alias>`
+- Check that changed components exist in the target org's API version
 
 ---
 
 ### Coverage check fails
 
-**Check:**
 - Add `Tests: ClassName` to your PR description
-- Ensure the test class covers the changed production class
-- Coverage threshold is configurable via `COVERAGE_THRESHOLD` variable (default: 85%)
+- Ensure the test class exercises the changed production class
+- Adjust `COVERAGE_THRESHOLD` in the variable group if needed
 
 ---
 
-### Architect gate fails (wrong approver)
+### Architect gate fails
 
-The pipeline enforces that only architects can approve main-branch deployments.
+Only architects can approve main-branch deployments. To add an architect, edit **both**:
 
-**To add an architect:** Edit the `ARCHITECTS` array in `ado-pipelines/e2e-uat-pipeline.yml`:
-```yaml
-ARCHITECTS=("chorevathi-deloitte" "mukeshranadeloitte" "new-architect-username")
-```
-Also add them as an approver in the `uat-deployment` ADO Environment.
+1. `ARCHITECTS` array in `ado-pipelines/e2e-pipeline.yml`
+2. Approvers list in the `uat-deployment` ADO Environment
 
 ---
 
-### ADO_PAT permissions error
+### `ADO_PAT` permissions error
 
-**Check the PAT has these scopes:**
-- Code: `Read`
-- Build: `Read & Execute`
-- Variable Groups: `Read & Manage`
-- Pull Request Threads: `Read & Write`
-- Identity: `Read`
+Ensure the PAT has:
 
----
-
-### CRT job not triggering
-
-**Check:**
-- `CRT_API_TOKEN` secret is set and not expired
-- `CRT_JOB_ID`, `CRT_PROJECT_ID`, `CRT_ORG_ID` match your Copado project settings
-- The UAT deployment succeeded before this job runs
+| Scope | Permission needed |
+|-------|-----------------|
+| Code | Read |
+| Build | Read & Execute |
+| Variable Groups | Read & Manage |
+| Pull Request Threads | Read & Write |
+| Identity | Read |
 
 ---
 
-### DELTA_FROM_COMMIT not updating after deployment
+### `DELTA_FROM_COMMIT` not updating after deployment
 
-The pipeline updates this variable via ADO REST API using `ADO_PAT`. If it fails:
+The pipeline updates this via ADO REST API. If it fails:
 
-1. Check `ADO_PAT` has **Variable Groups: Read & Manage** scope
-2. Check `DEPLOY_PIPELINE_ID` is set to the correct pipeline definition ID
-3. Fallback: manually update `DELTA_FROM_COMMIT` in the variable group to `git rev-parse HEAD` on UAT branch
+1. Verify `ADO_PAT` has Variable Groups: Read & Manage
+2. Verify `DEPLOY_PIPELINE_ID` matches the actual pipeline definition ID
+3. Manual fallback: run `git rev-parse HEAD` on the deployment branch and update the variable group manually
 
 ---
 
 ## Quick Start Checklist
 
 ```
-□ 1. Create variable group 'salesforce-uat' with all required variables
-□ 2. Create ADO Environment 'uat-deployment' with architect approvers
-□ 3. Register e2e-uat-pipeline.yml as pipeline 'Salesforce UAT E2E Pipeline'
-□ 4. Register update-delta-on-uat-push.yml as pipeline 'Update Delta Baseline on UAT Push'
-□ 5. Link variable group 'salesforce-uat' to both pipelines
-□ 6. Note DEPLOY_PIPELINE_ID and VARIABLE_GROUP_ID — update in variable group
-□ 7. Add branch policy on 'uat' and 'main' — require 'Salesforce PR Validation' to pass
-□ 8. Set DELTA_FROM_COMMIT to current UAT branch tip SHA
-□ 9. Open a test PR to uat branch and verify pipeline triggers
-□ 10. Verify SCA waiver file exists at .github/sf-scanner-waivers.csv on main branch
+□ Ran setup.py and reviewed generated files
+□ Variable group 'salesforce-uat' created with all variables
+□ CRT_UAT_AUTHURL secret set (SFDX auth URL)
+□ ADO_PAT secret set with correct scopes
+□ ADO Environment 'uat-deployment' created with approval gates
+□ Architect approvers added to environment
+□ e2e-pipeline.yml registered as pipeline in ADO
+□ update-delta-on-push.yml registered as pipeline in ADO
+□ Variable group linked to both pipelines
+□ DEPLOY_PIPELINE_ID and VARIABLE_GROUP_ID updated in variable group
+□ Branch policy added to all target branches
+□ DELTA_FROM_COMMIT set to current deployment branch tip SHA
+□ SCA waiver file at .github/sf-scanner-waivers.csv on main branch
+□ Test PR opened and pipeline triggered successfully
 ```
