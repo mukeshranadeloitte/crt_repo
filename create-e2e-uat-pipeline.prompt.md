@@ -2,7 +2,141 @@
 description: "Generate the complete UAT end-to-end GitHub Actions pipeline workflow (e2e-uat-pipeline.yml) from scratch, including all jobs, waiver files, and documentation markdown files"
 agent: "agent"
 tools: [read, edit, search]
-argument-hint: "Optionally specify customizations: target branch, org alias, coverage threshold, scanners to enable (checkmarx/fortify/all), CRT job/project/org IDs"
+argument-hint: "Optionally specify customizations: target branches, org alias, coverage threshold, scanners to enable (checkmarx/fortify/all), CRT job/project/org IDs"
+---
+
+<!--
+╔══════════════════════════════════════════════════════════════════════════╗
+║        HOW TO EXECUTE THIS PROMPT IN A NEW PROJECT                       ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║                                                                          ║
+║  1. Open VS Code in your Salesforce project root                         ║
+║  2. Open GitHub Copilot Chat (Ctrl+Alt+I)                                ║
+║  3. Switch to Agent mode (click the mode dropdown → "Agent")             ║
+║  4. Type:  /create-e2e-uat-pipeline                                      ║
+║     OR drag this file into the chat and press Enter                      ║
+║  5. Copilot will ask you configuration questions — answer each one       ║
+║  6. Copilot generates:                                                   ║
+║       .github/workflows/e2e-uat-pipeline.yml                             ║
+║       .github/sf-scanner-waivers.csv                                     ║
+║       docs/pipeline-setup.md                                             ║
+║       docs/sca-waivers.md                                                ║
+║       docs/manual_runbook.md                                             ║
+║       docs/troubleshooting.md                                            ║
+║                                                                          ║
+║  PRE-REQUISITES — gather these BEFORE running the prompt:               ║
+║                                                                          ║
+║  GitHub Secrets (Settings → Secrets → Actions → New repository secret): ║
+║  ┌────────────────────────┬─────────────────────────────────────────┐    ║
+║  │ Secret Name            │ How to Get It                           │    ║
+║  ├────────────────────────┼─────────────────────────────────────────┤    ║
+║  │ CRT_UAT_AUTHURL        │ sf org login web --alias uat            │    ║
+║  │                        │ sf org display --target-org uat         │    ║
+║  │                        │   --verbose  (copy "Sfdx Auth Url")     │    ║
+║  ├────────────────────────┼─────────────────────────────────────────┤    ║
+║  │ GH_PAT                 │ GitHub → Settings → Developer Settings  │    ║
+║  │                        │ → Fine-grained tokens → New token       │    ║
+║  │                        │ Scopes: Actions variables (read+write), │    ║
+║  │                        │ Pull requests (read+write),             │    ║
+║  │                        │ Contents (read)                         │    ║
+║  ├────────────────────────┼─────────────────────────────────────────┤    ║
+║  │ CRT_API_TOKEN          │ Copado → Settings →                     │    ║
+║  │                        │ External Personal Access Tokens         │    ║
+║  │                        │ → New Token  (copy once — not shown     │    ║
+║  │                        │ again)                                  │    ║
+║  ├────────────────────────┼─────────────────────────────────────────┤    ║
+║  │ CX_CLIENT_SECRET       │ Optional — from your CheckMarx team     │    ║
+║  ├────────────────────────┼─────────────────────────────────────────┤    ║
+║  │ FOD_CLIENT_SECRET      │ Optional — from your Fortify team       │    ║
+║  └────────────────────────┴─────────────────────────────────────────┘    ║
+║                                                                          ║
+║  GitHub Variables (Settings → Secrets → Actions → Variables tab):       ║
+║  ┌────────────────────────┬──────────┬──────────────────────────────┐    ║
+║  │ Variable Name          │ Default  │ Notes                        │    ║
+║  ├────────────────────────┼──────────┼──────────────────────────────┤    ║
+║  │ DELTA_FROM_COMMIT      │ (none)   │ Run: git rev-parse HEAD on   │    ║
+║  │                        │          │ your deployment branch first │    ║
+║  ├────────────────────────┼──────────┼──────────────────────────────┤    ║
+║  │ ORG_ALIAS              │ uat      │ Your SF org alias            │    ║
+║  ├────────────────────────┼──────────┼──────────────────────────────┤    ║
+║  │ COVERAGE_THRESHOLD     │ 85       │ Minimum Apex coverage %      │    ║
+║  ├────────────────────────┼──────────┼──────────────────────────────┤    ║
+║  │ SCA_ENFORCEMENT_MODE   │ enforce  │ enforce / warn / off         │    ║
+║  ├────────────────────────┼──────────┼──────────────────────────────┤    ║
+║  │ CRT_JOB_ID             │ (yours)  │ From Copado CRT → your job   │    ║
+║  ├────────────────────────┼──────────┼──────────────────────────────┤    ║
+║  │ CRT_PROJECT_ID         │ (yours)  │ From Copado CRT              │    ║
+║  ├────────────────────────┼──────────┼──────────────────────────────┤    ║
+║  │ CRT_ORG_ID             │ (yours)  │ From Copado CRT              │    ║
+║  └────────────────────────┴──────────┴──────────────────────────────┘    ║
+╚══════════════════════════════════════════════════════════════════════════╝
+-->
+
+## ⚡ Interactive Setup — Ask These Questions First
+
+**Before generating any files**, ask the DevOps engineer each of the following questions and record their answers. Use the answers to replace every placeholder in the generated workflow.
+
+```
+QUESTION 1 — Target branches
+  "Which branches should the pipeline trigger on?
+   (e.g. uat, main — list all, comma-separated)
+   Default: uat"
+
+QUESTION 2 — Deployment / primary branch
+  "Which is your deployment (primary) branch — the one Salesforce changes
+   are deployed FROM?
+   (e.g. uat)
+   Default: uat"
+
+QUESTION 3 — Salesforce org alias
+  "What is your Salesforce org alias?
+   (The alias you used when running: sf org login web --alias <alias>)
+   Default: uat"
+
+QUESTION 4 — Apex coverage threshold
+  "What minimum Apex test coverage % should the pipeline enforce?
+   Default: 85"
+
+QUESTION 5 — PR reviewers
+  "Who are the GitHub usernames of the default PR reviewers?
+   (comma-separated, e.g. user1, user2 — these will be auto-requested on
+   every PR)
+   Leave blank to skip auto-reviewer assignment."
+
+QUESTION 6 — Architects (merge gate approvers — main branch only)
+  "Who are the GitHub usernames of the Architects who can approve
+   deployments to main?
+   (comma-separated, e.g. architect1, architect2)
+   Leave blank to disable the architect gate."
+
+QUESTION 7 — Security scanners
+  "Which security scanners are you using?
+   Options: none | checkmarx | fortify | both
+   (CheckMarx and Fortify jobs are skipped automatically if the
+   corresponding secret is absent, so 'both' is safe even if you only
+   have one)
+   Default: none"
+
+QUESTION 8 — CRT (Copado Robotic Testing)
+  "Are you using Copado Robotic Testing (CRT) for automated smoke tests?
+   yes / no
+   If yes, please provide:
+     CRT_JOB_ID     (from Copado CRT → your test job)
+     CRT_PROJECT_ID (from Copado CRT → project)
+     CRT_ORG_ID     (from Copado CRT → org)"
+
+QUESTION 9 — SCA enforcement mode
+  "How should the pipeline handle Salesforce Code Analyzer violations?
+   enforce  — expired waivers and unwaived violations FAIL the pipeline
+   warn     — all violations are warnings only; pipeline always continues
+   off      — all SCA steps are skipped entirely
+   Default: enforce
+   (Tip: use 'off' or 'warn' during initial project setup; switch to
+   'enforce' when the codebase is clean)"
+```
+
+After collecting all answers, confirm them with the user in a summary table before generating any files. Then proceed with generation using the answers as substitution values throughout the workflow.
+
 ---
 
 Generate a complete Salesforce UAT End-to-End GitHub Actions pipeline. Use the existing workflow at `.github/workflows/e2e-uat-pipeline.yml` and associated files as reference implementations.
@@ -237,18 +371,28 @@ Results written to `sca-governance-report.csv` (includes Days_Left, Approved_Dat
 ---
 
 ## Instructions
-1. Read the existing workflow file at `.github/workflows/e2e-uat-pipeline.yml` first
-2. Generate or update each file listed above
-3. Preserve existing content in docs files — only add/update relevant sections
-4. Ensure YAML is valid — quote strings with colons, 2-space indentation
-5. Never use `--test-level NoTestRun` with `deploy validate` — omit the flag instead
-6. Never combine `--async` and `--wait` on the same deploy command
-7. Summarize what was created/updated and any required configuration
-8. `SCA_ENFORCEMENT_MODE` must be documented in every relevant doc file. Set it to `off` to bypass all SCA steps during initial project phase, `warn` for informational-only, `enforce` (default) to fail on expired waivers.
+1. **First** — ask all questions in the "Interactive Setup" section above and confirm answers before generating anything
+2. Read the existing workflow file at `.github/workflows/e2e-uat-pipeline.yml` for reference implementation
+3. Substitute user-provided values throughout all generated files:
+   - Replace `uat` branch references with the user's chosen target branches
+   - Replace `uat` org alias with `QUESTION 3` answer
+   - Replace coverage threshold with `QUESTION 4` answer
+   - Replace reviewer arrays with `QUESTION 5` answer
+   - Replace architect arrays with `QUESTION 6` answer
+   - Set `SCA_ENFORCEMENT_MODE` default to `QUESTION 9` answer
+   - Conditionally include/exclude CheckMarx and Fortify jobs based on `QUESTION 7`
+   - Conditionally include/exclude CRT job based on `QUESTION 8`
+4. Generate or update each file listed above
+5. Preserve existing content in docs files — only add/update relevant sections
+6. Ensure YAML is valid — quote strings with colons, 2-space indentation
+7. Never use `--test-level NoTestRun` with `deploy validate` — omit the flag instead
+8. Never combine `--async` and `--wait` on the same deploy command
+9. Summarize what was created/updated and list all required GitHub Secrets and Variables the user must configure (pre-filled with their answers where possible)
+10. `SCA_ENFORCEMENT_MODE` must be documented in every relevant doc file. Set it to `off` to bypass all SCA steps during initial project phase, `warn` for informational-only, `enforce` (default) to fail on expired waivers.
 
 ## Critical Code-Generation Rules (MUST follow — these prevent runtime errors)
 
-9. **Never use Python scripts for waiver checking.** All waiver logic (npm audit, SCA) must be pure bash + `jq`. Do NOT generate `cat > *.py << 'PYTHON_SCRIPT'` blocks for this purpose.
+11. **Never use Python scripts for waiver checking.** All waiver logic (npm audit, SCA) must be pure bash + `jq`. Do NOT generate `cat > *.py << 'PYTHON_SCRIPT'` blocks for this purpose.
 10. **Never embed bash control flow inside a heredoc.** When writing a file via `cat > file << 'HEREDOC'`, the content between the markers must be valid for that language only. Bash `if [ ... ]`, `while`, `for` etc. must be OUTSIDE any heredoc, not inside it. Example of the correct pattern:
     ```bash
     # CORRECT — bash guard wraps the heredoc
