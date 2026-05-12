@@ -88,10 +88,12 @@ pull_request ──────────────────────�
 pull_request_review (APPROVED) ────────────────────────────────
 │
 ├─► [5] approval-merge-gate
-│         │
+│         │  1. Validate freshness + required checks
+│         │  2. Architect gate (main branch only)
+│         │  3. MERGE PR immediately → outputs merge_sha
 │         ▼
 │   [6] deploy-after-merge
-│         │ ─ update DELTA_FROM_COMMIT via GH_PAT
+│         │  checkout merge_sha → deploy → update DELTA_FROM_COMMIT
 │         │
 │         ▼
 │   [7] trigger-crt-tests
@@ -150,20 +152,25 @@ pull_request_review (APPROVED) ────────────────�
 
 ### Job 5 — `approval-merge-gate`: Approval + Merge Gate
 - **Runs on:** `pull_request_review` (state=approved)
-- Verifies approval freshness, merges PR, outputs `merge_commit_sha`
+- **Permissions:** `actions: read`, `contents: write`, `pull-requests: write`
+- **Outputs:** `head_sha`, `base_sha`, `pr_number`, `merge_sha`
+- **Steps:**
+  1. **Validate approval freshness** — verifies `review.commit_id == pull_request.head.sha` (stale approvals rejected)
+  2. **Required checks gate** — queries all check-runs for head SHA; checks `Salesforce PR Validation` (+ CheckMarx/Fortify if secrets set); passes if **any** `completed + success` entry exists for each required check
+  3. **Architect gate** — if `base.ref == "main"`, validates that the approver is in the `ARCHITECTS` list (`chorevathi-deloitte`, `mukeshranadeloitte`); skipped for UAT and all other branches
+  4. **Merge pull request** — merges PR immediately via GitHub API (`PUT /pulls/{pr}/merge`); outputs `merge_sha` (the new merge commit SHA)
 
 ### Job 6 — `deploy-after-merge`: Deploy to UAT
 - **Needs:** `approval-merge-gate`
-- **Permissions:** `contents: write`
+- **Permissions:** `contents: write`, `pull-requests: write`
 - Steps:
-  1. Checkout merge commit + install SF CLI + authenticate org + install `sfdx-git-delta`
-  2. Build delta package: uses `git rev-parse HEAD^1` (UAT branch tip before this PR merged) as FROM for `sfdx-git-delta`. Falls back to `DELTA_FROM_COMMIT` only if `HEAD^1` unavailable (shallow clone).
+  1. Checkout **merge commit** (`merge_sha` from gate) + install SF CLI + authenticate org + install `sfdx-git-delta`
+  2. Build delta package: uses `base_sha` from gate outputs (UAT branch tip before PR merged) as FROM; falls back to `DELTA_FROM_COMMIT` variable if unavailable
   3. Display & upload delta artifacts
   4. **Prepare deploy manifests**: checks for `package.xml` / `destructiveChanges.xml`; does NOT infer or run test classes
   5. `sf project deploy start --async --test-level NoTestRun` → poll every 15s for live progress table (tests already ran during PR validation)
   6. Show component breakdown: ➕ CREATED / ✏️ UPDATED / 🗑️ DELETED per component
   7. Update `DELTA_FROM_COMMIT` via `git rev-parse HEAD` + GitHub API (`PATCH /actions/variables/DELTA_FROM_COMMIT`)
-  8. Merge pull request
 
 ### Job 7 — `trigger-crt-tests`: Trigger CRT Smoke Tests
 - **Needs:** `deploy-after-merge`
@@ -324,7 +331,8 @@ To see what was deployed in any run, check the `Display generated packages` step
 
 ## Constraints
 - NEVER remove `continue-on-error: true` from scanner or waiver-check steps
-- NEVER modify `approval-merge-gate` or `deploy-after-merge` approval logic without understanding the full gate chain
+- NEVER modify `approval-merge-gate` or `deploy-after-merge` approval logic without understanding the full gate chain: validate → architect gate → merge → deploy
+- **Merge happens in `approval-merge-gate` (step 4), NOT in `deploy-after-merge`.** The `deploy-after-merge` job checks out `merge_sha` from gate outputs; it does not merge the PR itself.
 - ALWAYS keep `needs:` dependencies consistent when adding jobs
 - ALWAYS add `approved_by` and `ticket` when adding waiver entries
 - ALWAYS update `docs/` when changing pipeline behaviour
