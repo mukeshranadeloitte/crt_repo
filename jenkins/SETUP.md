@@ -41,6 +41,35 @@ python3 jenkins/setup.py
 
 After running, open `jenkins/generated/credential-checklist.md` — it contains your project-specific credential IDs and a go-live checklist.
 
+### Option C — Module Snippets (Add specific stages to an existing Jenkinsfile)
+
+If your project **already has a Jenkinsfile** and you only need to add one or more specific stages (e.g. just the SCA scan, or just CRT tests), run `setup.py` and select **mode 2 — Module snippets**:
+
+```bash
+python3 jenkins/setup.py
+# Select mode: 2 (Module snippets)
+# Then pick which modules you want, e.g.:
+#   1. Salesforce Code Analyzer (SCA)
+#   2. Apex PR Validation
+#   3. CRT Test Trigger
+#   4. Architect Approval Gate
+#   5. CheckMarx AST Scan
+#   6. Fortify SAST/DAST
+```
+
+**What you get:**
+```
+jenkins/generated/modules/sca-stage.groovy              ← paste into your stages { } block
+jenkins/generated/modules/apex-validation-stage.groovy
+jenkins/generated/modules/crt-tests-stage.groovy
+jenkins/generated/modules/architect-gate-stage.groovy
+jenkins/generated/modules/checkmarx-stage.groovy
+jenkins/generated/modules/fortify-stage.groovy
+jenkins/generated/modules/integration-guide.md          ← prerequisites + integration steps
+```
+
+Each snippet file is **self-contained** — it includes a comment header listing every credential and environment variable it needs, so you know exactly what to configure in Jenkins before adding the stage.
+
 ### Option B — Manual Setup
 
 Use the manual steps in this document if you prefer not to run the script. The script automates the find-and-replace of branch names, reviewer lists, org aliases, and CRT IDs in the template Jenkinsfile.

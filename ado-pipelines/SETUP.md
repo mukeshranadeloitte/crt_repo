@@ -41,6 +41,35 @@ python3 ado-pipelines/setup.py
 
 After running, open `ado-pipelines/generated/variable-checklist.md` — it contains your project-specific variable values and a go-live checklist.
 
+### Option C — Module Snippets (Add specific jobs to an existing pipeline)
+
+If your project **already has a pipeline** and you only need to add one or more specific jobs (e.g. just the SCA scan, or just CRT tests), run `setup.py` and select **mode 2 — Module snippets**:
+
+```bash
+python3 ado-pipelines/setup.py
+# Select mode: 2 (Module snippets)
+# Then pick which modules you want, e.g.:
+#   1. Salesforce Code Analyzer (SCA)
+#   2. Apex PR Validation
+#   3. CRT Test Trigger
+#   4. Architect Approval Gate
+#   5. CheckMarx AST Scan
+#   6. Fortify SAST/DAST
+```
+
+**What you get:**
+```
+ado-pipelines/generated/modules/sca-job.yml             ← paste into your jobs: section
+ado-pipelines/generated/modules/apex-validation-job.yml
+ado-pipelines/generated/modules/crt-tests-job.yml
+ado-pipelines/generated/modules/architect-gate-job.yml  ← paste into your stages: section
+ado-pipelines/generated/modules/checkmarx-job.yml
+ado-pipelines/generated/modules/fortify-job.yml
+ado-pipelines/generated/modules/integration-guide.md    ← prerequisites + integration steps
+```
+
+Each snippet file is **self-contained** — it includes a comment header listing every credential and variable it needs, so you know exactly what to configure before pasting.
+
 ### Option B — Manual Setup
 
 Use the manual steps in this document if you prefer not to run the script. The script just automates the find-and-replace of branch names, reviewer lists, and org aliases in the template YAML files.

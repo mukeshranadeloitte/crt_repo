@@ -77,6 +77,22 @@ argument-hint: "Optionally specify customizations: target branches, org alias, c
 **Before generating any files**, ask the DevOps engineer each of the following questions and record their answers. Use the answers to replace every placeholder in the generated workflow.
 
 ```
+QUESTION 0 — Generation mode
+  "Do you want to:
+   (A) Generate a FULL pipeline from scratch, or
+   (B) Generate MODULE SNIPPETS to add specific jobs to an existing workflow?
+
+   Available modules:
+     1. Salesforce Code Analyzer (SCA) — sf scanner run + waiver check
+     2. Apex PR Validation             — delta build + check-only deploy + coverage
+     3. CRT Test Trigger               — Copado Robotic Testing trigger + polling
+     4. Architect Approval Gate        — GitHub Actions: require architect approval before deploy
+     5. CheckMarx AST Scan             — SAST security scan
+     6. Fortify SAST/DAST              — Fortify on Demand scan
+
+   If (B), which modules? (list numbers, or 'all')
+   Default: A (full pipeline)"
+
 QUESTION 1 — Target branches
   "Which branches should the pipeline trigger on?
    (e.g. uat, main — list all, comma-separated)
@@ -372,8 +388,16 @@ Results written to `sca-governance-report.csv` (includes Days_Left, Approved_Dat
 
 ## Instructions
 1. **First** — ask all questions in the "Interactive Setup" section above and confirm answers before generating anything
-2. Read the existing workflow file at `.github/workflows/e2e-uat-pipeline.yml` for reference implementation
-3. Substitute user-provided values throughout all generated files:
+2. **If QUESTION 0 answer is (B) — Module mode:**
+   - Generate only the specific job/step snippet(s) the user selected
+   - Each snippet must be a standalone YAML block with a comment header listing all required secrets/variables
+   - Include an `integration-guide.md` with paste instructions and prerequisites
+   - Do NOT generate the full pipeline or any docs files
+   - Stop after generating the snippets and integration guide
+3. **If QUESTION 0 answer is (A) — Full pipeline mode (default):**
+   Continue with the following steps:
+4. Read the existing workflow file at `.github/workflows/e2e-uat-pipeline.yml` for reference implementation
+5. Substitute user-provided values throughout all generated files:
    - Replace `uat` branch references with the user's chosen target branches
    - Replace `uat` org alias with `QUESTION 3` answer
    - Replace coverage threshold with `QUESTION 4` answer
@@ -382,13 +406,13 @@ Results written to `sca-governance-report.csv` (includes Days_Left, Approved_Dat
    - Set `SCA_ENFORCEMENT_MODE` default to `QUESTION 9` answer
    - Conditionally include/exclude CheckMarx and Fortify jobs based on `QUESTION 7`
    - Conditionally include/exclude CRT job based on `QUESTION 8`
-4. Generate or update each file listed above
-5. Preserve existing content in docs files — only add/update relevant sections
-6. Ensure YAML is valid — quote strings with colons, 2-space indentation
-7. Never use `--test-level NoTestRun` with `deploy validate` — omit the flag instead
-8. Never combine `--async` and `--wait` on the same deploy command
-9. Summarize what was created/updated and list all required GitHub Secrets and Variables the user must configure (pre-filled with their answers where possible)
-10. `SCA_ENFORCEMENT_MODE` must be documented in every relevant doc file. Set it to `off` to bypass all SCA steps during initial project phase, `warn` for informational-only, `enforce` (default) to fail on expired waivers.
+6. Generate or update each file listed above
+7. Preserve existing content in docs files — only add/update relevant sections
+8. Ensure YAML is valid — quote strings with colons, 2-space indentation
+9. Never use `--test-level NoTestRun` with `deploy validate` — omit the flag instead
+10. Never combine `--async` and `--wait` on the same deploy command
+11. Summarize what was created/updated and list all required GitHub Secrets and Variables the user must configure (pre-filled with their answers where possible)
+12. `SCA_ENFORCEMENT_MODE` must be documented in every relevant doc file. Set it to `off` to bypass all SCA steps during initial project phase, `warn` for informational-only, `enforce` (default) to fail on expired waivers.
 
 ## Critical Code-Generation Rules (MUST follow — these prevent runtime errors)
 
