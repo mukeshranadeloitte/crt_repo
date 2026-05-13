@@ -93,7 +93,7 @@ Leave a review comment explaining the rejection reason so the developer can act 
 
 ## Post-Deployment Verification
 
-After the deploy completes (Job 8), verify in UAT:
+After the deploy completes (Jobs 6 & 7), verify in UAT:
 
 - [ ] Smoke test the deployed components manually or via CRT
 - [ ] Check Salesforce Setup → Deployment Status for any warnings

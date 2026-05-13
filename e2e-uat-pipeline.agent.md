@@ -1,5 +1,5 @@
 ---
-description: "Use when: creating, modifying, debugging, or understanding the UAT end-to-end GitHub Actions pipeline for Salesforce projects. Covers e2e-uat-pipeline.yml, SF Code Analyzer waivers, npm SCA waivers, CheckMarx, Fortify, CRT testing, deployment gates, rollback, deployment packages, and all associated docs."
+description: "Use when: creating, modifying, debugging, or understanding the UAT end-to-end GitHub Actions pipeline for Salesforce projects. Covers e2e-uat-pipeline.yml, SF Code Analyzer waivers, CheckMarx, Fortify, CRT testing, deployment gates, module snippets, and all associated docs."
 tools: [read, edit, search]
 name: "E2E UAT Pipeline"
 argument-hint: "Describe what you want to do (e.g. add a job, debug a failure, create the pipeline for a new project, update scanner config, add a waiver)"
@@ -22,10 +22,11 @@ Every Salesforce project using this pipeline pattern should have these files:
   sf-scanner-waivers.csv          ← Salesforce Code Analyzer rule waivers (main branch only)
 docs/
   pipeline-overview.md            ← Architecture diagram + job summaries
+  pipeline-flow.md                ← Detailed mermaid flow diagram + SCA mode + delta diagram
   pipeline-setup.md               ← Secrets, variables, prerequisites
   sca-waivers.md                  ← Waiver governance + how-to guide
   troubleshooting.md              ← Common failures + fixes
-  manual_runbook.md               ← Manual trigger + rollback procedures
+  manual_runbook.md               ← Manual trigger + approval runbook
 ```
 
 ---
@@ -318,6 +319,18 @@ To see what was deployed in any run, check the `Display generated packages` step
 ---
 
 ## Adapting for a New Salesforce Project
+
+### Option A — Interactive setup script _(Recommended)_
+
+Use the platform-specific setup script to generate a customised pipeline for a new project:
+
+- **GitHub Actions:** Run `python3 create-e2e-uat-pipeline.prompt.md` via Copilot Agent mode (see prompt file)
+- **ADO:** Run `python3 ado-pipelines/setup.py` — select mode 1 (full pipeline) or mode 2 (module snippets)
+- **Jenkins:** Run `python3 jenkins/setup.py` — select mode 1 (full pipeline) or mode 2 (module snippets)
+
+**Module snippet mode** (mode 2) generates only the specific job/stage(s) you need — e.g. just the SCA scan — ready to paste into an existing pipeline. Available modules: `sca`, `apex-validation`, `crt-tests`, `architect-gate`, `checkmarx`, `fortify`.
+
+### Option B — Manual substitution
 
 1. **Branch name:** Replace `uat` in `branches: [uat]`
 2. **Auth secret:** Update `CRT_UAT_AUTHURL` or set `vars.SFDX_AUTH_SECRET_NAME`

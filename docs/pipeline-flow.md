@@ -184,3 +184,13 @@ flowchart LR
 | `CRT_JOB_ID` | Variable | CRT job ID to trigger (default: 115686) |
 | `CRT_PROJECT_ID` | Variable | CRT project ID (default: 73283) |
 | `CRT_ORG_ID` | Variable | CRT org ID (default: 43532) |
+
+---
+
+## Related Docs
+
+- [Pipeline Overview](./pipeline-overview.md)
+- [Setup & Configuration](./pipeline-setup.md)
+- [SCA Waivers](./sca-waivers.md)
+- [Manual Runbook](./manual_runbook.md)
+- [Troubleshooting](./troubleshooting.md)

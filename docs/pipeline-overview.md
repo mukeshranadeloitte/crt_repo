@@ -84,5 +84,7 @@ When a PR review is submitted with state **APPROVED**:
 ## Related Docs
 
 - [Setup & Configuration](./pipeline-setup.md)
+- [Flow Diagram (detailed)](./pipeline-flow.md)
+- [SCA Waivers](./sca-waivers.md)
 - [Manual Runbook](./manual_runbook.md)
 - [Troubleshooting](./troubleshooting.md)
